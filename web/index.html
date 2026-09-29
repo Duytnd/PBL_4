@@ -37,8 +37,8 @@
           <div class="tile"><div class="tile-label">Bytes downloaded</div><div class="tile-value">0 B</div></div>
           <div class="tile"><div class="tile-label">Bytes uploaded</div><div class="tile-value">0 B</div></div>
         </div>
-        <div class="dropzone">
-          <span>Drag and drop a file. <u>Click to add.</u></span>
+        <div id="dashboard-dropzone" class="dropzone">
+          <span>Drag and drop a file. <u>Click to create a torrent.</u></span>
         </div>
       </section>
 
@@ -61,11 +61,19 @@
             </select>
           </label>
           <span class="spacer"></span>
-          <button type="button" class="btn">Create torrent <span aria-hidden="true">+</span></button>
-          <button type="button" class="btn btn-primary">Add torrent <span aria-hidden="true">+</span></button>
+          <button id="create-torrent-btn" type="button" class="btn btn-primary">Create torrent <span aria-hidden="true">+</span></button>
+          <button id="add-torrent-btn" type="button" class="btn">Add torrent <span aria-hidden="true">+</span></button>
         </div>
-        <div class="dropzone">
-          <span>Drag and drop a file.</span>
+
+        <div id="torrent-builder" class="torrent-builder">
+          <input id="torrent-source" type="file" hidden>
+          <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
+        </div>
+
+        <div id="torrent-list" class="torrent-list" aria-live="polite"></div>
+
+        <div id="torrent-dropzone" class="dropzone">
+          <span>Drag and drop a file here, or click to create a .torrent.</span>
         </div>
       </section>
 

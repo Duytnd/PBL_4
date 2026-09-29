@@ -13,6 +13,7 @@
 namespace p2p {
 namespace {
 
+// Lấy tên torrent: ưu tiên override nếu có, nếu không dùng tên file/thu mục nguồn.
 std::string makeName(const std::filesystem::path& sourcePath, const std::string& nameOverride) {
     if (!nameOverride.empty()) {
         return nameOverride;

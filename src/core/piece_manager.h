@@ -7,6 +7,9 @@
 
 namespace p2p {
 
+// Quản lý dữ liệu của từng piece trong torrent.
+// Mỗi piece có thể được ghi từng block, kiểm tra đầy đủ, verify bằng SHA-1,
+// rồi ghép lại thành toàn bộ file khi download xong.
 class PieceManager {
 public:
     PieceManager(

@@ -6,6 +6,8 @@
 namespace p2p {
 namespace {
 
+// Các helper nhỏ để đọc dữ liệu Bencode theo kiểu mong muốn.
+// Ví dụ: nếu value là map, ta lấy ra dict; nếu là string, ta lấy ra string.
 const BencodeDict* asDict(const BencodeValue& value) {
     return value.get_if<BencodeDict>();
 }
@@ -37,6 +39,8 @@ std::vector<std::string> parsePieces(const std::string& rawPieces) {
 }  // namespace
 
 TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
+    // Parse file .torrent từ Bencode -> struct TorrentFileMetadata.
+    // Đây là bước chuyển từ dữ liệu raw (dạng text bencode) sang cấu trúc dữ liệu dễ xử lý.
     const auto root = decodeBencode(encodedData);
     const auto* rootDict = asDict(root);
     if (rootDict == nullptr) {

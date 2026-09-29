@@ -5,6 +5,8 @@
 
 namespace p2p {
 
+// Chặn path độc hại để tránh traversal, ký tự null, tên file Windows hệ thống,
+// hoặc các đường dẫn tương đối không an toàn khi tạo torrent hoặc lưu file.
 class PathSanitizer {
 public:
     static bool isSafeRelativePath(const std::string& path);

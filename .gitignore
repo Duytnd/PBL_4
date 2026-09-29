@@ -1,0 +1,54 @@
+# Build artifacts
+build/
+bin/
+out/
+obj/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# IDE/editor files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Local env and secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+secrets/
+config/local.*
+
+# Logs and caches
+*.log
+*.tmp
+*.cache
+coverage/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+Testing/
+
+# Python cache (if any)
+__pycache__/
+*.pyc
+
+# OS generated
+Thumbs.db

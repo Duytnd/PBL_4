@@ -10,6 +10,8 @@
 namespace p2p {
 namespace {
 
+// Kiểm tra xem path có bắt đầu bằng ổ đĩa Windows (ví dụ: C:/...) hay không.
+// Điều này bị chặn vì trong torrent/file system không nên chấp nhận đường dẫn tuyệt đối.
 bool isWindowsDrivePrefix(const std::string& path) {
     if (path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':') {
         return true;

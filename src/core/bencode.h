@@ -11,10 +11,11 @@ namespace p2p {
 
 struct BencodeValue {
     using Storage = std::variant<
-        int64_t,
-        std::string,
-        std::vector<BencodeValue>,
-        std::map<std::string, BencodeValue>>;
+        int64_t, // i..e              -> số nguyên, ví dụ: i42e = 42
+        std::string, // n:string       -> chuỗi, ví dụ: 5:hello = "hello"
+        std::vector<BencodeValue>, // l...e -> list, ví dụ: l4:spam4:eggse = ["spam", "eggs"]
+        std::map<std::string, BencodeValue> // d...e -> dict, ví dụ: key "foo" = 10, key "bar" = "hello"
+    >;
 
     Storage data;
 

@@ -11,6 +11,8 @@ namespace p2p {
 
 namespace {
 
+// Tính kích thước thực tế của 1 piece ở cuối file.
+// Ví dụ: file 1000 bytes, pieceLength 256 => piece cuối chỉ có 232 bytes.
 std::size_t clampPieceSize(std::size_t totalLength, std::size_t pieceLength, std::size_t pieceIndex) {
     const std::size_t start = pieceIndex * pieceLength;
     if (start >= totalLength) {

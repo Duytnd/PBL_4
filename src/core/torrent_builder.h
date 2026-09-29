@@ -8,6 +8,8 @@
 
 namespace p2p {
 
+// Tạo metadata torrent từ file hoặc thư mục nguồn.
+// Chuyển dữ liệu đầu vào thành cấu trúc Bencode của "info" và "root".
 class TorrentBuilder {
 public:
     static std::string buildTorrent(
