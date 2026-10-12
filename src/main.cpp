@@ -14,14 +14,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    // web/ nằm cạnh thư mục chạy (hoặc 2 cấp trên nếu chạy từ build/<config>/).
+    // Tìm thư mục web/ cạnh project root. exe có thể nằm ở build/ (Ninja/Make)
+    // hoặc build/<config>/ (Visual Studio multi-config), nên thử lần lượt
+    // 1, 2 cấp lên từ thư mục chứa exe, rồi mới tới thư mục đang chạy lệnh.
     const std::filesystem::path exeDir = std::filesystem::absolute(argv[0]).parent_path();
-    std::filesystem::path webRoot = exeDir / "web";
-    if (!std::filesystem::exists(webRoot)) {
-        webRoot = exeDir / ".." / ".." / "web";
+    std::filesystem::path webRoot;
+    for (const std::filesystem::path& candidate : {
+             exeDir / "web",
+             exeDir / ".." / "web",
+             exeDir / ".." / ".." / "web",
+             std::filesystem::current_path() / "web",
+         }) {
+        if (std::filesystem::exists(candidate / "index.html")) {
+            webRoot = candidate;
+            break;
+        }
     }
-    if (!std::filesystem::exists(webRoot)) {
-        webRoot = std::filesystem::current_path() / "web";
+    if (webRoot.empty()) {
+        std::cerr << "Could not locate web/ directory (looked next to the executable and the current directory)" << std::endl;
+        return 1;
     }
 
     const std::filesystem::path tempDir = std::filesystem::current_path() / "data" / ".uploads";
