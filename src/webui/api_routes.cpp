@@ -19,6 +19,45 @@ constexpr std::size_t kDefaultPieceLength = 262144;
 // nghẽn thread HTTP (mục 5.7 "giới hạn phòng thủ").
 constexpr std::size_t kMaxUploadBytes = 256ull * 1024 * 1024;
 
+// Phần trăm-encode theo RFC 5987 (dùng cho filename*=UTF-8''...), vì header
+// HTTP không phải UTF-8: ký tự ngoài ASCII (vd tiếng Việt có dấu) phải được
+// encode, nếu không trình duyệt hiển thị sai (lỗi font/mojibake).
+std::string rfc5987Encode(const std::string& value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(value.size() * 3);
+    for (unsigned char c : value) {
+        const bool unreserved =
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(hex[(c >> 4) & 0xF]);
+            out.push_back(hex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+// Tên file an toàn cho phần filename="..." (ASCII) khi trình duyệt cũ không
+// hiểu filename*=UTF-8''...: thay mọi byte ngoài ASCII in được bằng '_'.
+std::string asciiFallbackName(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char c : value) {
+        const bool printableAscii = c >= 0x20 && c <= 0x7E && c != '"' && c != '\\';
+        out.push_back(printableAscii ? static_cast<char>(c) : '_');
+    }
+    return out;
+}
+
+std::string buildContentDisposition(const std::string& downloadName) {
+    return "attachment; filename=\"" + asciiFallbackName(downloadName) +
+           "\"; filename*=UTF-8''" + rfc5987Encode(downloadName);
+}
+
 // Chỉ giữ lại tên file (bỏ mọi phần đường dẫn người dùng gửi lên) để tránh
 // path traversal khi ghi file tạm ra đĩa.
 std::filesystem::path safeFileName(const std::string& rawName) {
@@ -119,7 +158,7 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res,
         const std::string downloadName =
             (nameOverride.empty() ? sourceName.string() : nameOverride) + ".torrent";
 
-        res.set_header("Content-Disposition", "attachment; filename=\"" + downloadName + "\"");
+        res.set_header("Content-Disposition", buildContentDisposition(downloadName));
         res.set_content(torrentBytes, "application/x-bittorrent");
     } catch (const std::exception& error) {
         res.status = 500;

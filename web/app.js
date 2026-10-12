@@ -213,8 +213,12 @@
     }
 
     const disposition = response.headers.get('Content-Disposition') || '';
-    const match = disposition.match(/filename="?([^"]+)"?/);
-    const downloadName = match ? match[1] : `${file.name}.torrent`;
+    // Ưu tiên filename*=UTF-8''... (đúng ký tự có dấu) trước filename="..." (bản ASCII dự phòng).
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
+    const downloadName = utf8Match
+      ? decodeURIComponent(utf8Match[1])
+      : (asciiMatch ? asciiMatch[1] : `${file.name}.torrent`);
     const blob = await response.blob();
     return { blob, downloadName };
   }
