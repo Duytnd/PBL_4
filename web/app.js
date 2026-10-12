@@ -29,59 +29,6 @@
     if (kind === 'error') status.classList.add('error');
   }
 
-  function concatUint8Arrays(parts) {
-    const totalLength = parts.reduce((sum, part) => sum + part.length, 0);
-    const merged = new Uint8Array(totalLength);
-    let offset = 0;
-
-    for (const part of parts) {
-      merged.set(part, offset);
-      offset += part.length;
-    }
-
-    return merged;
-  }
-
-  function encodeBencodeValue(value) {
-    if (typeof value === 'number' && Number.isInteger(value)) {
-      const text = new TextEncoder().encode(`i${value}e`);
-      return text;
-    }
-
-    if (typeof value === 'string') {
-      const encoded = new TextEncoder().encode(value);
-      const length = new TextEncoder().encode(String(encoded.length));
-      return concatUint8Arrays([length, new Uint8Array([0x3a]), encoded]);
-    }
-
-    if (value instanceof Uint8Array) {
-      const length = new TextEncoder().encode(String(value.length));
-      return concatUint8Arrays([length, new Uint8Array([0x3a]), value]);
-    }
-
-    if (Array.isArray(value)) {
-      const parts = [new Uint8Array([0x6c])];
-      for (const item of value) {
-        parts.push(encodeBencodeValue(item));
-      }
-      parts.push(new Uint8Array([0x65]));
-      return concatUint8Arrays(parts);
-    }
-
-    if (value && typeof value === 'object') {
-      const keys = Object.keys(value).sort();
-      const parts = [new Uint8Array([0x64])];
-      for (const key of keys) {
-        parts.push(encodeBencodeValue(key));
-        parts.push(encodeBencodeValue(value[key]));
-      }
-      parts.push(new Uint8Array([0x65]));
-      return concatUint8Arrays(parts);
-    }
-
-    throw new Error('Unsupported Bencode value type');
-  }
-
   function decodeBytes(value) {
     if (value instanceof Uint8Array) {
       return new TextDecoder('utf-8').decode(value);
@@ -246,43 +193,30 @@
     });
   }
 
-  async function sha1Bytes(data) {
-    const hashBuffer = await crypto.subtle.digest('SHA-1', data);
-    return new Uint8Array(hashBuffer);
-  }
+  // Gửi file lên backend C++ (POST /api/torrents/create) và để
+  // src/core/torrent_builder.cpp chia piece + hash + đóng bencode thật,
+  // thay vì tự làm lại toàn bộ bằng JavaScript ở phía trình duyệt.
+  async function requestTorrentFromServer(file) {
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    formData.append('announce', DEFAULT_ANNOUNCE);
+    formData.append('piece_length', String(PIECE_LENGTH));
 
-  async function createTorrentBlob(file) {
-    const fileBuffer = await file.arrayBuffer();
-    const bytes = new Uint8Array(fileBuffer);
+    const response = await fetch('/api/torrents/create', {
+      method: 'POST',
+      body: formData,
+    });
 
-    const pieceHashes = [];
-    for (let offset = 0; offset < bytes.length; offset += PIECE_LENGTH) {
-      const chunk = bytes.slice(offset, offset + PIECE_LENGTH);
-      const hash = await sha1Bytes(chunk);
-      pieceHashes.push(hash);
+    if (!response.ok) {
+      const message = await response.text().catch(() => '');
+      throw new Error(message || `Server responded with ${response.status}`);
     }
 
-    const totalHashLength = pieceHashes.reduce((sum, hash) => sum + hash.length, 0);
-    const allPieceHashes = new Uint8Array(totalHashLength);
-    let cursor = 0;
-    for (const hash of pieceHashes) {
-      allPieceHashes.set(hash, cursor);
-      cursor += hash.length;
-    }
-
-    const info = {
-      name: file.name,
-      'piece length': PIECE_LENGTH,
-      pieces: allPieceHashes,
-      length: bytes.length,
-    };
-
-    const root = {
-      announce: DEFAULT_ANNOUNCE,
-      info,
-    };
-
-    return new Blob([encodeBencodeValue(root)], { type: 'application/x-bittorrent' });
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    const downloadName = match ? match[1] : `${file.name}.torrent`;
+    const blob = await response.blob();
+    return { blob, downloadName };
   }
 
   async function handleCreateTorrent(file) {
@@ -290,16 +224,16 @@
 
     try {
       setStatus(`Creating torrent for ${file.name}...`);
-      const blob = await createTorrentBlob(file);
+      const { blob, downloadName } = await requestTorrentFromServer(file);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `${file.name}.torrent`;
+      link.download = downloadName;
       document.body.appendChild(link);
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
-      setStatus(`Torrent created successfully: ${file.name}.torrent`, 'success');
+      setStatus(`Torrent created successfully: ${downloadName}`, 'success');
     } catch (error) {
       setStatus(`Failed to create torrent: ${error.message}`, 'error');
     }

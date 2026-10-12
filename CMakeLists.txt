@@ -100,3 +100,25 @@ add_executable(test_tracker_protocol
 target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME test_tracker_protocol COMMAND test_tracker_protocol)
+
+# Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
+# core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
+find_package(Threads REQUIRED)
+
+add_executable(p2p_server
+    src/main.cpp
+    src/core/bencode.cpp
+    src/core/hash_utils.cpp
+    src/core/path_sanitizer.cpp
+    src/core/torrent_file.cpp
+    src/core/torrent_builder.cpp
+    src/webui/http_server.cpp
+    src/webui/api_routes.cpp
+)
+
+target_include_directories(p2p_server PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(p2p_server PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
+if(WIN32)
+    target_link_libraries(p2p_server PRIVATE ws2_32 crypt32)
+endif()
