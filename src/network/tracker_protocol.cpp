@@ -1,6 +1,14 @@
 #include "network/tracker_protocol.h"
 
+// htons() nằm ở <arpa/inet.h> trên Linux/Mac, nhưng ở <winsock2.h> trên
+// Windows. Không include cả hai cùng lúc vì winsock2.h phải đứng trước
+// windows.h khác (tránh xung đột với winsock.h cũ).
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
+
 #include <cctype>
 #include <iomanip>
 #include <sstream>

@@ -89,22 +89,27 @@ find_package(OpenSSL REQUIRED)
 target_link_libraries(test_metadata_integration PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 add_test(NAME test_metadata_integration COMMAND test_metadata_integration)
 
+find_package(Threads REQUIRED)
+
 add_executable(test_tracker_protocol
     tests/test_tracker_protocol.cpp
     src/core/bencode.cpp
     src/network/tracker_protocol.cpp
     src/network/tracker_client.cpp
     tracker/tracker_server.cpp
+    tracker/peer_registry.cpp
 )
 
-target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
 target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_tracker_protocol PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_tracker_protocol PRIVATE ws2_32 crypt32)
+endif()
 add_test(NAME test_tracker_protocol COMMAND test_tracker_protocol)
 
 # Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
 # core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
-find_package(Threads REQUIRED)
-
 add_executable(p2p_server
     src/main.cpp
     src/core/bencode.cpp
@@ -121,4 +126,22 @@ target_link_libraries(p2p_server PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::T
 
 if(WIN32)
     target_link_libraries(p2p_server PRIVATE ws2_32 crypt32)
+endif()
+
+# Tracker server thật (BEP 3 + BEP 23): bind 0.0.0.0 để các máy khác trong
+# LAN announce tới được (khác p2p_server, chỉ bind 127.0.0.1 cho web UI).
+add_executable(p2p_tracker
+    tracker/main.cpp
+    tracker/tracker_server.cpp
+    tracker/peer_registry.cpp
+    src/core/bencode.cpp
+    src/network/tracker_protocol.cpp
+)
+
+target_include_directories(p2p_tracker PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
+target_include_directories(p2p_tracker PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(p2p_tracker PRIVATE Threads::Threads)
+
+if(WIN32)
+    target_link_libraries(p2p_tracker PRIVATE ws2_32 crypt32)
 endif()

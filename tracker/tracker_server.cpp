@@ -1,74 +1,36 @@
 #include "tracker/tracker_server.h"
 
-#include <algorithm>
-
 namespace p2p {
 
 TrackerServer::TrackerServer(int interval, std::size_t maxPeers)
-    : interval_(interval), maxPeers_(maxPeers) {}
+    : interval_(interval), registry_(interval * 2, maxPeers) {}
 
 void TrackerServer::addPeer(const std::string& infoHash, const PeerRegistration& peer) {
-    auto& list = peers_[infoHash];
-    auto it = std::find_if(list.begin(), list.end(), [&](const PeerRegistration& candidate) {
-        return candidate.peerId == peer.peerId;
-    });
-
-    if (it != list.end()) {
-        *it = peer;
-        return;
-    }
-
-    if (list.size() >= maxPeers_) {
-        list.erase(list.begin());
-    }
-    list.push_back(peer);
+    registry_.upsert(infoHash, peer);
 }
 
 void TrackerServer::removePeer(const std::string& infoHash, const std::string& peerId) {
-    auto it = peers_.find(infoHash);
-    if (it == peers_.end()) {
-        return;
-    }
-
-    it->second.erase(
-        std::remove_if(it->second.begin(), it->second.end(), [&](const PeerRegistration& peer) {
-            return peer.peerId == peerId;
-        }),
-        it->second.end());
-
-    if (it->second.empty()) {
-        peers_.erase(it);
-    }
+    registry_.remove(infoHash, peerId);
 }
 
 std::vector<TrackerPeer> TrackerServer::getPeers(const std::string& infoHash) const {
-    const auto it = peers_.find(infoHash);
-    if (it == peers_.end()) {
-        return {};
-    }
-
-    std::vector<TrackerPeer> peers;
-    peers.reserve(it->second.size());
-    for (const auto& peer : it->second) {
-        peers.push_back({peer.ip, peer.port});
-    }
-    return peers;
+    return registry_.getPeers(infoHash);
 }
 
 bool TrackerServer::hasPeer(const std::string& infoHash, const std::string& peerId) const {
-    const auto it = peers_.find(infoHash);
-    if (it == peers_.end()) {
-        return false;
-    }
+    return registry_.hasPeer(infoHash, peerId);
+}
 
-    return std::any_of(it->second.begin(), it->second.end(), [&](const PeerRegistration& peer) {
-        return peer.peerId == peerId;
-    });
+PeerRegistry& TrackerServer::registry() {
+    return registry_;
 }
 
 std::string TrackerServer::announce(const TrackerRequest& request) {
-    if (request.infoHash.empty()) {
-        return TrackerProtocol::encodeFailureResponse("Missing info_hash");
+    if (request.infoHash.size() != 20) {
+        return TrackerProtocol::encodeFailureResponse("info_hash must be 20 bytes");
+    }
+    if (request.peerId.size() != 20) {
+        return TrackerProtocol::encodeFailureResponse("peer_id must be 20 bytes");
     }
 
     if (request.event == "stopped") {
@@ -86,10 +48,8 @@ std::string TrackerServer::announce(const TrackerRequest& request) {
 
     addPeer(request.infoHash, peer);
 
-    std::vector<TrackerPeer> peers = getPeers(request.infoHash);
-    peers.erase(std::remove_if(peers.begin(), peers.end(), [&](const TrackerPeer& peerInfo) {
-        return peerInfo.ip == peer.ip && peerInfo.port == peer.port;
-    }), peers.end());
+    // Không trả lại chính peer đang hỏi (mục 5.2).
+    const std::vector<TrackerPeer> peers = registry_.getPeers(request.infoHash, request.peerId);
 
     return TrackerProtocol::encodeSuccessResponse(interval_, peers);
 }
