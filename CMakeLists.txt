@@ -161,6 +161,34 @@ if(WIN32)
 endif()
 add_test(NAME test_peer_connection COMMAND test_peer_connection)
 
+# Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy)
+add_executable(test_torrent_session
+    tests/test_torrent_session.cpp
+    src/network/torrent_session.cpp
+    src/network/peer_protocol.cpp
+    src/network/peer_connection.cpp
+    src/core/piece_manager.cpp
+    src/core/torrent_file.cpp
+    src/core/bencode.cpp
+    src/core/hash_utils.cpp
+    src/core/path_sanitizer.cpp
+    src/network/tracker_client.cpp
+    src/network/tracker_protocol.cpp
+    src/strategy/piece_picker.cpp
+    src/strategy/choker.cpp
+    src/network/lsd.cpp
+)
+target_include_directories(test_torrent_session PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+    ${CMAKE_SOURCE_DIR}/third_party
+)
+target_link_libraries(test_torrent_session PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_torrent_session PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_torrent_session COMMAND test_torrent_session)
+
 # Công cụ thực chiến Peer Wire: seed, leech, security attack simulation
 add_executable(peer_wire_tool
     tools/peer_wire_tool.cpp
@@ -185,11 +213,25 @@ add_executable(p2p_server
     src/core/path_sanitizer.cpp
     src/core/torrent_file.cpp
     src/core/torrent_builder.cpp
+    src/core/piece_manager.cpp
     src/webui/http_server.cpp
     src/webui/api_routes.cpp
+    src/webui/state_bridge.cpp
+    src/network/torrent_session.cpp
+    src/network/peer_protocol.cpp
+    src/network/peer_connection.cpp
+    src/network/tracker_client.cpp
+    src/network/tracker_protocol.cpp
+    src/strategy/piece_picker.cpp
+    src/strategy/choker.cpp
+    src/network/lsd.cpp
 )
 
-target_include_directories(p2p_server PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
+target_include_directories(p2p_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
 target_link_libraries(p2p_server PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
 if(WIN32)

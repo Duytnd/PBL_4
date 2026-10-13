@@ -122,6 +122,40 @@ bool PieceManager::writeBlock(
     return true;
 }
 
+bool PieceManager::readBlock(std::size_t pieceIndex, std::size_t offset, std::size_t length, std::string& outBlock) const {
+    if (pieceIndex >= pieceCount_ || pieceIndex >= pieces_.size()) {
+        return false;
+    }
+    const std::string& data = pieces_[pieceIndex];
+    if (offset + length > data.size()) {
+        return false;
+    }
+    outBlock = data.substr(offset, length);
+    return true;
+}
+
+bool PieceManager::loadFromFile(const std::filesystem::path& filePath) {
+    if (!std::filesystem::exists(filePath)) {
+        return false;
+    }
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    for (std::size_t i = 0; i < pieceCount_; ++i) {
+        const std::size_t size = pieceSize(i);
+        if (size == 0) continue;
+        std::string buffer(size, '\0');
+        file.read(buffer.data(), static_cast<std::streamsize>(size));
+        const std::size_t bytesRead = static_cast<std::size_t>(file.gcount());
+        if (bytesRead < size) {
+            return false;
+        }
+        writeBlock(i, 0, size, buffer);
+    }
+    return true;
+}
+
 std::string PieceManager::assembleFile() const {
     std::string output;
     output.reserve(totalLength_);

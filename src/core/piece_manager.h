@@ -30,7 +30,9 @@ public:
 
     bool writeBlock(std::size_t pieceIndex, std::size_t offset, const std::string& blockData);
     bool writeBlock(std::size_t pieceIndex, std::size_t offset, std::size_t length, const std::string& blockData);
+    bool readBlock(std::size_t pieceIndex, std::size_t offset, std::size_t length, std::string& outBlock) const;
 
+    bool loadFromFile(const std::filesystem::path& filePath);
     [[nodiscard]] std::string assembleFile() const;
     void writeToFile(const std::filesystem::path& filePath) const;
 

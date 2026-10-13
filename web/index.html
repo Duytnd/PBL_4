@@ -68,6 +68,13 @@
         <div id="torrent-builder" class="torrent-builder">
           <input id="torrent-source" type="file" hidden>
           <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
+          <div id="magnet-box" class="magnet-box" style="display: none; margin-top: 10px; padding: 12px; background: #eaf1ff; border: 1px solid #bfdbfe; border-radius: 8px;">
+            <div style="font-weight: 600; margin-bottom: 6px; color: #1e40af;">Magnet Link (Gửi link này cho người khác để tải về):</div>
+            <div style="display: flex; gap: 8px;">
+              <input id="magnet-input" type="text" readonly style="flex: 1; padding: 6px 10px; border: 1px solid #93c5fd; border-radius: 6px; font-family: monospace; font-size: 12px; background: #ffffff;">
+              <button id="copy-magnet-btn" type="button" class="btn btn-primary" style="white-space: nowrap;">Copy Magnet</button>
+            </div>
+          </div>
         </div>
 
         <div id="torrent-list" class="torrent-list" aria-live="polite"></div>

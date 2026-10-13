@@ -29,94 +29,6 @@
     if (kind === 'error') status.classList.add('error');
   }
 
-  function decodeBytes(value) {
-    if (value instanceof Uint8Array) {
-      return new TextDecoder('utf-8').decode(value);
-    }
-    return String(value ?? '');
-  }
-
-  function parseBString(data, offset) {
-    let lengthEnd = offset;
-    while (lengthEnd < data.length && data[lengthEnd] >= 0x30 && data[lengthEnd] <= 0x39) {
-      lengthEnd += 1;
-    }
-
-    if (lengthEnd >= data.length || data[lengthEnd] !== 0x3a) {
-      throw new Error('Invalid bencoded string length');
-    }
-
-    const length = Number(new TextDecoder('utf-8').decode(data.slice(offset, lengthEnd)));
-    const valueStart = lengthEnd + 1;
-    const valueEnd = valueStart + length;
-
-    return {
-      value: data.slice(valueStart, valueEnd),
-      nextIndex: valueEnd,
-    };
-  }
-
-  function parseBencodeValue(data, offset = 0) {
-    const marker = data[offset];
-
-    if (marker === 0x69) {
-      const end = data.indexOf(0x65, offset + 1);
-      if (end === -1) throw new Error('Invalid integer in torrent metadata');
-      const intText = new TextDecoder('utf-8').decode(data.slice(offset + 1, end));
-      return { value: Number(intText), nextIndex: end + 1 };
-    }
-
-    if (marker >= 0x30 && marker <= 0x39) {
-      return parseBString(data, offset);
-    }
-
-    if (marker === 0x6c) {
-      const list = [];
-      let index = offset + 1;
-      while (data[index] !== 0x65) {
-        const parsed = parseBencodeValue(data, index);
-        list.push(parsed.value);
-        index = parsed.nextIndex;
-      }
-      return { value: list, nextIndex: index + 1 };
-    }
-
-    if (marker === 0x64) {
-      const object = {};
-      let index = offset + 1;
-      while (data[index] !== 0x65) {
-        const keyParsed = parseBencodeValue(data, index);
-        const key = decodeBytes(keyParsed.value);
-        index = keyParsed.nextIndex;
-        const valueParsed = parseBencodeValue(data, index);
-        object[key] = valueParsed.value;
-        index = valueParsed.nextIndex;
-      }
-      return { value: object, nextIndex: index + 1 };
-    }
-
-    throw new Error('Unsupported torrent metadata format');
-  }
-
-  function parseTorrentMetadata(file) {
-    const dict = parseBencodeValue(new Uint8Array(file), 0).value;
-    const info = dict.info || {};
-    const announce = typeof dict.announce === 'string' ? dict.announce : decodeBytes(dict.announce || new Uint8Array());
-    const length = typeof info.length === 'number' ? info.length : 0;
-    const pieceLength = typeof info['piece length'] === 'number' ? info['piece length'] : 0;
-    const pieces = info.pieces instanceof Uint8Array ? info.pieces.length / 20 : 0;
-    const name = decodeBytes(info.name || new Uint8Array());
-
-    return {
-      name: name || file.name.replace(/\.torrent$/i, ''),
-      announce: announce || DEFAULT_ANNOUNCE,
-      length,
-      pieceLength,
-      pieceCount: pieces,
-      rawName: file.name,
-    };
-  }
-
   function formatBytes(bytes) {
     if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -125,8 +37,12 @@
     return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${sizes[index]}`;
   }
 
+  function formatSpeed(bytesPerSec) {
+    return `${formatBytes(bytesPerSec)}/s`;
+  }
+
   function escapeHtml(value) {
-    return String(value)
+    return String(value ?? '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -134,45 +50,88 @@
       .replace(/'/g, '&#39;');
   }
 
+  function updateDashboardTiles() {
+    let totalDownloaded = 0;
+    let totalUploaded = 0;
+    let totalDlSpeed = 0;
+    let totalUlSpeed = 0;
+
+    torrentList.forEach(t => {
+      totalDownloaded += t.downloaded || 0;
+      totalUploaded += t.uploaded || 0;
+      totalDlSpeed += t.downloadRate || 0;
+      totalUlSpeed += t.uploadRate || 0;
+    });
+
+    // Update dashboard tiles
+    const dashView = document.getElementById('view-dashboard');
+    if (dashView) {
+      const values = dashView.querySelectorAll('.tile-value');
+      if (values.length >= 2) {
+        values[0].textContent = formatBytes(totalDownloaded);
+        values[1].textContent = formatBytes(totalUploaded);
+      }
+    }
+
+    // Update speed view tiles
+    const speedView = document.getElementById('view-speed');
+    if (speedView) {
+      const values = speedView.querySelectorAll('.tile-value');
+      if (values.length >= 2) {
+        values[0].textContent = formatSpeed(totalDlSpeed);
+        values[1].textContent = formatSpeed(totalUlSpeed);
+      }
+    }
+  }
+
   function renderTorrentList() {
     const container = document.getElementById('torrent-list');
     if (!container) return;
 
     if (!torrentList.length) {
-      container.innerHTML = '<div class="torrent-empty">No torrent files added yet.</div>';
+      container.innerHTML = '<div class="torrent-empty" style="padding: 24px; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: var(--radius);">No torrent files added yet.</div>';
       return;
     }
 
     const cards = torrentList.map((torrent) => {
-      const announce = torrent.announce || 'No tracker';
       const size = formatBytes(torrent.length);
-      const fileName = torrent.rawName || torrent.name;
+      const state = (torrent.state || 'stopped').toUpperCase();
+      const progress = Number(torrent.progress || 0).toFixed(1);
+      const dlSpeed = formatSpeed(torrent.downloadRate || 0);
+      const ulSpeed = formatSpeed(torrent.uploadRate || 0);
+      const peers = torrent.peers || 0;
+
+      let stateBadgeStyle = 'background: #e5e7eb; color: #374151;';
+      if (state === 'SEEDING') stateBadgeStyle = 'background: #dcfce7; color: #166534; font-weight: 600;';
+      else if (state === 'DOWNLOADING') stateBadgeStyle = 'background: #dbeafe; color: #1e40af; font-weight: 600;';
+      else if (state === 'CHECKING') stateBadgeStyle = 'background: #fef9c3; color: #854d0e;';
+
+      const copyMagnetHtml = torrent.magnetUri
+        ? `<button class="torrent-copy-magnet btn" data-magnet="${escapeHtml(torrent.magnetUri)}" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>`
+        : '';
 
       return `
-        <article class="torrent-card">
-          <div class="torrent-card-top">
-            <div class="torrent-file-wrap">
-              <div class="torrent-file-icon">T</div>
+        <article class="torrent-card" style="margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg);">
+          <div class="torrent-card-top" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <div class="torrent-file-wrap" style="display: flex; align-items: center; gap: 10px;">
+              <span style="display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; ${stateBadgeStyle}">${state}</span>
               <div>
-                <h3>${escapeHtml(torrent.name)}</h3>
-                <span>${escapeHtml(fileName)}</span>
+                <h3 style="margin: 0; font-size: 15px; font-weight: 600;">${escapeHtml(torrent.name)}</h3>
+                <span style="font-size: 12px; color: var(--muted);">${size} • ${progress}% • Peers: ${peers}</span>
               </div>
             </div>
-            <button class="torrent-remove" data-id="${torrent.id}" aria-label="Remove ${escapeHtml(torrent.name)}">Remove</button>
+            <div style="display: flex; align-items: center;">
+              ${copyMagnetHtml}
+              <button class="torrent-remove btn" data-hash="${escapeHtml(torrent.infoHash || torrent.id)}" aria-label="Remove ${escapeHtml(torrent.name)}" style="padding: 4px 8px; font-size: 12px; color: #dc2626;">Remove</button>
+            </div>
           </div>
-          <div class="torrent-metrics">
-            <div>
-              <span>Size</span>
-              <strong>${size}</strong>
-            </div>
-            <div>
-              <span>Tracker</span>
-              <strong>${escapeHtml(announce)}</strong>
-            </div>
-            <div>
-              <span>Pieces</span>
-              <strong>${torrent.pieceCount}</strong>
-            </div>
+          <div style="height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 8px;">
+            <div style="width: ${progress}%; height: 100%; background: #2563eb; transition: width 0.3s ease;"></div>
+          </div>
+          <div class="torrent-metrics" style="display: flex; gap: 24px; font-size: 12px; color: var(--muted);">
+            <div>Down: <strong style="color: var(--text);">${dlSpeed}</strong></div>
+            <div>Up: <strong style="color: var(--text);">${ulSpeed}</strong></div>
+            <div>Pieces: <strong style="color: var(--text);">${torrent.completedPieces || 0}/${torrent.pieceCount || 0}</strong></div>
           </div>
         </article>
       `;
@@ -180,22 +139,69 @@
 
     container.innerHTML = cards;
 
+    // Bind remove buttons
     container.querySelectorAll('.torrent-remove').forEach((button) => {
-      button.addEventListener('click', () => {
-        const targetId = Number(button.dataset.id);
-        const index = torrentList.findIndex((item) => item.id === targetId);
+      button.addEventListener('click', async () => {
+        const hash = button.dataset.hash;
+        try {
+          await fetch(`/api/torrents/remove?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
+        } catch (_) {}
+        const index = torrentList.findIndex((item) => (item.infoHash || item.id) === hash);
         if (index !== -1) {
           torrentList.splice(index, 1);
           renderTorrentList();
-          setStatus('Torrent removed from list.', 'info');
+          updateDashboardTiles();
+          setStatus('Torrent removed.', 'info');
+        }
+      });
+    });
+
+    // Bind copy magnet buttons
+    container.querySelectorAll('.torrent-copy-magnet').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const uri = button.dataset.magnet;
+        if (uri) {
+          await navigator.clipboard.writeText(uri);
+          const orig = button.textContent;
+          button.textContent = 'Copied!';
+          setTimeout(() => { button.textContent = orig; }, 1500);
         }
       });
     });
   }
 
-  // Gửi file lên backend C++ (POST /api/torrents/create) và để
-  // src/core/torrent_builder.cpp chia piece + hash + đóng bencode thật,
-  // thay vì tự làm lại toàn bộ bằng JavaScript ở phía trình duyệt.
+  async function syncTorrentsFromServer() {
+    try {
+      const res = await fetch('/api/torrents');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        torrentList.length = 0;
+        data.forEach(item => {
+          torrentList.push({
+            id: item.info_hash,
+            name: item.name,
+            rawName: item.name,
+            infoHash: item.info_hash,
+            magnetUri: item.magnet_uri,
+            state: item.state,
+            length: item.total_bytes,
+            downloaded: item.downloaded_bytes,
+            uploaded: item.uploaded_bytes,
+            progress: item.progress_percent,
+            downloadRate: item.download_rate,
+            uploadRate: item.upload_rate,
+            pieceCount: item.total_pieces,
+            completedPieces: item.completed_pieces,
+            peers: item.connected_peers,
+          });
+        });
+        renderTorrentList();
+        updateDashboardTiles();
+      }
+    } catch (_) {}
+  }
+
   async function requestTorrentFromServer(file) {
     const formData = new FormData();
     formData.append('file', file, file.name);
@@ -213,14 +219,14 @@
     }
 
     const disposition = response.headers.get('Content-Disposition') || '';
-    // Ưu tiên filename*=UTF-8''... (đúng ký tự có dấu) trước filename="..." (bản ASCII dự phòng).
     const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
     const downloadName = utf8Match
       ? decodeURIComponent(utf8Match[1])
       : (asciiMatch ? asciiMatch[1] : `${file.name}.torrent`);
+    const magnetUri = response.headers.get('X-Magnet-Uri') || '';
     const blob = await response.blob();
-    return { blob, downloadName };
+    return { blob, downloadName, magnetUri };
   }
 
   async function handleCreateTorrent(file) {
@@ -228,7 +234,9 @@
 
     try {
       setStatus(`Creating torrent for ${file.name}...`);
-      const { blob, downloadName } = await requestTorrentFromServer(file);
+      const { blob, downloadName, magnetUri } = await requestTorrentFromServer(file);
+
+      // Download .torrent file
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -237,7 +245,19 @@
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
-      setStatus(`Torrent created successfully: ${downloadName}`, 'success');
+
+      // Display magnet link in UI box
+      if (magnetUri) {
+        const magnetBox = document.getElementById('magnet-box');
+        const magnetInput = document.getElementById('magnet-input');
+        if (magnetBox && magnetInput) {
+          magnetInput.value = magnetUri;
+          magnetBox.style.display = 'block';
+        }
+      }
+
+      setStatus(`Torrent created successfully & is now Seeding: ${downloadName}`, 'success');
+      await syncTorrentsFromServer();
     } catch (error) {
       setStatus(`Failed to create torrent: ${error.message}`, 'error');
     }
@@ -253,17 +273,23 @@
     }
 
     try {
-      const buffer = await file.arrayBuffer();
-      const metadata = parseTorrentMetadata(buffer);
-      const item = {
-        id: Date.now() + Math.random(),
-        ...metadata,
-      };
-      torrentList.unshift(item);
-      renderTorrentList();
-      setStatus(`Added ${metadata.name} to the list.`, 'success');
+      setStatus(`Uploading and starting ${file.name}...`);
+      const formData = new FormData();
+      formData.append('file', file, file.name);
+      const res = await fetch('/api/torrents/add', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(err || 'Failed to add torrent');
+      }
+
+      setStatus(`Added ${file.name} to downloading swarm!`, 'success');
+      await syncTorrentsFromServer();
     } catch (error) {
-      setStatus(`Failed to read torrent metadata: ${error.message}`, 'error');
+      setStatus(`Failed to add torrent: ${error.message}`, 'error');
     }
   }
 
@@ -281,6 +307,18 @@
     const addTorrentButton = document.getElementById('add-torrent-btn');
     const dropzone = document.getElementById('torrent-dropzone');
     const dashboardDropzone = document.getElementById('dashboard-dropzone');
+    const copyMagnetBtn = document.getElementById('copy-magnet-btn');
+
+    if (copyMagnetBtn) {
+      copyMagnetBtn.addEventListener('click', async () => {
+        const magnetInput = document.getElementById('magnet-input');
+        if (magnetInput && magnetInput.value) {
+          await navigator.clipboard.writeText(magnetInput.value);
+          copyMagnetBtn.textContent = 'Copied!';
+          setTimeout(() => { copyMagnetBtn.textContent = 'Copy Magnet'; }, 2000);
+        }
+      });
+    }
 
     if (createTorrentButton) {
       createTorrentButton.addEventListener('click', () => openFilePicker('create'));
@@ -328,8 +366,11 @@
     bindDropzone(dashboardDropzone, 'create');
   }
 
+  // Initial render & polling
   renderTorrentList();
   window.addEventListener('hashchange', showView);
   showView();
   bindFilePicker();
+  syncTorrentsFromServer();
+  setInterval(syncTorrentsFromServer, 2000);
 })();

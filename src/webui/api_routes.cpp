@@ -2,7 +2,10 @@
 
 #include "httplib.h"
 
+#include "core/hash_utils.h"
 #include "core/torrent_builder.h"
+#include "core/torrent_file.h"
+#include "webui/state_bridge.h"
 
 #include <chrono>
 #include <fstream>
@@ -15,13 +18,8 @@ namespace {
 
 constexpr const char* kDefaultAnnounce = "http://127.0.0.1:6969/announce";
 constexpr std::size_t kDefaultPieceLength = 262144;
-// Giới hạn upload cho /api/torrents/create: tránh một request khổng lồ làm
-// nghẽn thread HTTP (mục 5.7 "giới hạn phòng thủ").
 constexpr std::size_t kMaxUploadBytes = 256ull * 1024 * 1024;
 
-// Phần trăm-encode theo RFC 5987 (dùng cho filename*=UTF-8''...), vì header
-// HTTP không phải UTF-8: ký tự ngoài ASCII (vd tiếng Việt có dấu) phải được
-// encode, nếu không trình duyệt hiển thị sai (lỗi font/mojibake).
 std::string rfc5987Encode(const std::string& value) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string out;
@@ -41,8 +39,6 @@ std::string rfc5987Encode(const std::string& value) {
     return out;
 }
 
-// Tên file an toàn cho phần filename="..." (ASCII) khi trình duyệt cũ không
-// hiểu filename*=UTF-8''...: thay mọi byte ngoài ASCII in được bằng '_'.
 std::string asciiFallbackName(const std::string& value) {
     std::string out;
     out.reserve(value.size());
@@ -58,8 +54,6 @@ std::string buildContentDisposition(const std::string& downloadName) {
            "\"; filename*=UTF-8''" + rfc5987Encode(downloadName);
 }
 
-// Chỉ giữ lại tên file (bỏ mọi phần đường dẫn người dùng gửi lên) để tránh
-// path traversal khi ghi file tạm ra đĩa.
 std::filesystem::path safeFileName(const std::string& rawName) {
     std::filesystem::path name = std::filesystem::path(rawName).filename();
     if (name.empty() || name == "." || name == "..") {
@@ -67,27 +61,6 @@ std::filesystem::path safeFileName(const std::string& rawName) {
     }
     return name;
 }
-
-std::filesystem::path makeUniqueUploadDir(const std::filesystem::path& tempDir) {
-    const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    std::random_device rd;
-    std::mt19937_64 rng(rd());
-    std::uniform_int_distribution<unsigned long long> dist;
-
-    const std::string folder = "upload_" + std::to_string(now) + "_" + std::to_string(dist(rng));
-    return tempDir / folder;
-}
-
-// Xoá thư mục tạm khi ra khỏi scope, dù thành công hay lỗi.
-struct ScopedTempDir {
-    std::filesystem::path path;
-    ~ScopedTempDir() {
-        if (!path.empty()) {
-            std::error_code ec;
-            std::filesystem::remove_all(path, ec);
-        }
-    }
-};
 
 std::size_t parsePieceLength(const httplib::MultipartFormData& form) {
     if (!form.has_field("piece_length")) {
@@ -104,8 +77,7 @@ std::size_t parsePieceLength(const httplib::MultipartFormData& form) {
     }
 }
 
-void handleCreateTorrent(const httplib::Request& req, httplib::Response& res,
-                          const std::filesystem::path& tempDir) {
+void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
     if (!req.form.has_file("file")) {
         res.status = 400;
         res.set_content("Missing \"file\" field", "text/plain");
@@ -119,22 +91,15 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
+    std::filesystem::path downloadDir = std::filesystem::current_path() / "data" / "downloads";
     std::error_code ec;
-    std::filesystem::create_directories(tempDir, ec);
-
-    ScopedTempDir scopedDir{makeUniqueUploadDir(tempDir)};
-    std::filesystem::create_directories(scopedDir.path, ec);
-    if (ec) {
-        res.status = 500;
-        res.set_content("Failed to prepare upload directory", "text/plain");
-        return;
-    }
+    std::filesystem::create_directories(downloadDir, ec);
 
     const std::filesystem::path sourceName = safeFileName(upload.filename);
-    const std::filesystem::path sourcePath = scopedDir.path / sourceName;
+    const std::filesystem::path persistentPath = downloadDir / sourceName;
 
     {
-        std::ofstream output(sourcePath, std::ios::binary);
+        std::ofstream output(persistentPath, std::ios::binary);
         if (!output) {
             res.status = 500;
             res.set_content("Failed to store uploaded file", "text/plain");
@@ -150,15 +115,32 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res,
     const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
 
     try {
-        // Chỗ nối thật: dùng đúng TorrentBuilder của tầng core (5.1), không
-        // phải bản bencode/SHA-1 viết lại bằng JavaScript phía client nữa.
         const std::string torrentBytes = TorrentBuilder::buildTorrent(
-            sourcePath, announce, pieceLength, nameOverride);
+            persistentPath, announce, pieceLength, nameOverride);
+
+        // Parse metadata để lấy info_hash và tạo Magnet URI
+        auto meta = TorrentFile::parse(torrentBytes);
+        std::string infoHashHex = sha1Hex(meta.infoRaw);
+        std::string magnetUri = "magnet:?xt=urn:btih:" + infoHashHex +
+                                "&dn=" + rfc5987Encode(meta.name) +
+                                "&tr=" + rfc5987Encode(announce);
+
+        // Khởi động TorrentSession chạy ngầm ở chế độ Seeder
+        TorrentSessionConfig config;
+        config.download_dir = downloadDir;
+        config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_lsd = true;
+
+        auto session = std::make_shared<TorrentSession>(meta, config);
+        session->start();
+        StateBridge::instance().addSession(session, magnetUri);
 
         const std::string downloadName =
             (nameOverride.empty() ? sourceName.string() : nameOverride) + ".torrent";
 
         res.set_header("Content-Disposition", buildContentDisposition(downloadName));
+        res.set_header("X-Magnet-Uri", magnetUri);
+        res.set_header("Access-Control-Expose-Headers", "Content-Disposition, X-Magnet-Uri");
         res.set_content(torrentBytes, "application/x-bittorrent");
     } catch (const std::exception& error) {
         res.status = 500;
@@ -166,11 +148,83 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res,
     }
 }
 
+void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
+    if (!req.form.has_file("file")) {
+        res.status = 400;
+        res.set_content("Missing \"file\" field", "text/plain");
+        return;
+    }
+
+    const httplib::FormData upload = req.form.get_file("file");
+    try {
+        auto meta = TorrentFile::parse(upload.content);
+        std::string infoHashHex = sha1Hex(meta.infoRaw);
+        std::string magnetUri = "magnet:?xt=urn:btih:" + infoHashHex +
+                                "&dn=" + rfc5987Encode(meta.name) +
+                                "&tr=" + rfc5987Encode(meta.announce);
+
+        std::filesystem::path downloadDir = std::filesystem::current_path() / "data" / "downloads";
+        std::error_code ec;
+        std::filesystem::create_directories(downloadDir, ec);
+
+        TorrentSessionConfig config;
+        config.download_dir = downloadDir;
+        config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_lsd = true;
+
+        auto session = std::make_shared<TorrentSession>(meta, config);
+        session->start();
+        StateBridge::instance().addSession(session, magnetUri);
+
+        res.status = 200;
+        res.set_content("{\"status\":\"ok\",\"info_hash\":\"" + infoHashHex + "\"}", "application/json");
+    } catch (const std::exception& e) {
+        res.status = 400;
+        res.set_content(std::string("Failed to parse torrent: ") + e.what(), "text/plain");
+    }
+}
+
+void handleRemoveTorrent(const httplib::Request& req, httplib::Response& res) {
+    std::string hash = req.has_param("hash") ? req.get_param_value("hash") : "";
+    if (hash.empty() && req.has_param("info_hash")) {
+        hash = req.get_param_value("info_hash");
+    }
+    if (hash.empty()) {
+        res.status = 400;
+        res.set_content("Missing hash parameter", "text/plain");
+        return;
+    }
+
+    if (StateBridge::instance().removeSession(hash)) {
+        res.status = 200;
+        res.set_content("{\"status\":\"ok\"}", "application/json");
+    } else {
+        res.status = 404;
+        res.set_content("Torrent not found", "text/plain");
+    }
+}
+
 }  // namespace
 
-void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::path& tempDir) {
-    server.Post("/api/torrents/create", [tempDir](const httplib::Request& req, httplib::Response& res) {
-        handleCreateTorrent(req, res, tempDir);
+void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::path& /*tempDir*/) {
+    server.Post("/api/torrents/create", [](const httplib::Request& req, httplib::Response& res) {
+        handleCreateTorrent(req, res);
+    });
+
+    server.Post("/api/torrents/add", [](const httplib::Request& req, httplib::Response& res) {
+        handleAddTorrent(req, res);
+    });
+
+    server.Post("/api/torrents/remove", [](const httplib::Request& req, httplib::Response& res) {
+        handleRemoveTorrent(req, res);
+    });
+
+    server.Get("/api/torrents", [](const httplib::Request& /*req*/, httplib::Response& res) {
+        res.set_content(StateBridge::instance().toJsonString(), "application/json");
+    });
+
+    server.Get("/api/status", [](const httplib::Request& /*req*/, httplib::Response& res) {
+        res.set_content(StateBridge::instance().toJsonString(), "application/json");
     });
 }
 
