@@ -23,6 +23,35 @@ add_executable(test_choker
 target_include_directories(test_choker PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_choker COMMAND test_choker)
 
+# DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
+add_executable(test_kademlia
+    tests/test_kademlia.cpp
+    src/network/dht/node_id.cpp
+    src/network/dht/routing_table.cpp
+    src/network/dht/krpc.cpp
+    src/network/dht/kademlia_node.cpp
+    src/core/bencode.cpp
+    src/core/hash_utils.cpp
+)
+
+target_include_directories(test_kademlia PRIVATE ${CMAKE_SOURCE_DIR}/src)
+find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
+target_link_libraries(test_kademlia PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_kademlia PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_kademlia COMMAND test_kademlia)
+
+# LSD (BEP 14): compile-check (test multicast thật chạy bằng tay qua script riêng)
+add_library(lsd_lib STATIC
+    src/network/lsd.cpp
+)
+target_include_directories(lsd_lib PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(WIN32)
+    target_link_libraries(lsd_lib PRIVATE ws2_32)
+endif()
+
 add_executable(test_bencode
     tests/test_bencode.cpp
     src/core/bencode.cpp
@@ -107,6 +136,45 @@ if(WIN32)
     target_link_libraries(test_tracker_protocol PRIVATE ws2_32 crypt32)
 endif()
 add_test(NAME test_tracker_protocol COMMAND test_tracker_protocol)
+
+# Peer Wire Protocol (BEP 3, BEP 5, BEP 10): encode/decode & defensive checks
+add_executable(test_peer_protocol
+    tests/test_peer_protocol.cpp
+    src/network/peer_protocol.cpp
+)
+target_include_directories(test_peer_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_peer_protocol COMMAND test_peer_protocol)
+
+# Peer Connection (TCP socket via Asio, loopback integration test)
+add_executable(test_peer_connection
+    tests/test_peer_connection.cpp
+    src/network/peer_protocol.cpp
+    src/network/peer_connection.cpp
+)
+target_include_directories(test_peer_connection PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(test_peer_connection PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_peer_connection PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_peer_connection COMMAND test_peer_connection)
+
+# Công cụ thực chiến Peer Wire: seed, leech, security attack simulation
+add_executable(peer_wire_tool
+    tools/peer_wire_tool.cpp
+    src/network/peer_protocol.cpp
+    src/network/peer_connection.cpp
+)
+target_include_directories(peer_wire_tool PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(peer_wire_tool PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(peer_wire_tool PRIVATE ws2_32 crypt32)
+endif()
 
 # Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
 # core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
