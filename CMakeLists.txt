@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# cpp-httplib & Asio yêu cầu target Windows 10+ (0x0A00) khi compile trên Windows
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 enable_testing()
 
 add_executable(test_piece_picker

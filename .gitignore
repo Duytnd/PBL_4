@@ -52,3 +52,7 @@ __pycache__/
 
 # OS generated
 Thumbs.db
+
+# Runtime data & downloaded files
+data/
+*.torrent

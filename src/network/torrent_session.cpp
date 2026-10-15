@@ -629,6 +629,13 @@ void TorrentSession::handle_peer_message(
         }
         case pbl4::network::PeerMessageId::Interested: {
             peer->peer_interested = true;
+            // Unchoke ngay lập tức cho peer nếu mình đang seed hoặc có dữ liệu để bắt đầu truyền tải ngay
+            if (peer->am_choking) {
+                try {
+                    peer->connection->send_unchoke();
+                    peer->am_choking = false;
+                } catch (...) {}
+            }
             break;
         }
         case pbl4::network::PeerMessageId::NotInterested: {
@@ -653,17 +660,26 @@ void TorrentSession::handle_peer_message(
             auto bits = pbl4::network::peer_protocol::parse_bitfield(msg, metadata_.pieces.size());
             peer->bitfield = bits;
 
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            bool interested = false;
-            for (std::size_t i = 0; i < bits.size() && i < my_bitfield_.size(); ++i) {
-                if (bits[i] && !my_bitfield_[i]) {
-                    interested = true;
-                    break;
+            bool should_request = false;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                bool interested = false;
+                for (std::size_t i = 0; i < bits.size() && i < my_bitfield_.size(); ++i) {
+                    if (bits[i] && !my_bitfield_[i]) {
+                        interested = true;
+                        break;
+                    }
                 }
+                if (interested && !peer->am_interested) {
+                    peer->connection->send_interested();
+                    peer->am_interested = true;
+                }
+                // Nếu đã được unchoke từ trước (race: unchoke đến trước bitfield),
+                // đánh dấu để gửi request ngay sau khi giải phóng lock
+                should_request = (!peer->peer_choking && peer->am_interested);
             }
-            if (interested && !peer->am_interested) {
-                peer->connection->send_interested();
-                peer->am_interested = true;
+            if (should_request) {
+                request_next_blocks(peer);
             }
             break;
         }
@@ -675,6 +691,11 @@ void TorrentSession::handle_peer_message(
         case pbl4::network::PeerMessageId::Piece: {
             auto piece = pbl4::network::peer_protocol::parse_piece(msg);
             handle_piece_block(peer, piece);
+            // Pipeline: ngay sau khi nhận được block, gửi tiếp request block kế tiếp
+            // để luôn duy trì 4 request song song → tốc độ tải tối đa
+            if (!peer->peer_choking && peer->am_interested) {
+                request_next_blocks(peer);
+            }
             break;
         }
         default:
@@ -779,7 +800,11 @@ void TorrentSession::handle_piece_block(
 
 bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
     std::lock_guard<std::mutex> lock(session_mutex_);
-    if (state_ != SessionState::Downloading || my_bitfield_.empty()) {
+    // Cho phép request trong trạng thái Downloading HOẶC nếu vẫn còn piece cần tải
+    if (my_bitfield_.empty()) {
+        return false;
+    }
+    if (state_ != SessionState::Downloading && state_ != SessionState::Checking) {
         return false;
     }
 

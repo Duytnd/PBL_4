@@ -2,7 +2,11 @@
 
 (() => {
   const VIEWS = ['dashboard', 'torrents', 'speed'];
-  const DEFAULT_ANNOUNCE = 'http://localhost:6969/announce';
+  // Tự động dùng địa chỉ IP/host của máy đang mở WebUI (ví dụ 10.10.59.47:6969) để máy khác dùng được ngay
+  const host = (window.location && window.location.hostname && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')
+    ? window.location.hostname
+    : '10.10.59.47';
+  const DEFAULT_ANNOUNCE = `http://${host}:6969/announce`;
   const PIECE_LENGTH = 262144;
   const torrentList = [];
   let activeAction = 'create';
