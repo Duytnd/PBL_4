@@ -2,14 +2,26 @@
 
 (() => {
   const VIEWS = ['dashboard', 'torrents', 'speed'];
-  // Tự động dùng địa chỉ IP/host của máy đang mở WebUI (ví dụ 10.10.59.47:6969) để máy khác dùng được ngay
-  const host = (window.location && window.location.hostname && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')
-    ? window.location.hostname
-    : '10.10.59.47';
-  const DEFAULT_ANNOUNCE = `http://${host}:6969/announce`;
+  let currentAnnounceUrl = 'http://127.0.0.1:6969/announce';
   const PIECE_LENGTH = 262144;
   const torrentList = [];
   let activeAction = 'create';
+
+  async function fetchSystemInfo() {
+    try {
+      const res = await fetch('/api/system/info');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.default_announce) {
+          currentAnnounceUrl = data.default_announce;
+          const input = document.getElementById('tracker-announce-input');
+          if (input && (!input.value || input.value.includes('127.0.0.1') || input.value.includes('10.10.'))) {
+            input.value = currentAnnounceUrl;
+          }
+        }
+      }
+    } catch (_) {}
+  }
 
   function showView() {
     const name = location.hash.replace(/^#\/?/, '');
@@ -207,9 +219,12 @@
   }
 
   async function requestTorrentFromServer(file) {
+    const announceInput = document.getElementById('tracker-announce-input');
+    const announceUrl = (announceInput && announceInput.value.trim()) ? announceInput.value.trim() : currentAnnounceUrl;
+
     const formData = new FormData();
     formData.append('file', file, file.name);
-    formData.append('announce', DEFAULT_ANNOUNCE);
+    formData.append('announce', announceUrl);
     formData.append('piece_length', String(PIECE_LENGTH));
 
     const response = await fetch('/api/torrents/create', {
@@ -371,6 +386,7 @@
   }
 
   // Initial render & polling
+  fetchSystemInfo();
   renderTorrentList();
   window.addEventListener('hashchange', showView);
   showView();

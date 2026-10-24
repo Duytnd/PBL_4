@@ -105,6 +105,10 @@ void TorrentSession::check_existing_files() {
     std::lock_guard<std::mutex> lock(session_mutex_);
     set_state(SessionState::Checking);
 
+    std::cout << "[SESSION] Checking file: " << save_path_
+              << " | Expected total: " << total_bytes_ << " bytes, "
+              << metadata_.pieces.size() << " pieces" << std::endl;
+
     if (std::filesystem::exists(save_path_)) {
         if (piece_manager_->loadFromFile(save_path_)) {
             completed_pieces_count_ = 0;
@@ -120,14 +124,23 @@ void TorrentSession::check_existing_files() {
                     }
                 }
             }
+            std::cout << "[SESSION] File loaded successfully. Completed pieces: "
+                      << completed_pieces_count_ << "/" << metadata_.pieces.size() << std::endl;
+        } else {
+            std::cout << "[SESSION] Warning: Failed to load existing file into memory." << std::endl;
         }
+    } else {
+        std::cout << "[SESSION] File does not exist yet (download target): " << save_path_ << std::endl;
     }
 
     if (!metadata_.pieces.empty() && completed_pieces_count_ == metadata_.pieces.size()) {
         set_state(SessionState::Seeding);
         left_bytes_ = 0;
+        std::cout << "[SESSION] Status set to SEEDING (100% complete)" << std::endl;
     } else {
         set_state(SessionState::Stopped);
+        std::cout << "[SESSION] Status set to STOPPED (" << completed_pieces_count_ << "/"
+                  << metadata_.pieces.size() << " pieces ready)" << std::endl;
     }
 }
 
@@ -142,8 +155,10 @@ bool TorrentSession::start() {
 
     if (completed_pieces_count_ == metadata_.pieces.size() && !metadata_.pieces.empty()) {
         set_state(SessionState::Seeding);
+        std::cout << "[SESSION] Started as SEEDER on port " << config_.listen_port << std::endl;
     } else {
         set_state(SessionState::Downloading);
+        std::cout << "[SESSION] Started as DOWNLOADER on port " << config_.listen_port << std::endl;
     }
 
     last_rate_calc_time_ = std::chrono::steady_clock::now();
@@ -549,14 +564,18 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
             peer->connection->send_handshake(our_hs);
             auto remote_hs = peer->connection->receive_handshake();
             if (std::memcmp(remote_hs.info_hash.data(), info_hash_raw_.data(), 20) != 0) {
+                std::cout << "[PEER-WIRE] Handshake info_hash MISMATCH with " << peer->endpoint_str << "! Closing." << std::endl;
                 peer->connection->close();
                 peer->worker_active = false;
                 return;
             }
             peer->remote_peer_id = std::string(
                 reinterpret_cast<const char*>(remote_hs.peer_id.data()), 20);
+            std::cout << "[PEER-WIRE] Handshake OK with " << peer->endpoint_str
+                      << " (peer_id: " << peer->remote_peer_id.substr(0, 8) << "...)" << std::endl;
         } else {
             peer->connection->send_handshake(our_hs);
+            std::cout << "[PEER-WIRE] Inbound Handshake reply sent to " << peer->endpoint_str << std::endl;
         }
 
         // Gửi Bitfield của client cho Peer ngay sau handshake
@@ -565,6 +584,10 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
             std::lock_guard<std::mutex> lock(session_mutex_);
             current_bits = my_bitfield_;
         }
+        std::size_t my_has = 0;
+        for (bool b : current_bits) if (b) my_has++;
+        std::cout << "[PEER-WIRE] Sending bitfield (" << my_has << "/" << current_bits.size()
+                  << " pieces) to " << peer->endpoint_str << std::endl;
         peer->connection->send_bitfield(current_bits);
 
         // Bày tỏ quan tâm nếu đang tải
@@ -573,6 +596,7 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
             if (state_ == SessionState::Downloading) {
                 peer->connection->send_interested();
                 peer->am_interested = true;
+                std::cout << "[PEER-WIRE] Sent INTERESTED to " << peer->endpoint_str << std::endl;
             }
         }
 
@@ -620,20 +644,24 @@ void TorrentSession::handle_peer_message(
     switch (msg_id) {
         case pbl4::network::PeerMessageId::Choke: {
             peer->peer_choking = true;
+            std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " CHOKED us." << std::endl;
             break;
         }
         case pbl4::network::PeerMessageId::Unchoke: {
             peer->peer_choking = false;
+            std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " UNCHOKED us! Requesting blocks..." << std::endl;
             request_next_blocks(peer);
             break;
         }
         case pbl4::network::PeerMessageId::Interested: {
             peer->peer_interested = true;
+            std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " is INTERESTED in our pieces." << std::endl;
             // Unchoke ngay lập tức cho peer nếu mình đang seed hoặc có dữ liệu để bắt đầu truyền tải ngay
             if (peer->am_choking) {
                 try {
                     peer->connection->send_unchoke();
                     peer->am_choking = false;
+                    std::cout << "[PEER-WIRE] Sent UNCHOKE to " << peer->endpoint_str << " (Allowed to download)" << std::endl;
                 } catch (...) {}
             }
             break;
@@ -707,6 +735,8 @@ void TorrentSession::handle_request_block(
     std::shared_ptr<ActivePeer> peer,
     const pbl4::network::RequestPayload& req) {
     if (peer->am_choking) {
+        std::cout << "[UPLOAD] Rejected request from " << peer->endpoint_str
+                  << " because peer is choked by us." << std::endl;
         return;
     }
 
@@ -728,6 +758,12 @@ void TorrentSession::handle_request_block(
         std::lock_guard<std::mutex> lock(session_mutex_);
         uploaded_bytes_ += block_data.size();
         peer->uploaded_bytes += block_data.size();
+
+        std::cout << "[UPLOAD] Sent piece #" << req.index << " (offset: " << req.begin
+                  << ", size: " << block_data.size() << " bytes) to " << peer->endpoint_str
+                  << " | Total uploaded: " << uploaded_bytes_ << " bytes" << std::endl;
+    } else {
+        std::cout << "[UPLOAD] Failed to read piece #" << req.index << " (we might not have it)." << std::endl;
     }
 }
 
@@ -767,11 +803,17 @@ void TorrentSession::handle_piece_block(
         prog.received_blocks++;
     }
 
+    std::cout << "[DOWNLOAD] Received block for piece #" << piece.index << " (offset: " << piece.begin
+              << ", size: " << piece.data.size() << " bytes) from " << peer->endpoint_str
+              << " [" << prog.received_blocks << "/" << prog.total_blocks << " blocks]" << std::endl;
+
     // Nếu đã nhận đủ mọi block của piece -> verify hash SHA-1
     if (prog.received_blocks >= prog.total_blocks && prog.total_blocks > 0) {
         if (piece_manager_->verifyPiece(piece.index)) {
             my_bitfield_[piece.index] = true;
             completed_pieces_count_++;
+            std::cout << "[PIECE-VERIFY] Piece #" << piece.index << " SHA-1 VERIFIED OK! ("
+                      << completed_pieces_count_ << "/" << metadata_.pieces.size() << " completed)" << std::endl;
 
             const std::size_t psize = piece_manager_->pieceSize(piece.index);
             if (left_bytes_ >= psize) {
@@ -879,7 +921,21 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
 
         peer->connection->send_request(next_piece, begin, len);
         pending_blocks_.push_back({static_cast<std::uint32_t>(next_piece), begin, len, peer->endpoint_str, std::chrono::steady_clock::now()});
+        std::cout << "[DOWNLOAD-REQ] Sent request for piece #" << next_piece << " (begin: " << begin
+                  << ", len: " << len << ") to " << peer->endpoint_str << std::endl;
         return true;
+    } else {
+        static auto last_warn = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_warn > std::chrono::seconds(5)) {
+            std::cout << "[DOWNLOAD-REQ] Cannot pick piece! picker_result=" << next_piece
+                      << " | peer_bitfield_size=" << peer->bitfield.size()
+                      << " | our_unavail_pieces=";
+            std::size_t unavail = 0;
+            for (bool b : unavailable_or_in_progress) if (b) unavail++;
+            std::cout << unavail << "/" << unavailable_or_in_progress.size() << std::endl;
+            last_warn = now;
+        }
     }
 
     return false;

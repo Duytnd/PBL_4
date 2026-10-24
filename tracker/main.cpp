@@ -64,6 +64,11 @@ int main(int argc, char** argv) {
         // tránh client giả mạo địa chỉ peer khác (tránh bị lợi dụng làm DDoS).
         request.ip = req.remote_addr;
 
+        std::cout << "[TRACKER] Announce received from " << request.ip << ":" << request.port
+                  << " | event=" << (request.event.empty() ? "interval" : request.event)
+                  << " | left=" << request.left
+                  << " | up=" << request.uploaded << " | down=" << request.downloaded << std::endl;
+
         const std::string response = tracker.announce(request);
         res.set_content(response, "text/plain");
     });

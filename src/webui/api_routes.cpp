@@ -13,8 +13,63 @@
 #include <stdexcept>
 #include <system_error>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#endif
+
 namespace p2p {
 namespace {
+
+std::string getLocalLanIp() {
+#ifdef _WIN32
+    // Windows: connect UDP socket to query route IP
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock != INVALID_SOCKET) {
+        sockaddr_in loopback{};
+        loopback.sin_family = AF_INET;
+        loopback.sin_addr.s_addr = inet_addr("8.8.8.8");
+        loopback.sin_port = htons(53);
+        if (connect(sock, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)) == 0) {
+            sockaddr_in local{};
+            int len = sizeof(local);
+            if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+                char ipStr[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr))) {
+                    closesocket(sock);
+                    return std::string(ipStr);
+                }
+            }
+        }
+        closesocket(sock);
+    }
+#else
+    // macOS / Linux: scan interfaces with getifaddrs
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) == 0) {
+        for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                char ipStr[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &sin->sin_addr, ipStr, sizeof(ipStr))) {
+                    std::string ip(ipStr);
+                    // Bỏ qua loopback 127.0.0.1
+                    if (ip != "127.0.0.1" && ip.rfind("127.", 0) != 0 && ip.rfind("169.254.", 0) != 0) {
+                        freeifaddrs(ifap);
+                        return ip;
+                    }
+                }
+            }
+        }
+        freeifaddrs(ifap);
+    }
+#endif
+    return "127.0.0.1";
+}
 
 constexpr const char* kDefaultAnnounce = "http://127.0.0.1:6969/announce";
 constexpr std::size_t kDefaultPieceLength = 262144;
@@ -225,6 +280,13 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Get("/api/status", [](const httplib::Request& /*req*/, httplib::Response& res) {
         res.set_content(StateBridge::instance().toJsonString(), "application/json");
+    });
+
+    server.Get("/api/system/info", [](const httplib::Request& /*req*/, httplib::Response& res) {
+        const std::string ip = getLocalLanIp();
+        const std::string announce = "http://" + ip + ":6969/announce";
+        std::string json = "{\"ip\":\"" + ip + "\",\"default_announce\":\"" + announce + "\"}";
+        res.set_content(json, "application/json");
     });
 }
 
