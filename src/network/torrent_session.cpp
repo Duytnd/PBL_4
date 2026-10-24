@@ -291,12 +291,17 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     if (ip.empty() || port == 0) return;
     const std::string ep = ip + ":" + std::to_string(port);
 
+    bool is_new = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (known_peer_endpoints_.insert(ep).second) {
             candidate_peer_endpoints_.push_back(ep);
+            is_new = true;
         }
     }
+    std::cout << "[ADD-PEER] " << ep
+              << (is_new ? " -> added to candidates" : " -> already known, skipped")
+              << " | running=" << running_ << " paused=" << paused_ << std::endl;
     if (running_ && !paused_) {
         connect_candidate_peers();
     }
@@ -323,11 +328,19 @@ TorrentSessionStats TorrentSession::stats() const {
     s.upload_rate = current_upload_rate_;
     s.error_message = error_message_;
 
-    if (total_bytes_ > 0) {
+    // Nếu đang Seeding → luôn 100%
+    if (state_ == SessionState::Seeding) {
+        s.progress_percent = 100.0;
+    } else if (s.total_pieces > 0) {
+        // Tính theo số piece đã hoàn thành (chính xác hơn left_bytes khi tải theo block)
+        s.progress_percent = std::clamp(
+            (static_cast<double>(s.completed_pieces) / static_cast<double>(s.total_pieces)) * 100.0,
+            0.0, 100.0);
+    } else if (total_bytes_ > 0) {
         const double downloaded = static_cast<double>(total_bytes_ - left_bytes_);
         s.progress_percent = std::clamp((downloaded / static_cast<double>(total_bytes_)) * 100.0, 0.0, 100.0);
     } else {
-        s.progress_percent = (s.total_pieces > 0 && s.completed_pieces == s.total_pieces) ? 100.0 : 0.0;
+        s.progress_percent = 0.0;
     }
     return s;
 }
@@ -523,10 +536,12 @@ void TorrentSession::connect_candidate_peers() {
         const std::string ip = ep_str.substr(0, colon);
         const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(ep_str.substr(colon + 1)));
 
+        std::cout << "[CONNECT] Attempting TCP connect to " << ep_str << std::endl;
         try {
             auto conn = pbl4::network::PeerConnection::connect_to(
                 ip, port, std::chrono::seconds(5));
 
+            std::cout << "[CONNECT] TCP connected to " << ep_str << std::endl;
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
@@ -542,10 +557,10 @@ void TorrentSession::connect_candidate_peers() {
             }
 
             peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
-        } catch (const std::exception&) {
-            // Ignore connection error to individual peer
+        } catch (const std::exception& ex) {
+            std::cout << "[CONNECT] Failed to connect to " << ep_str << ": " << ex.what() << std::endl;
         } catch (...) {
-            // Ignore connection error to individual peer
+            std::cout << "[CONNECT] Failed to connect to " << ep_str << " (unknown error)" << std::endl;
         }
     }
 }
@@ -1048,6 +1063,7 @@ void TorrentSession::update_rates() {
 
 void TorrentSession::process_tracker_announce(const std::string& event) {
     if (metadata_.announce.empty()) {
+        std::cout << "[TRACKER-ANNOUNCE] Skipping: announce URL is empty!" << std::endl;
         return;
     }
 
@@ -1066,16 +1082,30 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
     req.compact = true;
 
     const std::string url = metadata_.announce;
+    std::cout << "[TRACKER-ANNOUNCE] Sending event='" << event
+              << "' to " << url
+              << " | port=" << req.port
+              << " | left=" << req.left << std::endl;
+
     std::thread([this, url, req]() {
         try {
             TrackerResponse resp = TrackerClient::announceHttp(url, req);
             if (resp.success) {
+                std::cout << "[TRACKER-ANNOUNCE] Response OK | peers received: "
+                          << resp.peers.size() << std::endl;
                 for (const auto& peer : resp.peers) {
+                    std::cout << "[TRACKER-ANNOUNCE] Got peer: "
+                              << peer.ip << ":" << peer.port << std::endl;
                     add_peer(peer.ip, peer.port);
                 }
+            } else {
+                std::cout << "[TRACKER-ANNOUNCE] Response FAILED: "
+                          << resp.failureReason << std::endl;
             }
+        } catch (const std::exception& ex) {
+            std::cout << "[TRACKER-ANNOUNCE] Exception: " << ex.what() << std::endl;
         } catch (...) {
-            // Tracker tạm thời không phản hồi hoặc timeout
+            std::cout << "[TRACKER-ANNOUNCE] Unknown exception!" << std::endl;
         }
     }).detach();
 }

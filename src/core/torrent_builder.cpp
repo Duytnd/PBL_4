@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -79,23 +78,57 @@ std::vector<FileEntry> collectFiles(const std::filesystem::path& sourcePath) {
     return files;
 }
 
-std::string encodePieceHashes(const std::string& payload, std::size_t pieceLength) {
-    std::string pieces;
-    for (std::size_t offset = 0; offset < payload.size(); offset += pieceLength) {
-        const std::size_t chunkSize = std::min<std::size_t>(pieceLength, payload.size() - offset);
-        const std::string piece = payload.substr(offset, chunkSize);
-        const std::string digest = sha1Digest(piece);
-        pieces.append(digest);
-    }
-    return pieces;
-}
+// Đọc file streaming theo chunk, hash từng piece mà không load toàn bộ file vào RAM.
+// pieceLength thường là 256KB, đọc từng 1MB buffer để tránh tốn RAM với file lớn.
+std::string computePieceHashesStreaming(
+    const std::vector<FileEntry>& files,
+    std::size_t pieceLength)
+{
+    static constexpr std::size_t kReadBuf = 1024 * 1024; // 1MB read buffer
 
-std::string buildSingleFilePayload(const std::filesystem::path& filePath) {
-    std::ifstream input(filePath, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("TorrentBuilder: cannot read source file");
+    std::string pieces;
+    Sha1Context pieceCtx;        // SHA-1 context cho piece hiện tại
+    std::size_t byteInPiece = 0; // Số byte đã nạp vào piece hiện tại
+
+    std::vector<char> buf(kReadBuf);
+
+    for (const auto& file : files) {
+        if (file.size == 0) continue;
+
+        std::ifstream in(file.absolutePath, std::ios::binary);
+        if (!in) continue;
+
+        while (in) {
+            in.read(buf.data(), static_cast<std::streamsize>(kReadBuf));
+            std::size_t bytesRead = static_cast<std::size_t>(in.gcount());
+            if (bytesRead == 0) break;
+
+            std::size_t pos = 0;
+            while (pos < bytesRead) {
+                // Số byte còn thiếu để lấp đầy piece hiện tại
+                const std::size_t spaceLeft = pieceLength - byteInPiece;
+                const std::size_t chunk = std::min(spaceLeft, bytesRead - pos);
+
+                pieceCtx.update(buf.data() + pos, chunk);
+                byteInPiece += chunk;
+                pos += chunk;
+
+                if (byteInPiece == pieceLength) {
+                    // Piece đầy → finalize hash và reset
+                    pieces.append(pieceCtx.finalize());
+                    pieceCtx = Sha1Context();
+                    byteInPiece = 0;
+                }
+            }
+        }
     }
-    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+
+    // Piece cuối (có thể chưa đầy)
+    if (byteInPiece > 0) {
+        pieces.append(pieceCtx.finalize());
+    }
+
+    return pieces;
 }
 
 }  // namespace
@@ -116,14 +149,11 @@ BencodeDict TorrentBuilder::buildInfoDict(
     info["name"] = BencodeValue(name);
     info["piece length"] = BencodeValue(static_cast<int64_t>(pieceLength));
 
-    std::string piecesBinary;
+    // Tính tổng dung lượng và tạo danh sách file (multi-file mode)
     std::uintmax_t totalLength = 0;
-    std::string payload;
+    bool isSingleFile = (files.size() == 1 && files[0].relativePath == sourcePath.filename());
 
-    if (files.size() == 1 && files[0].relativePath == sourcePath.filename()) {
-        payload = buildSingleFilePayload(files[0].absolutePath);
-        totalLength = payload.size();
-    } else {
+    if (!isSingleFile) {
         BencodeList fileList;
         for (const auto& file : files) {
             totalLength += file.size;
@@ -136,23 +166,14 @@ BencodeDict TorrentBuilder::buildInfoDict(
             }
             entry["path"] = BencodeValue(pathList);
             fileList.push_back(BencodeValue(entry));
-
-            if (file.size > 0) {
-                std::ifstream input(file.absolutePath, std::ios::binary);
-                if (!input) {
-                    continue;
-                }
-                payload.append(std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()));
-            }
         }
         info["files"] = BencodeValue(fileList);
+    } else {
+        totalLength = files[0].size;
     }
 
-    if (files.size() == 1 && files[0].relativePath == sourcePath.filename()) {
-        piecesBinary = encodePieceHashes(payload, pieceLength);
-    } else {
-        piecesBinary = encodePieceHashes(payload, pieceLength);
-    }
+    // Hash piece streaming — không load toàn bộ dữ liệu vào RAM
+    const std::string piecesBinary = computePieceHashesStreaming(files, pieceLength);
 
     info["length"] = BencodeValue(static_cast<int64_t>(totalLength));
     info["pieces"] = BencodeValue(piecesBinary);

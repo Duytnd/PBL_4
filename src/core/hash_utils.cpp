@@ -37,4 +37,20 @@ std::string computeInfoHash(const BencodeDict& infoDict) {
     return computeInfoHash(encodeBencode(infoDict));
 }
 
+// --- Sha1Context: streaming SHA-1 để tránh load toàn file vào RAM ---
+
+Sha1Context::Sha1Context() {
+    SHA1_Init(&ctx_);
+}
+
+void Sha1Context::update(const char* data, std::size_t size) {
+    SHA1_Update(&ctx_, reinterpret_cast<const unsigned char*>(data), size);
+}
+
+std::string Sha1Context::finalize() {
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    SHA1_Final(digest, &ctx_);
+    return std::string(reinterpret_cast<const char*>(digest), SHA_DIGEST_LENGTH);
+}
+
 }  // namespace p2p
