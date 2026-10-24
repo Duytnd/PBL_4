@@ -2,12 +2,25 @@
 
 #include "httplib.h"
 
+#include <chrono>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace p2p {
 namespace {
+
+constexpr int kTrackerMaxRetries = 3;
+
+bool isTransientTrackerHttpStatus(int status) {
+    return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+
+void sleepBeforeRetry(int attempt) {
+    const auto delayMs = std::chrono::milliseconds(250 * attempt);
+    std::this_thread::sleep_for(delayMs);
+}
 
 struct ParsedUrl {
     std::string host;
@@ -78,22 +91,33 @@ TrackerResponse TrackerClient::announceHttp(const std::string& announceUrl, cons
     const ParsedUrl url = parseHttpUrl(announceUrl);
     const std::string query = TrackerProtocol::encodeRequestQuery(request);
 
-    httplib::Client client(url.host, url.port);
-    client.set_connection_timeout(5);
-    client.set_read_timeout(5);
+    for (int attempt = 1; attempt <= kTrackerMaxRetries; ++attempt) {
+        httplib::Client client(url.host, url.port);
+        client.set_connection_timeout(5);
+        client.set_read_timeout(5);
 
-    const httplib::Result result = client.Get(url.path + "?" + query);
-    if (!result) {
-        throw std::runtime_error(
-            "TrackerClient: failed to reach tracker at " + announceUrl +
-            " (" + httplib::to_string(result.error()) + ")");
-    }
-    if (result->status != 200) {
+        const httplib::Result result = client.Get(url.path + "?" + query);
+        if (!result) {
+            if (attempt < kTrackerMaxRetries) {
+                sleepBeforeRetry(attempt);
+                continue;
+            }
+            throw std::runtime_error(
+                "TrackerClient: failed to reach tracker at " + announceUrl +
+                " (" + httplib::to_string(result.error()) + ")");
+        }
+        if (result->status == 200) {
+            return parseAnnounceResponse(result->body);
+        }
+        if (isTransientTrackerHttpStatus(result->status) && attempt < kTrackerMaxRetries) {
+            sleepBeforeRetry(attempt);
+            continue;
+        }
         throw std::runtime_error(
             "TrackerClient: tracker responded with HTTP " + std::to_string(result->status));
     }
 
-    return parseAnnounceResponse(result->body);
+    throw std::runtime_error("TrackerClient: tracker announce failed after retries");
 }
 
 }  // namespace p2p

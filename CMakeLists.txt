@@ -182,6 +182,7 @@ add_executable(test_torrent_session
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
     src/network/lsd.cpp
+    src/webui/state_bridge.cpp
 )
 target_include_directories(test_torrent_session PRIVATE
     ${CMAKE_SOURCE_DIR}/src

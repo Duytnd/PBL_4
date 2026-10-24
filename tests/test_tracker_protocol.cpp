@@ -1,5 +1,7 @@
 #include "test_framework.h"
 
+#include "httplib.h"
+
 #include "network/tracker_client.h"
 #include "network/tracker_protocol.h"
 #include "tracker/peer_registry.h"
@@ -78,6 +80,40 @@ void testTrackerClientMakePeerIdHasPrefixAndLength() {
     const std::string peerId = TrackerClient::makePeerId("-PB0001-");
     CHECK_EQ(peerId.size(), std::size_t(20));  // 8 byte prefix + 12 byte ngẫu nhiên
     CHECK_EQ(peerId.substr(0, 8), std::string("-PB0001-"));
+}
+
+void testTrackerClientRetriesTransientHttpFailures() {
+    httplib::Server server;
+    const int port = server.bind_to_any_port("127.0.0.1");
+    std::atomic<int> attempts{0};
+
+    server.Get("/announce", [&](const httplib::Request&, httplib::Response& res) {
+        if (attempts.fetch_add(1) == 0) {
+            res.status = 503;
+            res.set_content("temporary tracker outage", "text/plain");
+            return;
+        }
+        res.set_content(TrackerProtocol::encodeSuccessResponse(1800, {}), "text/plain");
+    });
+
+    std::thread serverThread([&]() {
+        server.listen_after_bind();
+    });
+
+    TrackerRequest request;
+    request.infoHash = std::string(20, 'a');
+    request.peerId = pad20("peerA");
+    request.port = 6881;
+    request.left = 100;
+
+    const TrackerResponse resp = TrackerClient::announceHttp("http://127.0.0.1:" + std::to_string(port) + "/announce", request);
+    CHECK(resp.success);
+    CHECK_EQ(attempts.load(), 2);
+
+    server.stop();
+    if (serverThread.joinable()) {
+        serverThread.join();
+    }
 }
 
 void testPeerRegistryUpsertAndGetPeersExcludesSelf() {
@@ -181,6 +217,7 @@ int main() {
     RUN(testSuccessResponseRoundTrip);
     RUN(testFailureResponseRoundTrip);
     RUN(testTrackerClientMakePeerIdHasPrefixAndLength);
+    RUN(testTrackerClientRetriesTransientHttpFailures);
     RUN(testPeerRegistryUpsertAndGetPeersExcludesSelf);
     RUN(testPeerRegistryExpiresOldPeers);
     RUN(testPeerRegistryEvictsOldestWhenFull);

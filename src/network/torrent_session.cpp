@@ -34,6 +34,7 @@ std::string session_state_to_string(SessionState s) {
         case SessionState::Stopped: return "stopped";
         case SessionState::Checking: return "checking";
         case SessionState::Downloading: return "downloading";
+        case SessionState::Waiting: return "waiting";
         case SessionState::Seeding: return "seeding";
         case SessionState::Paused: return "paused";
         case SessionState::Error: return "error";
@@ -137,6 +138,10 @@ void TorrentSession::check_existing_files() {
         set_state(SessionState::Seeding);
         left_bytes_ = 0;
         std::cout << "[SESSION] Status set to SEEDING (100% complete)" << std::endl;
+    } else if (completed_pieces_count_ > 0) {
+        set_state(SessionState::Downloading);
+        std::cout << "[SESSION] Status set to DOWNLOADING (" << completed_pieces_count_ << "/"
+                  << metadata_.pieces.size() << " pieces ready, resuming download)" << std::endl;
     } else {
         set_state(SessionState::Stopped);
         std::cout << "[SESSION] Status set to STOPPED (" << completed_pieces_count_ << "/"
@@ -148,6 +153,18 @@ bool TorrentSession::start() {
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (running_) {
         return true;
+    }
+
+    try {
+        acceptor_ioc_ = std::make_unique<asio::io_context>();
+        acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
+            *acceptor_ioc_,
+            asio::ip::tcp::endpoint(asio::ip::tcp::v4(), config_.listen_port));
+    } catch (const std::exception& ex) {
+        error_message_ = std::string("Failed to bind listen port ") + std::to_string(config_.listen_port) + ": " + ex.what();
+        set_state(SessionState::Error);
+        std::cout << "[SESSION] " << error_message_ << std::endl;
+        return false;
     }
 
     running_ = true;
@@ -331,6 +348,10 @@ TorrentSessionStats TorrentSession::stats() const {
     // Nếu đang Seeding → luôn 100%
     if (state_ == SessionState::Seeding) {
         s.progress_percent = 100.0;
+    } else if (state_ == SessionState::Waiting && s.total_pieces > 0) {
+        s.progress_percent = std::clamp(
+            (static_cast<double>(s.completed_pieces) / static_cast<double>(s.total_pieces)) * 100.0,
+            0.0, 100.0);
     } else if (s.total_pieces > 0) {
         // Tính theo số piece đã hoàn thành (chính xác hơn left_bytes khi tải theo block)
         s.progress_percent = std::clamp(
@@ -468,12 +489,11 @@ void TorrentSession::orchestration_loop() {
 
 void TorrentSession::acceptor_loop() {
     try {
-        acceptor_ioc_ = std::make_unique<asio::io_context>();
-        acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(
-            *acceptor_ioc_,
-            asio::ip::tcp::endpoint(asio::ip::tcp::v4(), config_.listen_port));
-
         while (running_) {
+            if (!acceptor_) {
+                break;
+            }
+
             asio::error_code ec;
             asio::ip::tcp::socket socket = acceptor_->accept(ec);
             if (ec || !running_) {
@@ -1101,11 +1121,26 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
             } else {
                 std::cout << "[TRACKER-ANNOUNCE] Response FAILED: "
                           << resp.failureReason << std::endl;
+                if (state_ == SessionState::Downloading || state_ == SessionState::Checking || state_ == SessionState::Stopped) {
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    error_message_ = resp.failureReason.empty() ? "Tracker rejected announce request" : resp.failureReason;
+                    set_state(SessionState::Waiting);
+                }
             }
         } catch (const std::exception& ex) {
             std::cout << "[TRACKER-ANNOUNCE] Exception: " << ex.what() << std::endl;
+            if (state_ == SessionState::Downloading || state_ == SessionState::Checking || state_ == SessionState::Stopped) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                error_message_ = std::string("Tracker temporarily unavailable: ") + ex.what();
+                set_state(SessionState::Waiting);
+            }
         } catch (...) {
             std::cout << "[TRACKER-ANNOUNCE] Unknown exception!" << std::endl;
+            if (state_ == SessionState::Downloading || state_ == SessionState::Checking || state_ == SessionState::Stopped) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                error_message_ = "Tracker temporarily unavailable";
+                set_state(SessionState::Waiting);
+            }
         }
     }).detach();
 }

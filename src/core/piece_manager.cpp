@@ -142,18 +142,34 @@ bool PieceManager::loadFromFile(const std::filesystem::path& filePath) {
     if (!file) {
         return false;
     }
+
+    bool any_data_loaded = false;
     for (std::size_t i = 0; i < pieceCount_; ++i) {
         const std::size_t size = pieceSize(i);
-        if (size == 0) continue;
+        if (size == 0) {
+            continue;
+        }
+
         std::string buffer(size, '\0');
         file.read(buffer.data(), static_cast<std::streamsize>(size));
         const std::size_t bytesRead = static_cast<std::size_t>(file.gcount());
-        if (bytesRead < size) {
-            return false;
+        if (bytesRead == 0) {
+            break;
         }
+
+        if (bytesRead < size) {
+            if (bytesRead > 0) {
+                writeBlock(i, 0, bytesRead, buffer.substr(0, bytesRead));
+            }
+            any_data_loaded = true;
+            break;
+        }
+
         writeBlock(i, 0, size, buffer);
+        any_data_loaded = true;
     }
-    return true;
+
+    return any_data_loaded;
 }
 
 std::string PieceManager::assembleFile() const {

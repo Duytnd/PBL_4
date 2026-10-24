@@ -5,6 +5,7 @@
 #include "network/peer_connection.h"
 #include "network/peer_protocol.h"
 #include "network/torrent_session.h"
+#include "webui/state_bridge.h"
 
 #include <chrono>
 #include <filesystem>
@@ -98,6 +99,89 @@ void testSessionExistingFileSeeding() {
     CHECK_EQ(stats.state, SessionState::Seeding);
 
     std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testSessionPartialExistingFileRemainsDownloading() {
+    std::cout << "[TEST] TorrentSession leaves partial existing file in Downloading state...\n";
+    const std::filesystem::path temp_dir = "./test_partial_download";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    const std::vector<std::string> pieces = {"AlphaPiece123456", "BetaPiece1234567"};
+    auto meta = makeMockMetadata("partial_file.bin", pieces, 16);
+
+    const std::filesystem::path file_path = temp_dir / meta.name;
+    {
+        std::ofstream out(file_path, std::ios::binary);
+        out << pieces[0];
+    }
+
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.listen_port = 6893;
+    config.enable_lsd = false;
+
+    TorrentSession session(meta, config);
+    auto stats = session.stats();
+
+    CHECK_EQ(stats.completed_pieces, std::size_t(1));
+    CHECK_EQ(stats.state, SessionState::Downloading);
+    CHECK(!session.is_complete());
+    CHECK(stats.progress_percent > 0.0);
+
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testSessionFailsWhenListenPortIsAlreadyBusy() {
+    std::cout << "[TEST] TorrentSession startup fails when listen port is already occupied...\n";
+
+    asio::io_context ioc;
+    asio::ip::tcp::acceptor busy_acceptor(
+        ioc,
+        asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const std::uint16_t busy_port = busy_acceptor.local_endpoint().port();
+
+    const std::vector<std::string> pieces = {"Alpha", "Beta"};
+    auto meta = makeMockMetadata("busy_port_file.bin", pieces, 5);
+
+    TorrentSessionConfig config;
+    config.download_dir = "./test_busy_port";
+    config.listen_port = busy_port;
+    config.enable_lsd = false;
+
+    TorrentSession session(meta, config);
+    CHECK_EQ(session.start(), false);
+    CHECK_EQ(session.state(), SessionState::Error);
+
+    std::error_code ec;
+    std::filesystem::remove_all("./test_busy_port", ec);
+}
+
+void testStateBridgeKeepsOriginalMagnetForDuplicateTorrent() {
+    std::cout << "[TEST] StateBridge keeps original session when same torrent hash is added again...\n";
+
+    const std::vector<std::string> pieces = {"SamePieceA", "SamePieceB"};
+    auto meta = makeMockMetadata("duplicate.bin", pieces, 10);
+
+    TorrentSessionConfig config;
+    config.download_dir = "./test_duplicate_bridge";
+    config.listen_port = 6902;
+    config.enable_lsd = false;
+
+    auto first = std::make_shared<TorrentSession>(meta, config);
+    auto second = std::make_shared<TorrentSession>(meta, config);
+
+    StateBridge::instance().addSession(first, "magnet:?xt=urn:btih:first");
+    StateBridge::instance().addSession(second, "magnet:?xt=urn:btih:second");
+
+    const auto torrents = StateBridge::instance().getAllTorrents();
+    CHECK_EQ(torrents.size(), std::size_t(1));
+    CHECK_EQ(torrents[0].magnet_uri, std::string("magnet:?xt=urn:btih:first"));
+
+    StateBridge::instance().removeSession(first->info_hash_hex());
+    std::error_code ec;
+    std::filesystem::remove_all("./test_duplicate_bridge", ec);
 }
 
 void testSessionLoopbackPeerDownload() {
@@ -244,6 +328,9 @@ void testSessionLoopbackPeerDownload() {
 int main() {
     testSessionInitializationAndStats();
     testSessionExistingFileSeeding();
+    testSessionPartialExistingFileRemainsDownloading();
+    testSessionFailsWhenListenPortIsAlreadyBusy();
+    testStateBridgeKeepsOriginalMagnetForDuplicateTorrent();
     testSessionLoopbackPeerDownload();
 
     std::cout << "\n>>> ALL TORRENT_SESSION TESTS PASSED SUCCESSFULLY! <<<\n";

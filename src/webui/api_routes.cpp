@@ -25,6 +25,29 @@
 namespace p2p {
 namespace {
 
+std::filesystem::path resolveProjectRoot() {
+    std::filesystem::path current = std::filesystem::absolute(std::filesystem::current_path());
+    for (int depth = 0; depth < 8; ++depth) {
+        const bool looksLikeProjectRoot =
+            std::filesystem::exists(current / "CMakeLists.txt") &&
+            std::filesystem::exists(current / "src") &&
+            std::filesystem::exists(current / "web");
+        if (looksLikeProjectRoot) {
+            return current;
+        }
+        const std::filesystem::path parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return std::filesystem::absolute(std::filesystem::current_path());
+}
+
+std::filesystem::path resolveDownloadDir() {
+    return resolveProjectRoot() / "data" / "downloads";
+}
+
 std::string getLocalLanIp() {
 #ifdef _WIN32
     // Windows: connect UDP socket to query route IP
@@ -146,7 +169,7 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    std::filesystem::path downloadDir = std::filesystem::current_path() / "data" / "downloads";
+    std::filesystem::path downloadDir = resolveDownloadDir();
     std::error_code ec;
     std::filesystem::create_directories(downloadDir, ec);
 
@@ -187,7 +210,11 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         config.enable_lsd = true;
 
         auto session = std::make_shared<TorrentSession>(meta, config);
-        session->start();
+        if (!session->start()) {
+            res.status = 503;
+            res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
+            return;
+        }
         StateBridge::instance().addSession(session, magnetUri);
 
         const std::string downloadName =
@@ -218,7 +245,7 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
                                 "&dn=" + rfc5987Encode(meta.name) +
                                 "&tr=" + rfc5987Encode(meta.announce);
 
-        std::filesystem::path downloadDir = std::filesystem::current_path() / "data" / "downloads";
+        std::filesystem::path downloadDir = resolveDownloadDir();
         std::error_code ec;
         std::filesystem::create_directories(downloadDir, ec);
 
@@ -228,7 +255,11 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
         config.enable_lsd = true;
 
         auto session = std::make_shared<TorrentSession>(meta, config);
-        session->start();
+        if (!session->start()) {
+            res.status = 503;
+            res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
+            return;
+        }
         StateBridge::instance().addSession(session, magnetUri);
 
         res.status = 200;

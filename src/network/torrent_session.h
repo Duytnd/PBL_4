@@ -33,6 +33,7 @@ enum class SessionState {
     Stopped,      // Chưa chạy hoặc đã dừng
     Checking,     // Đang quét file có sẵn trên đĩa để xác minh hash
     Downloading,  // Đang kết nối peer và tải block
+    Waiting,      // Đang chờ peer/tracker phản hồi; không phải lỗi nghiêm trọng
     Seeding,      // Đã đủ 100% dữ liệu, đang làm Seeder chia sẻ cho peer khác
     Paused,       // Tạm dừng tải/seed
     Error         // Gặp lỗi nghiêm trọng (I/O, tracker, v.v.)
@@ -43,6 +44,7 @@ inline std::ostream& operator<<(std::ostream& os, SessionState s) {
         case SessionState::Stopped: return os << "Stopped";
         case SessionState::Checking: return os << "Checking";
         case SessionState::Downloading: return os << "Downloading";
+        case SessionState::Waiting: return os << "Waiting";
         case SessionState::Seeding: return os << "Seeding";
         case SessionState::Paused: return os << "Paused";
         case SessionState::Error: return os << "Error";

@@ -9,6 +9,11 @@ void StateBridge::addSession(std::shared_ptr<TorrentSession> session, const std:
     if (!session) return;
     std::lock_guard<std::mutex> lock(mutex_);
     const std::string hash = session->info_hash_hex();
+    auto it = sessions_.find(hash);
+    if (it != sessions_.end()) {
+        // Giữ session gốc nếu đã tồn tại để tránh overwrite state và magnet khi add trùng torrent.
+        return;
+    }
     sessions_[hash] = Entry{std::move(session), magnetUri};
 }
 

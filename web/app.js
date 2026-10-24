@@ -57,6 +57,17 @@
     return `${formatBytes(bytesPerSec)}/s`;
   }
 
+  function normalizeTorrentState(rawState) {
+    const value = String(rawState || 'stopped').trim().toLowerCase();
+    if (value === 'seeding') return { label: 'SEEDING', kind: 'seeding' };
+    if (value === 'downloading') return { label: 'DOWNLOADING', kind: 'downloading' };
+    if (value === 'waiting') return { label: 'WAITING', kind: 'waiting' };
+    if (value === 'checking') return { label: 'CHECKING', kind: 'checking' };
+    if (value === 'paused') return { label: 'PAUSED', kind: 'paused' };
+    if (value === 'error') return { label: 'ERROR', kind: 'error' };
+    return { label: 'STOPPED', kind: 'stopped' };
+  }
+
   function escapeHtml(value) {
     return String(value ?? '')
       .replace(/&/g, '&amp;')
@@ -111,16 +122,19 @@
 
     const cards = torrentList.map((torrent) => {
       const size = formatBytes(torrent.length);
-      const state = (torrent.state || 'stopped').toUpperCase();
+      const stateInfo = normalizeTorrentState(torrent.state);
+      const state = stateInfo.label;
       const progress = Number(torrent.progress || 0).toFixed(1);
       const dlSpeed = formatSpeed(torrent.downloadRate || 0);
       const ulSpeed = formatSpeed(torrent.uploadRate || 0);
       const peers = torrent.peers || 0;
 
       let stateBadgeStyle = 'background: #e5e7eb; color: #374151;';
-      if (state === 'SEEDING') stateBadgeStyle = 'background: #dcfce7; color: #166534; font-weight: 600;';
-      else if (state === 'DOWNLOADING') stateBadgeStyle = 'background: #dbeafe; color: #1e40af; font-weight: 600;';
-      else if (state === 'CHECKING') stateBadgeStyle = 'background: #fef9c3; color: #854d0e;';
+      if (stateInfo.kind === 'seeding') stateBadgeStyle = 'background: #dcfce7; color: #166534; font-weight: 600;';
+      else if (stateInfo.kind === 'downloading') stateBadgeStyle = 'background: #dbeafe; color: #1e40af; font-weight: 600;';
+      else if (stateInfo.kind === 'waiting') stateBadgeStyle = 'background: #fef3c7; color: #92400e; font-weight: 600;';
+      else if (stateInfo.kind === 'checking') stateBadgeStyle = 'background: #fef9c3; color: #854d0e;';
+      else if (stateInfo.kind === 'error') stateBadgeStyle = 'background: #fee2e2; color: #991b1b; font-weight: 600;';
 
       const copyMagnetHtml = torrent.magnetUri
         ? `<button class="torrent-copy-magnet btn" data-magnet="${escapeHtml(torrent.magnetUri)}" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>`
@@ -275,7 +289,7 @@
         }
       }
 
-      setStatus(`Torrent created successfully & is now Seeding: ${downloadName}`, 'success');
+      setStatus(`Torrent created successfully and added to the swarm: ${downloadName}`, 'success');
       await syncTorrentsFromServer();
     } catch (error) {
       setStatus(`Failed to create torrent: ${error.message}`, 'error');
@@ -305,7 +319,7 @@
         throw new Error(err || 'Failed to add torrent');
       }
 
-      setStatus(`Added ${file.name} to downloading swarm!`, 'success');
+      setStatus(`Added ${file.name} to the swarm. Status will update as peers respond.`, 'success');
       await syncTorrentsFromServer();
     } catch (error) {
       setStatus(`Failed to add torrent: ${error.message}`, 'error');
