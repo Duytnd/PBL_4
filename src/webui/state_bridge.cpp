@@ -71,13 +71,37 @@ std::vector<TorrentViewInfo> StateBridge::getAllTorrents() {
     return list;
 }
 
+namespace {
+
+// Thử bind thật (không reuse) để biết cổng có đang bị process khác giữ không.
+bool isPortFree(std::uint16_t port) {
+    try {
+        asio::io_context ioc;
+        asio::ip::tcp::acceptor probe(ioc);
+        const asio::ip::tcp::endpoint ep(asio::ip::tcp::v4(), port);
+        probe.open(ep.protocol());
+        probe.bind(ep);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+}  // namespace
+
 std::uint16_t StateBridge::allocatePort() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::uint16_t port = next_port_++;
-    if (next_port_ > 6950) {
-        next_port_ = 6881;
+    constexpr std::uint16_t kFirst = 6881;
+    constexpr std::uint16_t kLast = 6950;
+    for (int attempt = 0; attempt <= kLast - kFirst; ++attempt) {
+        const std::uint16_t port = next_port_;
+        next_port_ = (next_port_ >= kLast) ? kFirst : static_cast<std::uint16_t>(next_port_ + 1);
+        if (isPortFree(port)) {
+            return port;
+        }
     }
-    return port;
+    // Cả dải 6881-6950 đều bận: trả về cổng kế tiếp, start() sẽ báo lỗi bind rõ ràng.
+    return next_port_;
 }
 
 static std::string escapeJsonString(const std::string& input) {
