@@ -1,5 +1,7 @@
 #include "core/torrent_file.h"
 
+#include "core/path_sanitizer.h"
+
 #include <fstream>
 #include <stdexcept>
 
@@ -78,6 +80,10 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
     if (nameValue == nullptr) {
         throw std::invalid_argument("Torrent metadata: info.name must be a string");
     }
+    // name được ghép vào download_dir: chặn traversal / đường dẫn tuyệt đối từ torrent độc.
+    if (!PathSanitizer::isSafeRelativePath(*nameValue)) {
+        throw std::invalid_argument("Torrent metadata: info.name is not a safe relative path");
+    }
     metadata.name = *nameValue;
 
     const auto pieceLengthIt = infoDict->find("piece length");
@@ -87,6 +93,9 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
     const auto* pieceLengthValue = asInt64(pieceLengthIt->second);
     if (pieceLengthValue == nullptr) {
         throw std::invalid_argument("Torrent metadata: info.piece length must be an integer");
+    }
+    if (*pieceLengthValue <= 0) {
+        throw std::invalid_argument("Torrent metadata: info.piece length must be positive");
     }
     metadata.pieceLength = *pieceLengthValue;
 
@@ -105,6 +114,9 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
         const auto* lengthValue = asInt64(lengthIt->second);
         if (lengthValue == nullptr) {
             throw std::invalid_argument("Torrent metadata: info.length must be an integer");
+        }
+        if (*lengthValue < 0) {
+            throw std::invalid_argument("Torrent metadata: info.length must not be negative");
         }
         metadata.length = static_cast<std::uint64_t>(*lengthValue);
     }
@@ -140,6 +152,9 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
                 pathValue += *partString;
             }
             if (!pathValue.empty()) {
+                if (!PathSanitizer::isSafeRelativePath(pathValue)) {
+                    throw std::invalid_argument("Torrent metadata: unsafe file path");
+                }
                 metadata.filePaths.push_back(pathValue);
             }
         }

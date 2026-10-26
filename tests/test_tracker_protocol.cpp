@@ -210,7 +210,29 @@ void testTrackerServerRejectsMalformedInfoHashOrPeerId() {
     CHECK(!decoded2.success);
 }
 
+void testPeerRegistryRejectsNewSwarmWhenFull() {
+    PeerRegistry registry(3600, 50, /*maxSwarms=*/1);
+    CHECK(registry.upsert(std::string(20, 'a'), {"peerA", "10.0.0.1", 1, 0, 0, 0}));
+    CHECK(!registry.upsert(std::string(20, 'b'), {"peerB", "10.0.0.2", 2, 0, 0, 0}));
+    // Swarm đã có vẫn nhận peer mới.
+    CHECK(registry.upsert(std::string(20, 'a'), {"peerC", "10.0.0.3", 3, 0, 0, 0}));
+}
+
+void testTrackerServerRejectsIpv6Peer() {
+    TrackerServer server(1800, 50);
+    TrackerRequest request;
+    request.infoHash = std::string(20, 'h');
+    request.peerId = std::string(20, 'p');
+    request.port = 6881;
+    request.ip = "::1";
+    const auto response = TrackerProtocol::decodeResponse(server.announce(request));
+    CHECK(!response.failureReason.empty());
+    CHECK(!server.hasPeer(request.infoHash, request.peerId));
+}
+
 int main() {
+    RUN(testPeerRegistryRejectsNewSwarmWhenFull);
+    RUN(testTrackerServerRejectsIpv6Peer);
     RUN(testEncodeRequestQueryPercentEncodesBinaryBytes);
     RUN(testCompactPeersRoundTrip);
     RUN(testDecodeCompactPeersRejectsBadLength);

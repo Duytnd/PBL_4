@@ -69,6 +69,7 @@ add_executable(test_torrent_file
     tests/test_torrent_file.cpp
     src/core/bencode.cpp
     src/core/torrent_file.cpp
+    src/core/path_sanitizer.cpp
 )
 
 target_include_directories(test_torrent_file PRIVATE ${CMAKE_SOURCE_DIR}/src)

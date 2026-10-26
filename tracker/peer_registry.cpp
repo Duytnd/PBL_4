@@ -4,10 +4,14 @@
 
 namespace p2p {
 
-PeerRegistry::PeerRegistry(int expirySeconds, std::size_t maxPeersPerTorrent)
-    : expirySeconds_(expirySeconds), maxPeersPerTorrent_(maxPeersPerTorrent) {}
+PeerRegistry::PeerRegistry(int expirySeconds, std::size_t maxPeersPerTorrent, std::size_t maxSwarms)
+    : expirySeconds_(expirySeconds), maxPeersPerTorrent_(maxPeersPerTorrent), maxSwarms_(maxSwarms) {}
 
-void PeerRegistry::upsert(const std::string& infoHash, const PeerRegistration& peer, Clock::time_point now) {
+bool PeerRegistry::upsert(const std::string& infoHash, const PeerRegistration& peer, Clock::time_point now) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (swarms_.find(infoHash) == swarms_.end() && swarms_.size() >= maxSwarms_) {
+        return false;
+    }
     auto& entries = swarms_[infoHash];
     const auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry& entry) {
         return entry.peer.peerId == peer.peerId;
@@ -16,7 +20,7 @@ void PeerRegistry::upsert(const std::string& infoHash, const PeerRegistration& p
     if (it != entries.end()) {
         it->peer = peer;
         it->lastSeen = now;
-        return;
+        return true;
     }
 
     if (entries.size() >= maxPeersPerTorrent_) {
@@ -28,9 +32,11 @@ void PeerRegistry::upsert(const std::string& infoHash, const PeerRegistration& p
     }
 
     entries.push_back(Entry{peer, now});
+    return true;
 }
 
 void PeerRegistry::remove(const std::string& infoHash, const std::string& peerId) {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = swarms_.find(infoHash);
     if (it == swarms_.end()) {
         return;
@@ -49,6 +55,7 @@ void PeerRegistry::remove(const std::string& infoHash, const std::string& peerId
 }
 
 void PeerRegistry::purgeExpired(Clock::time_point now) {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto expiry = std::chrono::seconds(expirySeconds_);
 
     for (auto swarmIt = swarms_.begin(); swarmIt != swarms_.end();) {
@@ -69,6 +76,7 @@ void PeerRegistry::purgeExpired(Clock::time_point now) {
 
 std::vector<TrackerPeer> PeerRegistry::getPeers(
     const std::string& infoHash, const std::string& excludePeerId, Clock::time_point now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = swarms_.find(infoHash);
     if (it == swarms_.end()) {
         return {};
@@ -92,6 +100,7 @@ std::vector<TrackerPeer> PeerRegistry::getPeers(
 }
 
 bool PeerRegistry::hasPeer(const std::string& infoHash, const std::string& peerId) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = swarms_.find(infoHash);
     if (it == swarms_.end()) {
         return false;
@@ -102,6 +111,7 @@ bool PeerRegistry::hasPeer(const std::string& infoHash, const std::string& peerI
 }
 
 std::size_t PeerRegistry::peerCount(const std::string& infoHash) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = swarms_.find(infoHash);
     return it == swarms_.end() ? 0 : it->second.size();
 }

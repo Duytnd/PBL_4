@@ -15,7 +15,7 @@ public:
     // Peer hết hạn sau 2 x interval nếu không announce lại (mục 5.2 kế hoạch).
     explicit TrackerServer(int interval = 1800, std::size_t maxPeers = 50);
 
-    void addPeer(const std::string& infoHash, const PeerRegistration& peer);
+    bool addPeer(const std::string& infoHash, const PeerRegistration& peer);
     void removePeer(const std::string& infoHash, const std::string& peerId);
     std::string announce(const TrackerRequest& request);
 

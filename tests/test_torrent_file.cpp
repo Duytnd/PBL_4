@@ -105,7 +105,55 @@ void testInfoRawMatchesOriginalEncodedInfo() {
     CHECK_EQ(metadata.infoRaw, encodeBencode(info));
 }
 
+namespace {
+bool parseThrows(const BencodeDict& info) {
+    BencodeDict root;
+    root["info"] = BencodeValue(info);
+    try {
+        TorrentFile::parse(encodeBencode(root));
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+void testParseRejectsUnsafeName() {
+    for (const char* bad : {"../../evil", "/etc/passwd", "C:/Windows/x", "a\\b", "file.txt:stream"}) {
+        BencodeDict info = makeSingleFileInfo();
+        info["name"] = BencodeValue(std::string(bad));
+        CHECK(parseThrows(info));
+    }
+}
+
+void testParseRejectsUnsafeFilePath() {
+    BencodeDict info = makeSingleFileInfo();
+    BencodeDict file;
+    file["length"] = BencodeValue(int64_t(5));
+    BencodeList path;
+    path.push_back(BencodeValue(std::string("..")));
+    path.push_back(BencodeValue(std::string("x")));
+    file["path"] = BencodeValue(path);
+    BencodeList files;
+    files.push_back(BencodeValue(file));
+    info["files"] = BencodeValue(files);
+    CHECK(parseThrows(info));
+}
+
+void testParseRejectsBadPieceLengthAndLength() {
+    BencodeDict zero = makeSingleFileInfo();
+    zero["piece length"] = BencodeValue(int64_t(0));
+    CHECK(parseThrows(zero));
+
+    BencodeDict negative = makeSingleFileInfo();
+    negative["length"] = BencodeValue(int64_t(-1));
+    CHECK(parseThrows(negative));
+}
+
 int main() {
+    RUN(testParseRejectsUnsafeName);
+    RUN(testParseRejectsUnsafeFilePath);
+    RUN(testParseRejectsBadPieceLengthAndLength);
     RUN(testParseSingleFileTorrent);
     RUN(testParseMultiFileTorrent);
     RUN(testParseRejectsMissingInfo);

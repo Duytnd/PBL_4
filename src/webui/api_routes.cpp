@@ -3,6 +3,7 @@
 #include "httplib.h"
 
 #include "core/hash_utils.h"
+#include "core/path_sanitizer.h"
 #include "core/torrent_builder.h"
 #include "core/torrent_file.h"
 #include "webui/state_bridge.h"
@@ -191,6 +192,11 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         : kDefaultAnnounce;
     const std::size_t pieceLength = parsePieceLength(req.form);
     const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
+    if (!nameOverride.empty() && !PathSanitizer::isSafeRelativePath(nameOverride)) {
+        res.status = 400;
+        res.set_content("Invalid torrent name", "text/plain");
+        return;
+    }
 
     try {
         const std::string torrentBytes = TorrentBuilder::buildTorrent(
@@ -209,13 +215,16 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         config.listen_port = StateBridge::instance().allocatePort();
         config.enable_lsd = true;
 
-        auto session = std::make_shared<TorrentSession>(meta, config);
-        if (!session->start()) {
-            res.status = 503;
-            res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
-            return;
+        // Trùng torrent: không start thêm session (tránh chiếm port vô ích).
+        if (!StateBridge::instance().getSession(infoHashHex)) {
+            auto session = std::make_shared<TorrentSession>(meta, config);
+            if (!session->start()) {
+                res.status = 503;
+                res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
+                return;
+            }
+            StateBridge::instance().addSession(session, magnetUri);
         }
-        StateBridge::instance().addSession(session, magnetUri);
 
         const std::string downloadName =
             (nameOverride.empty() ? sourceName.string() : nameOverride) + ".torrent";
@@ -254,13 +263,15 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
         config.listen_port = StateBridge::instance().allocatePort();
         config.enable_lsd = true;
 
-        auto session = std::make_shared<TorrentSession>(meta, config);
-        if (!session->start()) {
-            res.status = 503;
-            res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
-            return;
+        if (!StateBridge::instance().getSession(infoHashHex)) {
+            auto session = std::make_shared<TorrentSession>(meta, config);
+            if (!session->start()) {
+                res.status = 503;
+                res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
+                return;
+            }
+            StateBridge::instance().addSession(session, magnetUri);
         }
-        StateBridge::instance().addSession(session, magnetUri);
 
         res.status = 200;
         res.set_content("{\"status\":\"ok\",\"info_hash\":\"" + infoHashHex + "\"}", "application/json");
@@ -293,6 +304,9 @@ void handleRemoveTorrent(const httplib::Request& req, httplib::Response& res) {
 }  // namespace
 
 void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::path& /*tempDir*/) {
+    // Giới hạn body trước khi httplib đọc vào RAM (file + vài field form).
+    server.set_payload_max_length(kMaxUploadBytes + 1024 * 1024);
+
     server.Post("/api/torrents/create", [](const httplib::Request& req, httplib::Response& res) {
         handleCreateTorrent(req, res);
     });

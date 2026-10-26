@@ -174,8 +174,15 @@
       button.addEventListener('click', async () => {
         const hash = button.dataset.hash;
         try {
-          await fetch(`/api/torrents/remove?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
-        } catch (_) {}
+          const res = await fetch(`/api/torrents/remove?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
+          if (!res.ok && res.status !== 404) {
+            setStatus(`Failed to remove torrent: server responded ${res.status}`, 'error');
+            return;
+          }
+        } catch (_) {
+          setStatus('Failed to remove torrent: server unreachable.', 'error');
+          return;
+        }
         const index = torrentList.findIndex((item) => (item.infoHash || item.id) === hash);
         if (index !== -1) {
           torrentList.splice(index, 1);
@@ -191,7 +198,12 @@
       button.addEventListener('click', async () => {
         const uri = button.dataset.magnet;
         if (uri) {
-          await navigator.clipboard.writeText(uri);
+          try {
+            await navigator.clipboard.writeText(uri);
+          } catch (_) {
+            setStatus('Clipboard access denied.', 'error');
+            return;
+          }
           const orig = button.textContent;
           button.textContent = 'Copied!';
           setTimeout(() => { button.textContent = orig; }, 1500);
@@ -254,9 +266,11 @@
     const disposition = response.headers.get('Content-Disposition') || '';
     const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
-    const downloadName = utf8Match
-      ? decodeURIComponent(utf8Match[1])
-      : (asciiMatch ? asciiMatch[1] : `${file.name}.torrent`);
+    let downloadName = `${file.name}.torrent`;
+    try {
+      if (utf8Match) downloadName = decodeURIComponent(utf8Match[1]);
+      else if (asciiMatch) downloadName = asciiMatch[1];
+    } catch (_) {}
     const magnetUri = response.headers.get('X-Magnet-Uri') || '';
     const blob = await response.blob();
     return { blob, downloadName, magnetUri };
@@ -346,7 +360,12 @@
       copyMagnetBtn.addEventListener('click', async () => {
         const magnetInput = document.getElementById('magnet-input');
         if (magnetInput && magnetInput.value) {
-          await navigator.clipboard.writeText(magnetInput.value);
+          try {
+            await navigator.clipboard.writeText(magnetInput.value);
+          } catch (_) {
+            setStatus('Clipboard access denied.', 'error');
+            return;
+          }
           copyMagnetBtn.textContent = 'Copied!';
           setTimeout(() => { copyMagnetBtn.textContent = 'Copy Magnet'; }, 2000);
         }

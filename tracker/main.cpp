@@ -53,7 +53,12 @@ int main(int argc, char** argv) {
         p2p::TrackerRequest request;
         request.infoHash = req.get_param_value("info_hash");
         request.peerId = req.get_param_value("peer_id");
-        request.port = static_cast<std::uint16_t>(paramU64(req, "port"));
+        const std::uint64_t rawPort = paramU64(req, "port");
+        if (rawPort == 0 || rawPort > 65535) {
+            res.set_content(p2p::TrackerProtocol::encodeFailureResponse("invalid port"), "text/plain");
+            return;
+        }
+        request.port = static_cast<std::uint16_t>(rawPort);
         request.uploaded = paramU64(req, "uploaded");
         request.downloaded = paramU64(req, "downloaded");
         request.left = paramU64(req, "left");
@@ -64,8 +69,11 @@ int main(int argc, char** argv) {
         // tránh client giả mạo địa chỉ peer khác (tránh bị lợi dụng làm DDoS).
         request.ip = req.remote_addr;
 
+        // event do client tự khai: chỉ log giá trị hợp lệ để không chèn dòng giả vào log.
+        const bool knownEvent = request.event == "started" || request.event == "completed" ||
+                                request.event == "stopped";
         std::cout << "[TRACKER] Announce received from " << request.ip << ":" << request.port
-                  << " | event=" << (request.event.empty() ? "interval" : request.event)
+                  << " | event=" << (knownEvent ? request.event : "interval")
                   << " | left=" << request.left
                   << " | up=" << request.uploaded << " | down=" << request.downloaded << std::endl;
 

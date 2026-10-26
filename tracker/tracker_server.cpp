@@ -5,8 +5,8 @@ namespace p2p {
 TrackerServer::TrackerServer(int interval, std::size_t maxPeers)
     : interval_(interval), registry_(interval * 2, maxPeers) {}
 
-void TrackerServer::addPeer(const std::string& infoHash, const PeerRegistration& peer) {
-    registry_.upsert(infoHash, peer);
+bool TrackerServer::addPeer(const std::string& infoHash, const PeerRegistration& peer) {
+    return registry_.upsert(infoHash, peer);
 }
 
 void TrackerServer::removePeer(const std::string& infoHash, const std::string& peerId) {
@@ -46,7 +46,13 @@ std::string TrackerServer::announce(const TrackerRequest& request) {
         request.downloaded,
         request.left};
 
-    addPeer(request.infoHash, peer);
+    // Compact peer list (BEP 23) chỉ mã hoá được IPv4; một peer IPv6 sẽ làm hỏng cả swarm.
+    if (peer.ip.find(':') != std::string::npos) {
+        return TrackerProtocol::encodeFailureResponse("IPv6 peers are not supported");
+    }
+    if (!addPeer(request.infoHash, peer)) {
+        return TrackerProtocol::encodeFailureResponse("Tracker is full");
+    }
 
     // Không trả lại chính peer đang hỏi (mục 5.2).
     const std::vector<TrackerPeer> peers = registry_.getPeers(request.infoHash, request.peerId);

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -29,10 +30,12 @@ public:
 
     // expirySeconds: peer không announce lại trong khoảng này sẽ bị coi là
     // đã rời mạng (mục 5.2: "thời gian hết hạn, vd 2 x interval").
-    explicit PeerRegistry(int expirySeconds, std::size_t maxPeersPerTorrent);
+    explicit PeerRegistry(int expirySeconds, std::size_t maxPeersPerTorrent,
+                          std::size_t maxSwarms = 10000);
 
     // now cho phép test giả lập thời gian trôi qua mà không cần sleep thật.
-    void upsert(const std::string& infoHash, const PeerRegistration& peer,
+    // Trả false khi swarm mới bị từ chối vì registry đã đầy (chống phình RAM).
+    bool upsert(const std::string& infoHash, const PeerRegistration& peer,
                 Clock::time_point now = Clock::now());
     void remove(const std::string& infoHash, const std::string& peerId);
 
@@ -55,6 +58,9 @@ private:
 
     int expirySeconds_;
     std::size_t maxPeersPerTorrent_;
+    std::size_t maxSwarms_;
+    // httplib xử lý announce đa luồng + luồng dọn định kỳ: mọi truy cập swarms_ phải khoá.
+    mutable std::mutex mutex_;
     std::map<std::string, std::vector<Entry>> swarms_;
 };
 

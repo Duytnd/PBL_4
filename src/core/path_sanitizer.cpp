@@ -83,6 +83,10 @@ bool PathSanitizer::isSafeRelativePath(const std::string& path) {
     if (isWindowsDrivePrefix(path)) {
         return false;
     }
+    // ':' sau ổ đĩa vẫn nguy hiểm trên NTFS (alternate data stream "file:stream").
+    if (path.find(':') != std::string::npos) {
+        return false;
+    }
 
     std::vector<std::string> segments = splitSegments(path);
     if (segments.empty()) {
