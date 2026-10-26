@@ -249,6 +249,19 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
     const httplib::FormData upload = req.form.get_file("file");
     try {
         auto meta = TorrentFile::parse(upload.content);
+        // Session chỉ ghi/đọc 1 file đơn; nhận torrent nhiều file sẽ tải ra file hỏng.
+        if (!meta.filePaths.empty()) {
+            res.status = 400;
+            res.set_content("Multi-file torrents are not supported", "text/plain");
+            return;
+        }
+        // Số piece phải khớp độ dài file, nếu không PieceManager đọc/ghi sai vùng nhớ.
+        const std::uint64_t pieceLen = static_cast<std::uint64_t>(meta.pieceLength);
+        if (meta.length == 0 || meta.pieces.size() != (meta.length + pieceLen - 1) / pieceLen) {
+            res.status = 400;
+            res.set_content("Invalid torrent: piece count does not match file length", "text/plain");
+            return;
+        }
         std::string infoHashHex = sha1Hex(meta.infoRaw);
         std::string magnetUri = "magnet:?xt=urn:btih:" + infoHashHex +
                                 "&dn=" + rfc5987Encode(meta.name) +

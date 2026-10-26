@@ -25,6 +25,7 @@ struct TorrentViewInfo {
     std::size_t completed_pieces = 0;
     std::size_t total_pieces = 0;
     std::size_t connected_peers = 0;
+    std::string error_message;
 };
 
 class StateBridge {

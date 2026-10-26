@@ -65,6 +65,7 @@ std::vector<TorrentViewInfo> StateBridge::getAllTorrents() {
         info.completed_pieces = stats.completed_pieces;
         info.total_pieces = stats.total_pieces;
         info.connected_peers = stats.connected_peers;
+        info.error_message = stats.error_message;
         list.push_back(std::move(info));
     }
     return list;
@@ -121,7 +122,8 @@ std::string StateBridge::toJsonString() {
              << "\"upload_rate\":" << static_cast<uint64_t>(t.upload_rate) << ","
              << "\"completed_pieces\":" << t.completed_pieces << ","
              << "\"total_pieces\":" << t.total_pieces << ","
-             << "\"connected_peers\":" << t.connected_peers
+             << "\"connected_peers\":" << t.connected_peers << ","
+             << "\"error\":\"" << escapeJsonString(t.error_message) << "\""
              << "}";
     }
     json << "]";

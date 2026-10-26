@@ -195,6 +195,43 @@ std::string PieceManager::assembleFile() const {
     return output;
 }
 
+bool PieceManager::writePieceToFile(std::size_t pieceIndex, const std::filesystem::path& filePath) const {
+    if (!isPieceComplete(pieceIndex)) {
+        return false;
+    }
+    std::error_code ec;
+    const auto parent = filePath.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+    }
+    if (!std::filesystem::exists(filePath)) {
+        std::ofstream create(filePath, std::ios::binary | std::ios::trunc);
+        if (!create) {
+            return false;
+        }
+    }
+    if (std::filesystem::file_size(filePath, ec) != totalLength_) {
+        std::filesystem::resize_file(filePath, totalLength_, ec);
+        if (ec) {
+            return false;
+        }
+    }
+    std::fstream file(filePath, std::ios::in | std::ios::out | std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    file.seekp(static_cast<std::streamoff>(pieceOffset(pieceIndex)));
+    file.write(pieces_[pieceIndex].data(), static_cast<std::streamsize>(pieces_[pieceIndex].size()));
+    file.flush();
+    return static_cast<bool>(file);
+}
+
+void PieceManager::discardPiece(std::size_t pieceIndex) {
+    if (pieceIndex < pieces_.size()) {
+        pieces_[pieceIndex].clear();
+    }
+}
+
 void PieceManager::writeToFile(const std::filesystem::path& filePath) const {
     const std::string payload = assembleFile();
     const auto parent = filePath.parent_path();

@@ -36,6 +36,13 @@ public:
     [[nodiscard]] std::string assembleFile() const;
     void writeToFile(const std::filesystem::path& filePath) const;
 
+    // Ghi riêng 1 piece (đã đủ byte) vào đúng offset của file tạm dạng sparse có kích thước
+    // totalLength; dùng để lưu tiến độ tải dở, tắt app rồi chạy lại vẫn resume được.
+    bool writePieceToFile(std::size_t pieceIndex, const std::filesystem::path& filePath) const;
+
+    // Bỏ dữ liệu của 1 piece (vd. piece nạp từ đĩa nhưng sai hash).
+    void discardPiece(std::size_t pieceIndex);
+
 private:
     std::size_t pieceCount_;
     std::size_t pieceLength_;

@@ -159,11 +159,15 @@ private:
     std::string info_hash_raw_;    // 20 bytes binary
     std::string info_hash_hex_;    // 40 ký tự hex
     std::filesystem::path save_path_;
+    std::filesystem::path part_path_;  // <save_path>.part: tiến độ tải dở để resume
 
     // Trạng thái nội bộ
     mutable std::mutex session_mutex_;
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
+    // Số luồng announce tracker đang chạy nền (detached): destructor phải chờ về 0
+    // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
+    std::atomic<int> announce_inflight_{0};
     SessionState state_{SessionState::Stopped};
     std::string error_message_;
 
@@ -271,7 +275,7 @@ private:
 
     bool request_next_blocks(std::shared_ptr<ActivePeer> peer);
     void broadcast_have(std::uint32_t piece_index);
-    void check_and_finalize_completion();
+    bool check_and_finalize_completion();
 };
 
 }  // namespace p2p::network

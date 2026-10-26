@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MiniBitorrent</title>
+  <title>MiniBitTorrent</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#/dashboard">MiniBitorrent</a>
+    <a class="brand" href="#/dashboard">MiniBitTorrent</a>
     <form class="search" role="search">
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
       <input type="search" placeholder="Search for a torrent" aria-label="Search for a torrent">
@@ -32,6 +32,7 @@
     </nav>
 
     <main>
+      <div id="conn-banner" class="torrent-status error" role="alert" hidden>Lost connection to the server. Retrying...</div>
       <section class="view" id="view-dashboard" aria-label="Dashboard">
         <div class="tiles">
           <div class="tile"><div class="tile-label">Bytes downloaded</div><div class="tile-value">0 B</div></div>
@@ -44,7 +45,6 @@
 
       <section class="view" id="view-torrents" aria-label="Torrents" hidden>
         <div class="toolbar">
-          <label class="select-all"><input type="checkbox"><span class="sr-only">Select all</span></label>
           <label class="field">Show:
             <select>
               <option>All</option>
@@ -69,11 +69,11 @@
           <input id="torrent-source" type="file" hidden>
           <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px;">
             <label for="tracker-announce-input" style="font-size: 13px; font-weight: 500; color: var(--text);">Tracker URL:</label>
-            <input id="tracker-announce-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" value="http://10.10.32.153:6969/announce">
+            <input id="tracker-announce-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="http://&lt;LAN IP&gt;:6969/announce">
           </div>
           <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
           <div id="magnet-box" class="magnet-box" style="display: none; margin-top: 10px; padding: 12px; background: #eaf1ff; border: 1px solid #bfdbfe; border-radius: 8px;">
-            <div style="font-weight: 600; margin-bottom: 6px; color: #1e40af;">Magnet Link (Gửi link này cho người khác để tải về):</div>
+            <div style="font-weight: 600; margin-bottom: 6px; color: #1e40af;">Magnet Link (share it so others can download):</div>
             <div style="display: flex; gap: 8px;">
               <input id="magnet-input" type="text" readonly style="flex: 1; padding: 6px 10px; border: 1px solid #93c5fd; border-radius: 6px; font-family: monospace; font-size: 12px; background: #ffffff;">
               <button id="copy-magnet-btn" type="button" class="btn btn-primary" style="white-space: nowrap;">Copy Magnet</button>

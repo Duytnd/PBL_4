@@ -15,7 +15,7 @@
         if (data.default_announce) {
           currentAnnounceUrl = data.default_announce;
           const input = document.getElementById('tracker-announce-input');
-          if (input && (!input.value || input.value.includes('127.0.0.1') || input.value.includes('10.10.'))) {
+          if (input && !input.value.trim()) {
             input.value = currentAnnounceUrl;
           }
         }
@@ -111,68 +111,174 @@
     }
   }
 
+  const STATE_BADGE_STYLE = {
+    seeding: 'background: #dcfce7; color: #166534; font-weight: 600;',
+    downloading: 'background: #dbeafe; color: #1e40af; font-weight: 600;',
+    waiting: 'background: #fef3c7; color: #92400e; font-weight: 600;',
+    checking: 'background: #fef9c3; color: #854d0e;',
+    error: 'background: #fee2e2; color: #991b1b; font-weight: 600;',
+  };
+  const BADGE_BASE = 'display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #e5e7eb; color: #374151; ';
+
+  const cardNodes = new Map();      // infoHash -> <article>
+  const firstSeen = new Map();      // infoHash -> thứ tự xuất hiện (server trả danh sách không theo thứ tự cố định)
+  let viewFilter = 'all';
+  let viewSort = 'recent';
+  let searchText = '';
+
+  function formatEta(torrent) {
+    const remaining = Math.max((torrent.length || 0) - (torrent.downloaded || 0), 0);
+    const rate = torrent.downloadRate || 0;
+    if (!rate || remaining <= 0) return '';
+    const sec = Math.round(remaining / rate);
+    if (sec >= 86400) return '> 1d';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    return h ? `${h}h ${m}m` : (m ? `${m}m ${s}s` : `${s}s`);
+  }
+
+  function matchesFilter(torrent) {
+    const kind = normalizeTorrentState(torrent.state).kind;
+    if (viewFilter === 'downloading' && !['downloading', 'waiting', 'checking'].includes(kind)) return false;
+    if (viewFilter === 'seeding' && kind !== 'seeding') return false;
+    if (viewFilter === 'paused' && !['paused', 'stopped'].includes(kind)) return false;
+    if (searchText && !String(torrent.name || '').toLowerCase().includes(searchText)) return false;
+    return true;
+  }
+
+  function visibleTorrents() {
+    const list = torrentList.filter(matchesFilter);
+    if (viewSort === 'name') {
+      list.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    } else if (viewSort === 'size') {
+      list.sort((a, b) => (b.length || 0) - (a.length || 0));
+    } else {
+      list.sort((a, b) => (firstSeen.get(b.infoHash) || 0) - (firstSeen.get(a.infoHash) || 0));
+    }
+    return list;
+  }
+
+  // Dựng khung card 1 lần; các lần poll sau chỉ cập nhật text/width tại chỗ
+  // (không innerHTML lại) để không nháy, không mất hover/focus và thanh tiến độ chạy mượt.
+  function buildCard(torrent) {
+    const card = document.createElement('article');
+    card.className = 'torrent-card';
+    card.dataset.hash = torrent.infoHash;
+    card.style.cssText = 'margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg);';
+    card.innerHTML = `
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; gap: 12px;">
+        <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+          <span data-f="badge"></span>
+          <div style="min-width: 0;">
+            <h3 data-f="name" style="margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></h3>
+            <span data-f="meta" style="font-size: 12px; color: var(--muted);"></span>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; flex-shrink: 0;">
+          <button type="button" class="torrent-copy-magnet btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>
+          <button type="button" class="torrent-remove btn" style="padding: 4px 8px; font-size: 12px; color: #dc2626;">Remove</button>
+        </div>
+      </div>
+      <div role="progressbar" aria-valuemin="0" aria-valuemax="100" data-f="track" style="height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 8px;">
+        <div data-f="bar" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.4s ease;"></div>
+      </div>
+      <div data-f="error" hidden style="font-size: 12px; color: #92400e; margin-bottom: 6px;"></div>
+      <div style="display: flex; gap: 24px; font-size: 12px; color: var(--muted); flex-wrap: wrap;">
+        <div>Down: <strong data-f="dl" style="color: var(--text);"></strong></div>
+        <div>Up: <strong data-f="ul" style="color: var(--text);"></strong></div>
+        <div>Pieces: <strong data-f="pieces" style="color: var(--text);"></strong></div>
+      </div>`;
+    return card;
+  }
+
+  function updateCard(card, torrent) {
+    const f = (key) => card.querySelector(`[data-f="${key}"]`);
+    const stateInfo = normalizeTorrentState(torrent.state);
+    const progress = Math.min(Math.max(Number(torrent.progress) || 0, 0), 100);
+
+    const badge = f('badge');
+    badge.textContent = stateInfo.label;
+    badge.style.cssText = BADGE_BASE + (STATE_BADGE_STYLE[stateInfo.kind] || '');
+
+    const name = f('name');
+    name.textContent = torrent.name;
+    name.title = torrent.name;
+
+    const eta = stateInfo.kind === 'downloading' ? formatEta(torrent) : '';
+    f('meta').textContent =
+      `${formatBytes(torrent.length)} • ${progress.toFixed(1)}% • Peers: ${torrent.peers || 0}` +
+      (eta ? ` • ETA ${eta}` : '');
+
+    f('bar').style.width = `${progress}%`;
+    f('bar').style.background = stateInfo.kind === 'seeding' ? '#16a34a' : '#2563eb';
+    f('track').setAttribute('aria-valuenow', progress.toFixed(0));
+
+    const errorBox = f('error');
+    const showError = !!torrent.error && (stateInfo.kind === 'waiting' || stateInfo.kind === 'error');
+    errorBox.hidden = !showError;
+    errorBox.textContent = showError ? torrent.error : '';
+
+    f('dl').textContent = formatSpeed(torrent.downloadRate || 0);
+    f('ul').textContent = formatSpeed(torrent.uploadRate || 0);
+    f('pieces').textContent = `${torrent.completedPieces || 0}/${torrent.pieceCount || 0}`;
+
+    card.querySelector('.torrent-copy-magnet').hidden = !torrent.magnetUri;
+    card.querySelector('.torrent-remove').setAttribute('aria-label', `Remove ${torrent.name}`);
+  }
+
   function renderTorrentList() {
     const container = document.getElementById('torrent-list');
     if (!container) return;
 
-    if (!torrentList.length) {
-      container.innerHTML = '<div class="torrent-empty" style="padding: 24px; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: var(--radius);">No torrent files added yet.</div>';
-      return;
+    const list = visibleTorrents();
+    const keep = new Set(list.map((t) => t.infoHash));
+
+    for (const [hash, node] of cardNodes) {
+      if (!keep.has(hash)) {
+        node.remove();
+        cardNodes.delete(hash);
+      }
     }
 
-    const cards = torrentList.map((torrent) => {
-      const size = formatBytes(torrent.length);
-      const stateInfo = normalizeTorrentState(torrent.state);
-      const state = stateInfo.label;
-      const progress = Number(torrent.progress || 0).toFixed(1);
-      const dlSpeed = formatSpeed(torrent.downloadRate || 0);
-      const ulSpeed = formatSpeed(torrent.uploadRate || 0);
-      const peers = torrent.peers || 0;
+    let empty = container.querySelector('.torrent-empty');
+    if (!list.length) {
+      if (!empty) {
+        empty = document.createElement('div');
+        empty.className = 'torrent-empty';
+        empty.style.cssText = 'padding: 24px; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: var(--radius);';
+        container.appendChild(empty);
+      }
+      empty.textContent = torrentList.length ? 'No torrents match the current filter.' : 'No torrent files added yet.';
+      return;
+    }
+    if (empty) empty.remove();
 
-      let stateBadgeStyle = 'background: #e5e7eb; color: #374151;';
-      if (stateInfo.kind === 'seeding') stateBadgeStyle = 'background: #dcfce7; color: #166534; font-weight: 600;';
-      else if (stateInfo.kind === 'downloading') stateBadgeStyle = 'background: #dbeafe; color: #1e40af; font-weight: 600;';
-      else if (stateInfo.kind === 'waiting') stateBadgeStyle = 'background: #fef3c7; color: #92400e; font-weight: 600;';
-      else if (stateInfo.kind === 'checking') stateBadgeStyle = 'background: #fef9c3; color: #854d0e;';
-      else if (stateInfo.kind === 'error') stateBadgeStyle = 'background: #fee2e2; color: #991b1b; font-weight: 600;';
+    list.forEach((torrent, index) => {
+      let card = cardNodes.get(torrent.infoHash);
+      if (!card) {
+        card = buildCard(torrent);
+        cardNodes.set(torrent.infoHash, card);
+      }
+      updateCard(card, torrent);
+      if (container.children[index] !== card) {
+        container.insertBefore(card, container.children[index] || null);
+      }
+    });
+  }
 
-      const copyMagnetHtml = torrent.magnetUri
-        ? `<button class="torrent-copy-magnet btn" data-magnet="${escapeHtml(torrent.magnetUri)}" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>`
-        : '';
+  function bindTorrentListActions() {
+    const container = document.getElementById('torrent-list');
+    if (!container) return;
 
-      return `
-        <article class="torrent-card" style="margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg);">
-          <div class="torrent-card-top" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-            <div class="torrent-file-wrap" style="display: flex; align-items: center; gap: 10px;">
-              <span style="display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; ${stateBadgeStyle}">${state}</span>
-              <div>
-                <h3 style="margin: 0; font-size: 15px; font-weight: 600;">${escapeHtml(torrent.name)}</h3>
-                <span style="font-size: 12px; color: var(--muted);">${size} • ${progress}% • Peers: ${peers}</span>
-              </div>
-            </div>
-            <div style="display: flex; align-items: center;">
-              ${copyMagnetHtml}
-              <button class="torrent-remove btn" data-hash="${escapeHtml(torrent.infoHash || torrent.id)}" aria-label="Remove ${escapeHtml(torrent.name)}" style="padding: 4px 8px; font-size: 12px; color: #dc2626;">Remove</button>
-            </div>
-          </div>
-          <div style="height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 8px;">
-            <div style="width: ${progress}%; height: 100%; background: #2563eb; transition: width 0.3s ease;"></div>
-          </div>
-          <div class="torrent-metrics" style="display: flex; gap: 24px; font-size: 12px; color: var(--muted);">
-            <div>Down: <strong style="color: var(--text);">${dlSpeed}</strong></div>
-            <div>Up: <strong style="color: var(--text);">${ulSpeed}</strong></div>
-            <div>Pieces: <strong style="color: var(--text);">${torrent.completedPieces || 0}/${torrent.pieceCount || 0}</strong></div>
-          </div>
-        </article>
-      `;
-    }).join('');
+    container.addEventListener('click', async (event) => {
+      const button = event.target.closest('button');
+      const card = event.target.closest('.torrent-card');
+      if (!button || !card) return;
+      const hash = card.dataset.hash;
+      const torrent = torrentList.find((item) => item.infoHash === hash);
 
-    container.innerHTML = cards;
-
-    // Bind remove buttons
-    container.querySelectorAll('.torrent-remove').forEach((button) => {
-      button.addEventListener('click', async () => {
-        const hash = button.dataset.hash;
+      if (button.classList.contains('torrent-remove')) {
         try {
           const res = await fetch(`/api/torrents/remove?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
           if (!res.ok && res.status !== 404) {
@@ -183,44 +289,77 @@
           setStatus('Failed to remove torrent: server unreachable.', 'error');
           return;
         }
-        const index = torrentList.findIndex((item) => (item.infoHash || item.id) === hash);
-        if (index !== -1) {
-          torrentList.splice(index, 1);
-          renderTorrentList();
-          updateDashboardTiles();
-          setStatus('Torrent removed.', 'info');
+        const index = torrentList.findIndex((item) => item.infoHash === hash);
+        if (index !== -1) torrentList.splice(index, 1);
+        renderTorrentList();
+        updateDashboardTiles();
+        setStatus('Torrent removed.', 'info');
+      } else if (button.classList.contains('torrent-copy-magnet') && torrent && torrent.magnetUri) {
+        try {
+          await navigator.clipboard.writeText(torrent.magnetUri);
+        } catch (_) {
+          setStatus('Clipboard access denied.', 'error');
+          return;
         }
-      });
+        const orig = button.textContent;
+        button.textContent = 'Copied!';
+        setTimeout(() => { button.textContent = orig === 'Copied!' ? 'Copy Magnet' : orig; }, 1500);
+      }
     });
+  }
 
-    // Bind copy magnet buttons
-    container.querySelectorAll('.torrent-copy-magnet').forEach((button) => {
-      button.addEventListener('click', async () => {
-        const uri = button.dataset.magnet;
-        if (uri) {
-          try {
-            await navigator.clipboard.writeText(uri);
-          } catch (_) {
-            setStatus('Clipboard access denied.', 'error');
-            return;
-          }
-          const orig = button.textContent;
-          button.textContent = 'Copied!';
-          setTimeout(() => { button.textContent = orig; }, 1500);
-        }
+  function bindListControls() {
+    const [showSelect, sortSelect] = document.querySelectorAll('#view-torrents .toolbar select');
+    if (showSelect) {
+      showSelect.addEventListener('change', () => {
+        viewFilter = showSelect.value.toLowerCase();
+        renderTorrentList();
       });
-    });
+    }
+    if (sortSelect) {
+      sortSelect.addEventListener('change', () => {
+        const v = sortSelect.value.toLowerCase();
+        viewSort = v.startsWith('most') ? 'recent' : v;
+        renderTorrentList();
+      });
+    }
+    const searchForm = document.querySelector('.topbar .search');
+    const searchInput = searchForm && searchForm.querySelector('input');
+    if (searchForm) {
+      // Enter trong form không có action sẽ tải lại cả trang.
+      searchForm.addEventListener('submit', (event) => event.preventDefault());
+    }
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        if (location.hash !== '#/torrents') location.hash = '#/torrents';
+        searchText = searchInput.value.trim().toLowerCase();
+        renderTorrentList();
+      });
+    }
+  }
+
+  let nextSeenOrder = 1;
+
+  function setConnectionLost(lost) {
+    const banner = document.getElementById('conn-banner');
+    if (banner) banner.hidden = !lost;
   }
 
   async function syncTorrentsFromServer() {
     try {
       const res = await fetch('/api/torrents');
-      if (!res.ok) return;
+      if (!res.ok) {
+        setConnectionLost(true);
+        return;
+      }
+      setConnectionLost(false);
       const data = await res.json();
       if (Array.isArray(data)) {
         torrentList.length = 0;
         data.forEach(item => {
+          if (!firstSeen.has(item.info_hash)) firstSeen.set(item.info_hash, nextSeenOrder++);
           torrentList.push({
+            error: item.error || '',
             id: item.info_hash,
             name: item.name,
             rawName: item.name,
@@ -241,7 +380,9 @@
         renderTorrentList();
         updateDashboardTiles();
       }
-    } catch (_) {}
+    } catch (_) {
+      setConnectionLost(true);
+    }
   }
 
   async function requestTorrentFromServer(file) {
@@ -406,7 +547,9 @@
         event.preventDefault();
         zone.classList.remove('is-active');
         const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
-        if (mode === 'add') {
+        // Kéo thả file .torrent vào vùng "create" là để thêm torrent, không phải tạo torrent từ chính nó.
+        const isTorrent = !!file && file.name.toLowerCase().endsWith('.torrent');
+        if (mode === 'add' || isTorrent) {
           await handleAddTorrent(file);
         } else {
           await handleCreateTorrent(file);
@@ -424,6 +567,8 @@
   window.addEventListener('hashchange', showView);
   showView();
   bindFilePicker();
+  bindTorrentListActions();
+  bindListControls();
   syncTorrentsFromServer();
   setInterval(syncTorrentsFromServer, 2000);
 })();
