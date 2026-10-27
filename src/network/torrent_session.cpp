@@ -218,21 +218,40 @@ bool TorrentSession::start() {
         }
     }
 
-    // Khởi động Distributed Hash Table (BEP 5) nếu bật
+    // Khởi động Distributed Hash Table (BEP 5) nếu bật.
+    // Không chạy bootstrap/lookup đồng bộ trong start() vì các thao tác UDP DHT
+    // có thể chậm và khóa request tạo torrent.
     if (config_.enable_dht) {
         try {
             const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
             dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
             if (dht_->start()) {
                 std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
-                if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
-                    dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
-                }
-                const auto dht_peers = dht_->getPeers(info_hash_raw_);
-                for (const auto& peer : dht_peers) {
-                    add_peer(peer.ip, peer.port);
-                }
-                dht_->announcePeer(info_hash_raw_, config_.listen_port);
+
+                dht_init_thread_ = std::thread([this]() {
+                    if (!running_) {
+                        return;
+                    }
+
+                    if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
+                        dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                    }
+
+                    if (!running_) {
+                        return;
+                    }
+
+                    const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                    for (const auto& peer : dht_peers) {
+                        if (running_) {
+                            add_peer(peer.ip, peer.port);
+                        }
+                    }
+
+                    if (running_) {
+                        dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                    }
+                });
             } else {
                 std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
                 dht_.reset();
@@ -264,15 +283,23 @@ void TorrentSession::stop() {
         if (lsd_) {
             lsd_->stop();
         }
-        if (dht_) {
-            dht_->stop();
-        }
 
         // Đóng các kết nối peer để giải phóng thread
         for (auto& [ep, peer] : active_peers_) {
             if (peer && peer->connection) {
                 peer->connection->close();
             }
+        }
+    }
+
+    if (dht_init_thread_.joinable()) {
+        dht_init_thread_.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (dht_) {
+            dht_->stop();
         }
     }
 

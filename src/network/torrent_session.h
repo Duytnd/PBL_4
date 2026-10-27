@@ -176,6 +176,7 @@ private:
     // Số luồng announce tracker đang chạy nền (detached): destructor phải chờ về 0
     // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
     std::atomic<int> announce_inflight_{0};
+    std::thread dht_init_thread_;
     SessionState state_{SessionState::Stopped};
     std::string error_message_;
 

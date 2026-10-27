@@ -558,11 +558,36 @@ void testSessionDhtIntegration() {
     CHECK(!session.is_running());
 }
 
+void testSessionStartDoesNotBlockOnDhtBootstrap() {
+    std::cout << "[TEST] TorrentSession startup ignores slow DHT bootstrap and returns promptly...\n";
+    const std::vector<std::string> pieces = {"BootstrapDelayPieceA", "BootstrapDelayPieceB"};
+    auto meta = makeMockMetadata("bootstrap_delay.bin", pieces, 18);
+
+    TorrentSessionConfig config;
+    config.download_dir = "./test_dht_bootstrap_delay";
+    config.listen_port = 6903;
+    config.enable_lsd = false;
+    config.enable_dht = true;
+    config.dht_port = 17801;
+    config.dht_bootstrap_host = "203.0.113.1";
+    config.dht_bootstrap_port = 6881;
+
+    TorrentSession session(meta, config);
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(session.start());
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    CHECK(elapsed < std::chrono::milliseconds(1000));
+
+    session.stop();
+}
+
 int main() {
     testSessionResumesFromPartFile();
     testSessionInitializationAndStats();
     testSessionTrackerDisabledStillRunsDht();
     testSessionDhtIntegration();
+    testSessionStartDoesNotBlockOnDhtBootstrap();
     testSessionExistingFileSeeding();
     testSessionPartialExistingFileRemainsDownloading();
     testSessionFailsWhenListenPortIsAlreadyBusy();

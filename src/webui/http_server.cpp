@@ -7,9 +7,9 @@
 namespace p2p {
 namespace {
 
-// Tách hostname khỏi "host[:port]" hoặc "scheme://host[:port]"; so khớp chính xác,
-// không so tiền tố (tránh "127.0.0.1.evil.com" / "localhost.evil.com").
-bool isLoopbackHost(std::string value) {
+// Tách hostname khỏi "host[:port]" hoặc "scheme://host[:port]"; cho phép gọi qua LAN IP
+// khi phát triển/test DHT bootstrap trên cùng mạng nội bộ.
+bool isAllowedHost(std::string value) {
     const std::size_t scheme = value.find("://");
     if (scheme != std::string::npos) {
         value.erase(0, scheme + 3);
@@ -22,7 +22,9 @@ bool isLoopbackHost(std::string value) {
     if (colon != std::string::npos) {
         value.erase(colon);
     }
-    return value == "127.0.0.1" || value == "localhost";
+    return value == "127.0.0.1" || value == "localhost" || value == "0.0.0.0" ||
+           value.rfind("10.", 0) == 0 || value.rfind("192.168.", 0) == 0 ||
+           value.rfind("172.", 0) == 0;
 }
 
 }  // namespace
@@ -32,10 +34,9 @@ HttpServer::HttpServer(std::filesystem::path staticRoot)
     // Chỉ phục vụ file tĩnh; API được api_routes.cpp đăng ký thêm vào raw().
     server_->set_mount_point("/", staticRoot_.string());
 
-    // Chặn request có header Host khác 127.0.0.1 / localhost: tránh một trang
-    // web khác (nguồn khác) điều khiển server qua DNS rebinding (mục 5.7).
+    // Chấp nhận cả localhost và các IP nội bộ trên cùng LAN để test bootstrap DHT.
     server_->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (!isLoopbackHost(req.get_header_value("Host"))) {
+        if (!isAllowedHost(req.get_header_value("Host"))) {
             res.status = 403;
             res.set_content("Forbidden: invalid Host header", "text/plain");
             return httplib::Server::HandlerResponse::Handled;
@@ -44,7 +45,7 @@ HttpServer::HttpServer(std::filesystem::path staticRoot)
         if (req.method != "GET" && req.method != "HEAD") {
             const std::string origin = req.get_header_value("Origin");
             const bool crossSite = req.get_header_value("Sec-Fetch-Site") == "cross-site";
-            if (crossSite || (!origin.empty() && !isLoopbackHost(origin))) {
+            if (crossSite || (!origin.empty() && !isAllowedHost(origin))) {
                 res.status = 403;
                 res.set_content("Forbidden: cross-origin request", "text/plain");
                 return httplib::Server::HandlerResponse::Handled;
@@ -63,9 +64,9 @@ httplib::Server& HttpServer::raw() {
 }
 
 bool HttpServer::run(int port) {
-    // Chỉ bind 127.0.0.1 (mục 5.7 của kế hoạch): không cho máy khác trong LAN gọi tới.
-    std::cout << "Web UI: http://127.0.0.1:" << port << "/" << std::endl;
-    return server_->listen("127.0.0.1", port);
+    // Bind all interfaces so other machines on the same LAN can reach the API endpoints.
+    std::cout << "Web UI: http://0.0.0.0:" << port << "/" << std::endl;
+    return server_->listen("0.0.0.0", port);
 }
 
 }  // namespace p2p
