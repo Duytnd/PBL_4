@@ -167,7 +167,7 @@ if(WIN32)
 endif()
 add_test(NAME test_peer_connection COMMAND test_peer_connection)
 
-# Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy)
+# Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy, LSD, DHT)
 add_executable(test_torrent_session
     tests/test_torrent_session.cpp
     src/network/torrent_session.cpp
@@ -183,6 +183,10 @@ add_executable(test_torrent_session
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
     src/network/lsd.cpp
+    src/network/dht/node_id.cpp
+    src/network/dht/routing_table.cpp
+    src/network/dht/krpc.cpp
+    src/network/dht/kademlia_node.cpp
     src/webui/state_bridge.cpp
 )
 target_include_directories(test_torrent_session PRIVATE
@@ -211,6 +215,25 @@ if(WIN32)
     target_link_libraries(peer_wire_tool PRIVATE ws2_32 crypt32)
 endif()
 
+# Công cụ CLI DHT Node (BEP 5): bootstrap, tra cứu peer, mô phỏng mạng Kademlia
+add_executable(dht_tool
+    tools/dht_tool.cpp
+    src/network/dht/node_id.cpp
+    src/network/dht/routing_table.cpp
+    src/network/dht/krpc.cpp
+    src/network/dht/kademlia_node.cpp
+    src/core/bencode.cpp
+    src/core/hash_utils.cpp
+)
+target_include_directories(dht_tool PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+)
+target_link_libraries(dht_tool PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(dht_tool PRIVATE ws2_32 crypt32)
+endif()
+
 # Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
 # core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
 add_executable(p2p_server
@@ -232,6 +255,10 @@ add_executable(p2p_server
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
     src/network/lsd.cpp
+    src/network/dht/node_id.cpp
+    src/network/dht/routing_table.cpp
+    src/network/dht/krpc.cpp
+    src/network/dht/kademlia_node.cpp
 )
 
 target_include_directories(p2p_server PRIVATE

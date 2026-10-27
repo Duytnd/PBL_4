@@ -237,8 +237,11 @@ void testSessionLoopbackPeerDownload() {
             seeder_peer.send_bitfield(all_have);
             std::cout << "  [SEEDER] Sent bitfield {true, true}!\n";
 
-            // 3. Nhận interested từ TorrentSession
+            // 3. Nhận interested từ TorrentSession (bỏ qua Port nếu có DHT)
             auto interested_msg = seeder_peer.receive_message();
+            while (interested_msg.id == static_cast<Byte>(PeerMessageId::Port)) {
+                interested_msg = seeder_peer.receive_message();
+            }
             std::cout << "  [SEEDER] Received message ID: " << static_cast<int>(interested_msg.id) << "\n";
             assert(interested_msg.id == static_cast<Byte>(PeerMessageId::Interested));
 
@@ -378,8 +381,11 @@ void testSessionLoopbackDownloadWithUnreachableTracker() {
             seeder_peer.send_bitfield(all_have);
             std::cout << "  [SEEDER] Sent bitfield {true, true}!\n";
 
-            // 3. Nhận interested từ TorrentSession
+            // 3. Nhận interested từ TorrentSession (bỏ qua Port nếu có DHT)
             auto interested_msg = seeder_peer.receive_message();
+            while (interested_msg.id == static_cast<Byte>(PeerMessageId::Port)) {
+                interested_msg = seeder_peer.receive_message();
+            }
             std::cout << "  [SEEDER] Received message ID: " << static_cast<int>(interested_msg.id) << "\n";
             assert(interested_msg.id == static_cast<Byte>(PeerMessageId::Interested));
 
@@ -504,9 +510,35 @@ void testSessionResumesFromPartFile() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+void testSessionDhtIntegration() {
+    std::cout << "[TEST] TorrentSession DHT integration (BEP 5)...\n";
+    const std::vector<std::string> pieces = {"DhtTestPieceData1", "DhtTestPieceData2"};
+    auto meta = makeMockMetadata("dht_test_file.bin", pieces, 17);
+
+    TorrentSessionConfig config;
+    config.download_dir = "./test_dht_downloads";
+    config.listen_port = 6896;
+    config.enable_lsd = false;
+    config.enable_dht = true;
+    config.dht_port = 17799;
+
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+    CHECK(session.is_running());
+    CHECK(session.dht() != nullptr);
+    CHECK_EQ(session.dht()->port(), std::uint16_t(17799));
+
+    auto stats = session.stats();
+    CHECK_EQ(stats.dht_nodes_count, std::size_t(0));
+
+    session.stop();
+    CHECK(!session.is_running());
+}
+
 int main() {
     testSessionResumesFromPartFile();
     testSessionInitializationAndStats();
+    testSessionDhtIntegration();
     testSessionExistingFileSeeding();
     testSessionPartialExistingFileRemainsDownloading();
     testSessionFailsWhenListenPortIsAlreadyBusy();

@@ -206,8 +206,9 @@
     name.title = torrent.name;
 
     const eta = stateInfo.kind === 'downloading' ? formatEta(torrent) : '';
+    const dhtStr = (torrent.dhtNodes !== undefined && torrent.dhtNodes > 0) ? ` • DHT: ${torrent.dhtNodes}` : '';
     f('meta').textContent =
-      `${formatBytes(torrent.length)} • ${progress.toFixed(1)}% • Peers: ${torrent.peers || 0}` +
+      `${formatBytes(torrent.length)} • ${progress.toFixed(1)}% • Peers: ${torrent.peers || 0}${dhtStr}` +
       (eta ? ` • ETA ${eta}` : '');
 
     f('bar').style.width = `${progress}%`;
@@ -375,6 +376,7 @@
             pieceCount: item.total_pieces,
             completedPieces: item.completed_pieces,
             peers: item.connected_peers,
+            dhtNodes: item.dht_nodes,
           });
         });
         renderTorrentList();

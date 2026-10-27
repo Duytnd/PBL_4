@@ -8,6 +8,7 @@
 #include "network/tracker_protocol.h"
 #include "strategy/choker.h"
 #include "strategy/piece_picker.h"
+#include "network/dht/kademlia_node.h"
 
 #include <atomic>
 #include <chrono>
@@ -81,6 +82,7 @@ struct TorrentSessionStats {
     std::size_t completed_pieces = 0;
     std::size_t connected_peers = 0;
     std::size_t total_peers_known = 0;
+    std::size_t dht_nodes_count = 0;
     std::string error_message;
 };
 
@@ -93,6 +95,10 @@ struct TorrentSessionConfig {
     std::chrono::seconds choker_interval{10};
     std::chrono::seconds peer_timeout{30};
     bool enable_lsd = true;                     // Tự tìm kiếm peer qua LSD (BEP 14)
+    bool enable_dht = true;                     // Tự tìm kiếm peer qua DHT (BEP 5)
+    std::uint16_t dht_port = 0;                 // Port UDP cho DHT (0 = dùng listen_port)
+    std::string dht_bootstrap_host;             // Địa chỉ node DHT bootstrap
+    std::uint16_t dht_bootstrap_port = 0;       // Cổng node DHT bootstrap
     std::string client_peer_id;                 // Tự sinh nếu để rỗng (-PB0001-...)
 };
 
@@ -141,6 +147,7 @@ public:
     [[nodiscard]] std::string info_hash_hex() const;
     [[nodiscard]] const std::string& peer_id() const noexcept;
     [[nodiscard]] std::filesystem::path save_path() const;
+    [[nodiscard]] KademliaNode* dht() noexcept { return dht_.get(); }
 
     // Thay đổi chiến lược (Piece Picker & Choker)
     void set_piece_picker(std::unique_ptr<strategy::PiecePicker> picker);
@@ -249,6 +256,9 @@ private:
 
     // LSD
     std::unique_ptr<LocalServiceDiscovery> lsd_;
+
+    // DHT (BEP 5)
+    std::unique_ptr<KademliaNode> dht_;
 
     // Các hàm nội bộ
     void set_state(SessionState new_state);

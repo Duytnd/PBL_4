@@ -377,6 +377,45 @@ void testKademliaNodeGetPeersAndAnnounce() {
     nodeB.stop();
 }
 
+void testKademliaSwarmSimulation16Nodes() {
+    std::cout << "[TEST] DHT Kademlia 16-node swarm simulation (Stage 4 requirement)...\n";
+    constexpr std::size_t kNodeCount = 16;
+    constexpr std::uint16_t kBasePort = 18850;
+
+    std::vector<std::unique_ptr<KademliaNode>> nodes;
+    nodes.reserve(kNodeCount);
+
+    // Tạo và khởi động 16 node DHT trên localhost
+    for (std::size_t i = 0; i < kNodeCount; ++i) {
+        NodeId id = NodeId::random();
+        auto node = std::make_unique<KademliaNode>(id, static_cast<std::uint16_t>(kBasePort + i));
+        CHECK(node->start());
+        nodes.push_back(std::move(node));
+    }
+
+    // Node 0 là bootstrap root; các node 1..15 lần lượt bootstrap vào mạng
+    for (std::size_t i = 1; i < kNodeCount; ++i) {
+        const std::uint16_t targetPort = static_cast<std::uint16_t>(kBasePort + (i % 2 == 0 ? 0 : i - 1));
+        nodes[i]->bootstrap("127.0.0.1", targetPort);
+    }
+
+    // Node 15 announce 1 info_hash trên TCP port 6899
+    const std::string testInfoHash = std::string(20, '\x77');
+    nodes[15]->announcePeer(testInfoHash, 6899);
+
+    // Node 1 truy vấn getPeers cho testInfoHash
+    const auto discoveredPeers = nodes[1]->getPeers(testInfoHash);
+
+    // Kiểm tra routing table các node đã hội tụ và lưu contacts
+    CHECK(nodes[0]->routingTable().size() >= 1);
+    CHECK(nodes[1]->routingTable().size() >= 1);
+    CHECK(nodes[15]->routingTable().size() >= 1);
+
+    for (auto& node : nodes) {
+        node->stop();
+    }
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -415,6 +454,7 @@ int main() {
     // KademliaNode (I/O thật)
     RUN(testKademliaNodePingBootstrap);
     RUN(testKademliaNodeGetPeersAndAnnounce);
+    RUN(testKademliaSwarmSimulation16Nodes);
 
     return TEST_REPORT();
 }

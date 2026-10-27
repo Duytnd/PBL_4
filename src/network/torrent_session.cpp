@@ -218,6 +218,30 @@ bool TorrentSession::start() {
         }
     }
 
+    // Khởi động Distributed Hash Table (BEP 5) nếu bật
+    if (config_.enable_dht) {
+        try {
+            const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
+            dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
+            if (dht_->start()) {
+                std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
+                if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
+                    dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                }
+                const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                for (const auto& peer : dht_peers) {
+                    add_peer(peer.ip, peer.port);
+                }
+                dht_->announcePeer(info_hash_raw_, config_.listen_port);
+            } else {
+                std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
+                dht_.reset();
+            }
+        } catch (...) {
+            dht_.reset();
+        }
+    }
+
     // Khởi động Inbound Acceptor thread
     acceptor_thread_ = std::thread(&TorrentSession::acceptor_loop, this);
 
@@ -239,6 +263,9 @@ void TorrentSession::stop() {
 
         if (lsd_) {
             lsd_->stop();
+        }
+        if (dht_) {
+            dht_->stop();
         }
 
         // Đóng các kết nối peer để giải phóng thread
@@ -288,6 +315,7 @@ void TorrentSession::stop() {
         in_progress_pieces_.clear();
         pending_blocks_.clear();
         lsd_.reset();
+        dht_.reset();
     }
 }
 
@@ -362,6 +390,7 @@ TorrentSessionStats TorrentSession::stats() const {
     s.completed_pieces = completed_pieces_count_;
     s.connected_peers = active_peers_.size();
     s.total_peers_known = known_peer_endpoints_.size();
+    s.dht_nodes_count = dht_ ? dht_->routingTable().size() : 0;
     s.download_rate = current_download_rate_;
     s.upload_rate = current_upload_rate_;
     s.error_message = error_message_;
@@ -480,6 +509,7 @@ void TorrentSession::orchestration_loop() {
     auto last_choker_time = std::chrono::steady_clock::now();
     auto last_tracker_time = std::chrono::steady_clock::now();
     auto last_lsd_time = std::chrono::steady_clock::now();
+    auto last_dht_time = std::chrono::steady_clock::now();
 
     while (running_) {
         if (!paused_) {
@@ -506,6 +536,16 @@ void TorrentSession::orchestration_loop() {
             if (config_.enable_lsd && lsd_ && now - last_lsd_time >= std::chrono::seconds(60)) {
                 lsd_->announce(info_hash_raw_);
                 last_lsd_time = now;
+            }
+
+            // 5. Announce và truy vấn định kỳ DHT (mỗi 60 giây)
+            if (config_.enable_dht && dht_ && now - last_dht_time >= std::chrono::seconds(60)) {
+                const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                for (const auto& p : dht_peers) {
+                    add_peer(p.ip, p.port);
+                }
+                dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                last_dht_time = now;
             }
         }
 
@@ -661,6 +701,13 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                   << " pieces) to " << peer->endpoint_str << std::endl;
         peer->connection->send_bitfield(current_bits);
 
+        // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
+        if (dht_ && peer->connection->is_open()) {
+            try {
+                peer->connection->send_port(dht_->port());
+            } catch (...) {}
+        }
+
         // Bày tỏ quan tâm nếu đang tải
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
@@ -803,6 +850,14 @@ void TorrentSession::handle_peer_message(
             // để luôn duy trì 4 request song song → tốc độ tải tối đa
             if (!peer->peer_choking && peer->am_interested) {
                 request_next_blocks(peer);
+            }
+            break;
+        }
+        case pbl4::network::PeerMessageId::Port: {
+            const auto remote_dht_port = pbl4::network::peer_protocol::parse_port(msg);
+            std::cout << "[DHT] Peer " << peer->endpoint_str << " sent DHT Port: " << remote_dht_port << std::endl;
+            if (dht_ && remote_dht_port != 0) {
+                dht_->ping(peer->ip, remote_dht_port);
             }
             break;
         }
