@@ -9,8 +9,12 @@
 #include "webui/state_bridge.h"
 
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <random>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -156,6 +160,205 @@ std::size_t parsePieceLength(const httplib::MultipartFormData& form) {
     }
 }
 
+bool parseBoolField(const httplib::MultipartFormData& form, const char* name, bool defaultValue) {
+    if (!form.has_field(name)) {
+        return defaultValue;
+    }
+    const std::string value = form.get_field(name);
+    if (value.empty()) {
+        return defaultValue;
+    }
+    const std::string normalized = [&value]() {
+        std::string copy = value;
+        std::transform(copy.begin(), copy.end(), copy.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return copy;
+    }();
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return defaultValue;
+}
+
+std::uint16_t parseUint16Field(const httplib::MultipartFormData& form, const char* name, std::uint16_t defaultValue) {
+    if (!form.has_field(name)) {
+        return defaultValue;
+    }
+    try {
+        const unsigned long value = std::stoul(form.get_field(name));
+        if (value == 0 || value > 65535UL) {
+            return defaultValue;
+        }
+        return static_cast<std::uint16_t>(value);
+    } catch (const std::exception&) {
+        return defaultValue;
+    }
+}
+
+std::string trim(const std::string& value) {
+    const std::size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const std::size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string readEnvString(const char* key) {
+    if (const char* value = std::getenv(key)) {
+        return trim(value);
+    }
+    return "";
+}
+
+std::filesystem::path resolveDhtConfigPath() {
+    return resolveProjectRoot() / "config" / "dht_bootstrap.json";
+}
+
+std::string jsonEscape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+std::string readJsonStringField(const std::string& json, const std::string& field) {
+    const std::regex re("\\\"" + field + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+    std::smatch match;
+    if (std::regex_search(json, match, re)) {
+        return match[1].str();
+    }
+    return "";
+}
+
+std::uint16_t readJsonUint16Field(const std::string& json, const std::string& field, std::uint16_t defaultValue) {
+    const std::regex re("\\\"" + field + "\\\"\\s*:\\s*([0-9]{1,5})");
+    std::smatch match;
+    if (std::regex_search(json, match, re)) {
+        const unsigned long value = std::stoul(match[1].str());
+        if (value > 0 && value <= 65535UL) {
+            return static_cast<std::uint16_t>(value);
+        }
+    }
+    return defaultValue;
+}
+
+std::pair<std::string, std::uint16_t> loadDhtBootstrapConfig() {
+    std::string host = readEnvString("DHT_BOOTSTRAP_HOST");
+    std::uint16_t port = 0;
+    const std::string envPort = readEnvString("DHT_BOOTSTRAP_PORT");
+    if (!envPort.empty()) {
+        try {
+            const unsigned long value = std::stoul(envPort);
+            if (value > 0 && value <= 65535UL) {
+                port = static_cast<std::uint16_t>(value);
+            }
+        } catch (const std::exception&) {
+        }
+    }
+
+    const std::filesystem::path configPath = resolveDhtConfigPath();
+    if (std::filesystem::exists(configPath)) {
+        std::ifstream input(configPath);
+        if (input) {
+            std::stringstream buffer;
+            buffer << input.rdbuf();
+            const std::string json = buffer.str();
+            if (host.empty()) {
+                host = readJsonStringField(json, "host");
+            }
+            if (port == 0) {
+                port = readJsonUint16Field(json, "port", 0);
+            }
+        }
+    }
+
+    return {host, port};
+}
+
+std::string getDhtBootstrapSource() {
+    if (!readEnvString("DHT_BOOTSTRAP_HOST").empty() || !readEnvString("DHT_BOOTSTRAP_PORT").empty()) {
+        return "env";
+    }
+    return std::filesystem::exists(resolveDhtConfigPath()) ? "json" : "default";
+}
+
+void saveDhtBootstrapConfig(const std::string& host, std::uint16_t port) {
+    const std::filesystem::path configPath = resolveDhtConfigPath();
+    std::filesystem::create_directories(configPath.parent_path());
+    std::ofstream output(configPath, std::ios::trunc);
+    if (!output) {
+        return;
+    }
+    output << "{\n"
+           << "  \"host\": \"" << jsonEscape(host) << "\",\n"
+           << "  \"port\": " << port << "\n"
+           << "}\n";
+
+    setenv("DHT_BOOTSTRAP_HOST", host.c_str(), 1);
+    std::string portValue = std::to_string(port);
+    setenv("DHT_BOOTSTRAP_PORT", portValue.c_str(), 1);
+}
+
+std::pair<std::string, std::uint16_t> extractDhtBootstrapFromRequest(const httplib::Request& req) {
+    std::string host;
+    std::uint16_t port = 0;
+
+    if (req.has_param("host")) {
+        host = trim(req.get_param_value("host"));
+    } else if (req.has_param("dht_bootstrap_host")) {
+        host = trim(req.get_param_value("dht_bootstrap_host"));
+    } else if (!req.body.empty()) {
+        const std::regex hostRegex(R"re("host"\s*:\s*"([^"]*)")re");
+        std::smatch match;
+        if (std::regex_search(req.body, match, hostRegex)) {
+            host = match[1].str();
+        }
+    }
+
+    if (req.has_param("port")) {
+        try {
+            const unsigned long value = std::stoul(req.get_param_value("port"));
+            if (value > 0 && value <= 65535UL) {
+                port = static_cast<std::uint16_t>(value);
+            }
+        } catch (const std::exception&) {
+        }
+    } else if (req.has_param("dht_bootstrap_port")) {
+        try {
+            const unsigned long value = std::stoul(req.get_param_value("dht_bootstrap_port"));
+            if (value > 0 && value <= 65535UL) {
+                port = static_cast<std::uint16_t>(value);
+            }
+        } catch (const std::exception&) {
+        }
+    } else if (!req.body.empty()) {
+        const std::regex portRegex(R"re("port"\s*:\s*([0-9]{1,5}))re");
+        std::smatch match;
+        if (std::regex_search(req.body, match, portRegex)) {
+            const unsigned long value = std::stoul(match[1].str());
+            if (value > 0 && value <= 65535UL) {
+                port = static_cast<std::uint16_t>(value);
+            }
+        }
+    }
+
+    return {host, port};
+}
+
 void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
     if (!req.form.has_file("file")) {
         res.status = 400;
@@ -192,6 +395,11 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         : kDefaultAnnounce;
     const std::size_t pieceLength = parsePieceLength(req.form);
     const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
+    const bool enableTracker = parseBoolField(req.form, "enable_tracker", true);
+    const bool enableDht = parseBoolField(req.form, "enable_dht", true);
+    const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
+    const std::string dhtBootstrapHost = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
+    const std::uint16_t dhtBootstrapPort = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
     if (!nameOverride.empty() && !PathSanitizer::isSafeRelativePath(nameOverride)) {
         res.status = 400;
         res.set_content("Invalid torrent name", "text/plain");
@@ -213,7 +421,11 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         TorrentSessionConfig config;
         config.download_dir = downloadDir;
         config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_tracker = enableTracker;
         config.enable_lsd = true;
+        config.enable_dht = enableDht;
+        config.dht_bootstrap_host = dhtBootstrapHost;
+        config.dht_bootstrap_port = dhtBootstrapPort;
 
         // Trùng torrent: không start thêm session (tránh chiếm port vô ích).
         if (!StateBridge::instance().getSession(infoHashHex)) {
@@ -274,7 +486,12 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
         TorrentSessionConfig config;
         config.download_dir = downloadDir;
         config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_tracker = parseBoolField(req.form, "enable_tracker", true);
         config.enable_lsd = true;
+        config.enable_dht = parseBoolField(req.form, "enable_dht", true);
+        const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
+        config.dht_bootstrap_host = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
+        config.dht_bootstrap_port = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
 
         if (!StateBridge::instance().getSession(infoHashHex)) {
             auto session = std::make_shared<TorrentSession>(meta, config);
@@ -344,6 +561,37 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
         const std::string ip = getLocalLanIp();
         const std::string announce = "http://" + ip + ":6969/announce";
         std::string json = "{\"ip\":\"" + ip + "\",\"default_announce\":\"" + announce + "\"}";
+        res.set_content(json, "application/json");
+    });
+
+    server.Get("/api/dht/bootstrap", [](const httplib::Request& /*req*/, httplib::Response& res) {
+        const auto [host, port] = loadDhtBootstrapConfig();
+        const std::string configPath = resolveDhtConfigPath().string();
+        std::string json = "{\"host\":\"" + jsonEscape(host) + "\",\"port\":" + std::to_string(port) +
+                           ",\"source\":\"" + getDhtBootstrapSource() + "\",\"config_path\":\"" + jsonEscape(configPath) + "\"}";
+        res.set_content(json, "application/json");
+    });
+
+    server.Post("/api/dht/bootstrap", [](const httplib::Request& req, httplib::Response& res) {
+        const auto [host, port] = extractDhtBootstrapFromRequest(req);
+        if (host.empty() || port == 0) {
+            res.status = 400;
+            res.set_content("{\"status\":\"error\",\"message\":\"Requires host and port\"}", "application/json");
+            return;
+        }
+
+        saveDhtBootstrapConfig(host, port);
+        std::string json = "{\"status\":\"ok\",\"host\":\"" + jsonEscape(host) + "\",\"port\":" + std::to_string(port) +
+                           ",\"config_path\":\"" + jsonEscape(resolveDhtConfigPath().string()) + "\"}";
+        res.set_content(json, "application/json");
+    });
+
+    server.Get("/api/dht/status", [](const httplib::Request& /*req*/, httplib::Response& res) {
+        const auto [host, port] = loadDhtBootstrapConfig();
+        const bool enabled = true;
+        std::string json = "{\"enabled\":" + std::string(enabled ? "true" : "false") +
+                           ",\"bootstrap_host\":\"" + jsonEscape(host) + "\",\"bootstrap_port\":" + std::to_string(port) +
+                           ",\"source\":\"" + getDhtBootstrapSource() + "\",\"config_path\":\"" + jsonEscape(resolveDhtConfigPath().string()) + "\"}";
         res.set_content(json, "application/json");
     });
 }

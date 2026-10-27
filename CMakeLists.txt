@@ -234,6 +234,25 @@ if(WIN32)
     target_link_libraries(dht_tool PRIVATE ws2_32 crypt32)
 endif()
 
+# Công cụ CLI BitTorrent chính thức: tạo .torrent (p2p create), kiểm tra metadata (p2p info), verify
+add_executable(p2p
+    tools/torrent_tool.cpp
+    src/core/bencode.cpp
+    src/core/hash_utils.cpp
+    src/core/path_sanitizer.cpp
+    src/core/torrent_file.cpp
+    src/core/torrent_builder.cpp
+    src/core/piece_manager.cpp
+)
+target_include_directories(p2p PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+)
+target_link_libraries(p2p PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(p2p PRIVATE ws2_32 crypt32)
+endif()
+
 # Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
 # core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
 add_executable(p2p_server

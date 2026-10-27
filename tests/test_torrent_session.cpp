@@ -510,6 +510,29 @@ void testSessionResumesFromPartFile() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+void testSessionTrackerDisabledStillRunsDht() {
+    std::cout << "[TEST] TorrentSession tracker-disabled + DHT-enabled mode...\n";
+    const std::vector<std::string> pieces = {"DhtTestPieceData1", "DhtTestPieceData2"};
+    auto meta = makeMockMetadata("tracker_disabled_dht.bin", pieces, 17);
+
+    TorrentSessionConfig config;
+    config.download_dir = "./test_dht_downloads_no_tracker";
+    config.listen_port = 6897;
+    config.enable_tracker = false;
+    config.enable_lsd = false;
+    config.enable_dht = true;
+    config.dht_port = 17800;
+
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+    CHECK(session.is_running());
+    CHECK(session.dht() != nullptr);
+    CHECK_EQ(session.dht()->port(), std::uint16_t(17800));
+
+    session.stop();
+    CHECK(!session.is_running());
+}
+
 void testSessionDhtIntegration() {
     std::cout << "[TEST] TorrentSession DHT integration (BEP 5)...\n";
     const std::vector<std::string> pieces = {"DhtTestPieceData1", "DhtTestPieceData2"};
@@ -538,6 +561,7 @@ void testSessionDhtIntegration() {
 int main() {
     testSessionResumesFromPartFile();
     testSessionInitializationAndStats();
+    testSessionTrackerDisabledStillRunsDht();
     testSessionDhtIntegration();
     testSessionExistingFileSeeding();
     testSessionPartialExistingFileRemainsDownloading();

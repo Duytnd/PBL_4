@@ -94,6 +94,7 @@ struct TorrentSessionConfig {
     std::chrono::seconds tracker_interval{60};
     std::chrono::seconds choker_interval{10};
     std::chrono::seconds peer_timeout{30};
+    bool enable_tracker = true;                 // Cho phép announce tới tracker nếu có URL
     bool enable_lsd = true;                     // Tự tìm kiếm peer qua LSD (BEP 14)
     bool enable_dht = true;                     // Tự tìm kiếm peer qua DHT (BEP 5)
     std::uint16_t dht_port = 0;                 // Port UDP cho DHT (0 = dùng listen_port)

@@ -504,7 +504,9 @@ void TorrentSession::on_torrent_finished(TorrentFinishedCallback cb) {
 }
 
 void TorrentSession::orchestration_loop() {
-    process_tracker_announce("started");
+    if (config_.enable_tracker) {
+        process_tracker_announce("started");
+    }
 
     auto last_choker_time = std::chrono::steady_clock::now();
     auto last_tracker_time = std::chrono::steady_clock::now();
@@ -526,8 +528,8 @@ void TorrentSession::orchestration_loop() {
                 last_choker_time = now;
             }
 
-            // 3. Announce định kỳ tới Tracker
-            if (now - last_tracker_time >= config_.tracker_interval) {
+            // 3. Announce định kỳ tới Tracker (nếu bật), độc lập với DHT
+            if (config_.enable_tracker && now - last_tracker_time >= config_.tracker_interval) {
                 process_tracker_announce("");
                 last_tracker_time = now;
             }
@@ -1253,6 +1255,10 @@ void TorrentSession::update_rates() {
 }
 
 void TorrentSession::process_tracker_announce(const std::string& event) {
+    if (!config_.enable_tracker) {
+        std::cout << "[TRACKER-ANNOUNCE] Skipping: tracker is disabled by configuration." << std::endl;
+        return;
+    }
     if (metadata_.announce.empty()) {
         std::cout << "[TRACKER-ANNOUNCE] Skipping: announce URL is empty!" << std::endl;
         return;
