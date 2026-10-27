@@ -1,57 +1,76 @@
 #include "choker.h"
 #include <algorithm>
-#include <random>
 
 namespace p2p {
 namespace strategy {
 
+TitForTatChoker::TitForTatChoker(TitForTatConfig config, unsigned int seed)
+    : config_(config), rng_(seed) {
+    if (config_.regular_slots < 0) config_.regular_slots = 0;
+    if (config_.optimistic_rotation_rounds < 1) config_.optimistic_rotation_rounds = 1;
+}
+
 std::vector<std::string> TitForTatChoker::update_chokes(const std::vector<PeerStatus>& peers, bool is_seeding_only) {
     std::vector<std::string> unchoked_peers;
-    std::vector<PeerStatus> interested_peers;
 
-    // Bước 1: Chỉ quan tâm đến những người đang muốn tải dữ liệu từ mình (is_interested = true)
+    // Bước 1: Chỉ quan tâm đến những người đang muốn tải dữ liệu từ mình.
+    std::vector<PeerStatus> interested_peers;
     for (const auto& peer : peers) {
         if (peer.is_interested) {
             interested_peers.push_back(peer);
         }
     }
 
-    // Bước 2: Sắp xếp danh sách dựa trên tốc độ
+    // Bước 2: Sắp xếp theo tốc độ. Hòa thì xếp theo peer_id để kết quả ổn định,
+    // không phụ thuộc thứ tự danh sách đầu vào.
     std::sort(interested_peers.begin(), interested_peers.end(),
               [is_seeding_only](const PeerStatus& a, const PeerStatus& b) {
-                  // Nếu mình đã tải xong file (chỉ seed), ưu tiên người mình đẩy file cho họ nhanh nhất
-                  if (is_seeding_only) {
-                      return a.upload_rate > b.upload_rate;
-                  } 
-                  // Nếu mình đang tải, ưu tiên người gửi dữ liệu cho mình nhanh nhất
-                  else {
-                      return a.download_rate > b.download_rate;
-                  }
+                  const double ra = is_seeding_only ? a.upload_rate : a.download_rate;
+                  const double rb = is_seeding_only ? b.upload_rate : b.download_rate;
+                  if (ra != rb) return ra > rb;
+                  return a.peer_id < b.peer_id;
               });
 
-    // Bước 3: Cấp slot chính thức (Mặc định là 3 slot)
-    std::vector<PeerStatus> remaining_peers;
+    // Bước 3: Cấp slot chính thức theo tốc độ.
+    const size_t regular = static_cast<size_t>(config_.regular_slots);
+    std::vector<std::string> candidates;  // những peer interested chưa được slot chính thức
     for (size_t i = 0; i < interested_peers.size(); ++i) {
-        if (i < num_regular_slots) {
+        if (i < regular) {
             unchoked_peers.push_back(interested_peers[i].peer_id);
         } else {
-            remaining_peers.push_back(interested_peers[i]);
+            candidates.push_back(interested_peers[i].peer_id);
         }
     }
 
-    // Bước 4: Cấp slot ngẫu nhiên (Optimistic unchoke - 1 slot)
-    // Giúp dò tìm các peer mới có khả năng cho tốc độ cao hơn
-    if (!remaining_peers.empty()) {
-        // Trong môi trường thực tế, luồng thời gian bên ngoài sẽ gọi hàm xoay vòng 30s/lần.
-        // Ở đây ta cài đặt logic chọn ngẫu nhiên 1 peer từ danh sách còn lại.
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> distrib(0, remaining_peers.size() - 1);
-        
-        current_optimistic_peer = remaining_peers[distrib(gen)].peer_id;
-        unchoked_peers.push_back(current_optimistic_peer);
+    // Bước 4: Slot optimistic. Giữ nguyên peer cũ cho đủ N vòng nếu nó còn hợp lệ
+    // (còn kết nối, còn interested, chưa lọt vào top theo tốc độ).
+    if (candidates.empty()) {
+        current_optimistic_peer_.clear();
+        rounds_held_ = 0;
+        return unchoked_peers;
     }
 
+    const bool still_valid =
+        !current_optimistic_peer_.empty() &&
+        std::find(candidates.begin(), candidates.end(), current_optimistic_peer_) != candidates.end();
+
+    if (still_valid && rounds_held_ < config_.optimistic_rotation_rounds) {
+        ++rounds_held_;
+    } else {
+        // Đến lúc xoay (hoặc peer cũ không còn hợp lệ): bốc người mới.
+        // Nếu còn lựa chọn khác thì tránh bốc lại đúng người vừa giữ.
+        std::vector<std::string> pool;
+        for (const auto& id : candidates) {
+            if (id != current_optimistic_peer_) pool.push_back(id);
+        }
+        if (pool.empty()) pool = candidates;
+
+        std::uniform_int_distribution<size_t> distrib(0, pool.size() - 1);
+        current_optimistic_peer_ = pool[distrib(rng_)];
+        rounds_held_ = 1;
+    }
+
+    unchoked_peers.push_back(current_optimistic_peer_);
     return unchoked_peers;
 }
 
