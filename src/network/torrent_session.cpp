@@ -1,7 +1,6 @@
 #include "network/torrent_session.h"
 
 #include "core/hash_utils.h"
-#include "network/extension.h"
 #include "network/lsd.h"
 
 #include <algorithm>
@@ -223,51 +222,42 @@ bool TorrentSession::start() {
     // Không chạy bootstrap/lookup đồng bộ trong start() vì các thao tác UDP DHT
     // có thể chậm và khóa request tạo torrent.
     if (config_.enable_dht) {
-        if (config_.shared_dht) {
-            dht_shared_ = config_.shared_dht;
-        } else {
-            try {
-                const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
-                dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
-                if (dht_->start()) {
-                    std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
-                } else {
-                    std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
-                    dht_.reset();
-                }
-            } catch (...) {
+        try {
+            const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
+            dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
+            if (dht_->start()) {
+                std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
+
+                dht_init_thread_ = std::thread([this]() {
+                    if (!running_) {
+                        return;
+                    }
+
+                    if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
+                        dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                    }
+
+                    if (!running_) {
+                        return;
+                    }
+
+                    const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                    for (const auto& peer : dht_peers) {
+                        if (running_) {
+                            add_peer(peer.ip, peer.port);
+                        }
+                    }
+
+                    if (running_) {
+                        dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                    }
+                });
+            } else {
+                std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
                 dht_.reset();
             }
-        }
-
-        if (dht()) {
-            dht_init_thread_ = std::thread([this]() {
-                if (!running_) {
-                    return;
-                }
-
-                auto* node = dht();
-                if (!node) return;
-
-                if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
-                    node->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
-                }
-
-                if (!running_) {
-                    return;
-                }
-
-                const auto dht_peers = node->getPeers(info_hash_raw_);
-                for (const auto& peer : dht_peers) {
-                    if (running_) {
-                        add_peer(peer.ip, peer.port);
-                    }
-                }
-
-                if (running_) {
-                    node->announcePeer(info_hash_raw_, config_.listen_port);
-                }
-            });
+        } catch (...) {
+            dht_.reset();
         }
     }
 
@@ -427,7 +417,7 @@ TorrentSessionStats TorrentSession::stats() const {
     s.completed_pieces = completed_pieces_count_;
     s.connected_peers = active_peers_.size();
     s.total_peers_known = known_peer_endpoints_.size();
-    s.dht_nodes_count = dht() ? dht()->routingTable().size() : 0;
+    s.dht_nodes_count = dht_ ? dht_->routingTable().size() : 0;
     s.download_rate = current_download_rate_;
     s.upload_rate = current_upload_rate_;
     s.error_message = error_message_;
@@ -577,14 +567,13 @@ void TorrentSession::orchestration_loop() {
                 last_lsd_time = now;
             }
 
-            // 5. Announce và truy vấn định kỳ DHT
-            const auto dht_interval = active_peers_.empty() ? std::chrono::seconds(10) : std::chrono::seconds(60);
-            if (config_.enable_dht && dht() && now - last_dht_time >= dht_interval) {
-                const auto dht_peers = dht()->getPeers(info_hash_raw_);
+            // 5. Announce và truy vấn định kỳ DHT (mỗi 60 giây)
+            if (config_.enable_dht && dht_ && now - last_dht_time >= std::chrono::seconds(60)) {
+                const auto dht_peers = dht_->getPeers(info_hash_raw_);
                 for (const auto& p : dht_peers) {
                     add_peer(p.ip, p.port);
                 }
-                dht()->announcePeer(info_hash_raw_, config_.listen_port);
+                dht_->announcePeer(info_hash_raw_, config_.listen_port);
                 last_dht_time = now;
             }
         }
@@ -671,7 +660,6 @@ void TorrentSession::connect_candidate_peers() {
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
-            peer->outbound = true;
             peer->endpoint_str = ep_str;
             peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(conn));
             peer->bitfield.assign(metadata_.pieces.size(), false);
@@ -742,21 +730,10 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                   << " pieces) to " << peer->endpoint_str << std::endl;
         peer->connection->send_bitfield(current_bits);
 
-        const bool remote_supports_extensions =
-            peer->connection->remote_handshake().supports_extension();
-        if (remote_supports_extensions) {
-            const auto metadata_size = metadata_.infoRaw.size() <=
-                    pbl4::network::extension::kMaxMetadataSize
-                ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(metadata_.infoRaw.size()))
-                : std::nullopt;
-            peer->connection->send_message(
-                pbl4::network::extension::make_extended_handshake(metadata_size));
-        }
-
         // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
-        if (dht() && peer->connection->is_open()) {
+        if (dht_ && peer->connection->is_open()) {
             try {
-                peer->connection->send_port(dht()->port());
+                peer->connection->send_port(dht_->port());
             } catch (...) {}
         }
 
@@ -771,13 +748,7 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
         }
 
         // Vòng lặp nhận và xử lý message
-        auto last_pex_time = std::chrono::steady_clock::now();
         while (running_ && !paused_ && peer->connection->is_open()) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_pex_time >= std::chrono::seconds(60)) {
-                send_peer_exchange(peer);
-                last_pex_time = now;
-            }
             if (!peer->peer_choking && peer->am_interested) {
                 request_next_blocks(peer);
             }
@@ -792,12 +763,8 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                 }
             }
         }
-    } catch (const std::exception& ex) {
-        std::cout << "[PEER-WIRE] Peer worker stopped for " << peer->endpoint_str
-                  << ": " << ex.what() << std::endl;
     } catch (...) {
-        std::cout << "[PEER-WIRE] Peer worker stopped for " << peer->endpoint_str
-                  << " due to an unknown error" << std::endl;
+        // Socket closed or error during peer communication
     }
 
     if (peer->connection && peer->connection->is_open()) {
@@ -918,83 +885,8 @@ void TorrentSession::handle_peer_message(
         case pbl4::network::PeerMessageId::Port: {
             const auto remote_dht_port = pbl4::network::peer_protocol::parse_port(msg);
             std::cout << "[DHT] Peer " << peer->endpoint_str << " sent DHT Port: " << remote_dht_port << std::endl;
-            if (dht() && remote_dht_port != 0) {
-                dht()->ping(peer->ip, remote_dht_port);
-                dht()->announcePeer(info_hash_raw_, config_.listen_port);
-            }
-            break;
-        }
-        case pbl4::network::PeerMessageId::Extended: {
-            if (msg.payload.empty()) {
-                break;
-            }
-
-            try {
-                if (msg.payload[0] == pbl4::network::extension::kExtendedHandshakeId) {
-                    peer->remote_extensions =
-                        pbl4::network::extension::parse_extended_handshake(msg);
-                    send_peer_stats(peer);
-                    send_peer_exchange(peer);
-                } else if (msg.payload[0] == pbl4::network::extension::kUtMetadataId) {
-                    const auto request = pbl4::network::extension::parse_metadata_message(
-                        msg, pbl4::network::extension::kUtMetadataId);
-                    if (request.type == pbl4::network::extension::MetadataMessage::Type::Request) {
-                        const auto metadata_id = peer->remote_extensions.find(
-                            pbl4::network::extension::kUtMetadataName);
-                        if (metadata_id == peer->remote_extensions.end() || metadata_id->second == 0) {
-                            break;
-                        }
-                        const std::size_t offset =
-                            static_cast<std::size_t>(request.piece) *
-                            pbl4::network::extension::kMetadataBlockSize;
-                        if (metadata_.infoRaw.size() > pbl4::network::extension::kMaxMetadataSize ||
-                            offset >= metadata_.infoRaw.size()) {
-                            peer->connection->send_message(
-                                pbl4::network::extension::make_metadata_reject(
-                                    metadata_id->second, request.piece));
-                            break;
-                        }
-                        const std::size_t size = std::min<std::size_t>(
-                            pbl4::network::extension::kMetadataBlockSize,
-                            metadata_.infoRaw.size() - offset);
-                        const auto* begin = reinterpret_cast<const pbl4::network::Byte*>(
-                            metadata_.infoRaw.data() + offset);
-                        const pbl4::network::Bytes data(begin, begin + size);
-                        peer->connection->send_message(
-                            pbl4::network::extension::make_metadata_data(
-                                metadata_id->second, request.piece,
-                                static_cast<std::uint32_t>(metadata_.infoRaw.size()), data));
-                    }
-                } else if (msg.payload[0] == pbl4::network::extension::kUtPexId) {
-                    const auto pex = pbl4::network::extension::parse_pex_message(
-                        msg, pbl4::network::extension::kUtPexId);
-                    for (const auto& dropped : pex.dropped) {
-                        const std::string endpoint = dropped.ip + ":" + std::to_string(dropped.port);
-                        std::lock_guard<std::mutex> lock(session_mutex_);
-                        if (active_peers_.find(endpoint) == active_peers_.end()) {
-                            known_peer_endpoints_.erase(endpoint);
-                            candidate_peer_endpoints_.erase(
-                                std::remove(candidate_peer_endpoints_.begin(),
-                                    candidate_peer_endpoints_.end(), endpoint),
-                                candidate_peer_endpoints_.end());
-                        }
-                    }
-                    for (const auto& added : pex.added) {
-                        if (added.ip != peer->ip || added.port != peer->port) {
-                            add_peer(added.ip, added.port);
-                        }
-                    }
-                } else if (msg.payload[0] == pbl4::network::extension::kPbStatsId) {
-                    const auto stats = pbl4::network::extension::parse_peer_stats(
-                        msg, pbl4::network::extension::kPbStatsId);
-                    if (stats) {
-                        peer->remote_downloaded_bytes = stats->downloaded;
-                        peer->remote_uploaded_bytes = stats->uploaded;
-                    }
-                }
-            } catch (const std::exception& ex) {
-                std::cout << "[EXTENSION] Ignoring invalid extension message from "
-                          << peer->endpoint_str << ": " << ex.what() << std::endl;
+            if (dht_ && remote_dht_port != 0) {
+                dht_->ping(peer->ip, remote_dht_port);
             }
             break;
         }
@@ -1027,13 +919,9 @@ void TorrentSession::handle_request_block(
             reinterpret_cast<const pbl4::network::Byte*>(block_data.data()),
             block_data.size());
 
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            uploaded_bytes_ += block_data.size();
-            peer->uploaded_bytes += block_data.size();
-        }
-
-        send_peer_stats(peer);
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        uploaded_bytes_ += block_data.size();
+        peer->uploaded_bytes += block_data.size();
 
         std::cout << "[UPLOAD] Sent piece #" << req.index << " (offset: " << req.begin
                   << ", size: " << block_data.size() << " bytes) to " << peer->endpoint_str
@@ -1047,7 +935,6 @@ void TorrentSession::handle_piece_block(
     std::shared_ptr<ActivePeer> peer,
     const pbl4::network::PiecePayload& piece) {
     bool torrent_finished = false;
-    bool block_counted = false;
     PieceCompletedCallback piece_cb;
     TorrentFinishedCallback finished_cb;
     std::size_t completed_snapshot = 0;
@@ -1090,7 +977,15 @@ void TorrentSession::handle_piece_block(
 
         downloaded_bytes_ += piece.data.size();
         peer->downloaded_bytes += piece.data.size();
-        block_counted = true;
+
+        // Endgame: block này có thể đã được xin từ peer khác. Gom lại để gửi cancel, khỏi nhận trùng.
+        std::vector<PendingBlock> to_cancel;
+        for (const auto& pb : pending_blocks_) {
+            if (pb.piece_index == piece.index && pb.begin == piece.begin &&
+                pb.peer_endpoint != peer->endpoint_str) {
+                to_cancel.push_back(pb);
+            }
+        }
 
         // Xoá khỏi pending blocks
         pending_blocks_.erase(
@@ -1099,6 +994,15 @@ void TorrentSession::handle_piece_block(
                                return pb.piece_index == piece.index && pb.begin == piece.begin;
                            }),
             pending_blocks_.end());
+
+        for (const auto& pb : to_cancel) {
+            auto other = active_peers_.find(pb.peer_endpoint);
+            if (other != active_peers_.end() && other->second->connection) {
+                other->second->connection->send_cancel(pb.piece_index, pb.begin, pb.length);
+                std::cout << "[DOWNLOAD-REQ][ENDGAME] Cancel piece #" << pb.piece_index << " (begin: "
+                          << pb.begin << ") sent to " << pb.peer_endpoint << std::endl;
+            }
+        }
 
         // Cập nhật tiến độ của piece
         if (!prog.received_block_mask[block_idx]) {
@@ -1152,10 +1056,6 @@ void TorrentSession::handle_piece_block(
         }
     }
 
-    if (block_counted) {
-        send_peer_stats(peer);
-    }
-
     // Announce tracker và callback phải chạy NGOÀI session_mutex_ (mutex không recursive:
     // process_tracker_announce tự khoá lại, gọi trong lock sẽ deadlock và treo cả Web UI).
     if (piece_verified && piece_cb) {
@@ -1165,96 +1065,6 @@ void TorrentSession::handle_piece_block(
         process_tracker_announce("completed");
         if (finished_cb) {
             finished_cb();
-        }
-    }
-}
-
-void TorrentSession::send_peer_stats(const std::shared_ptr<ActivePeer>& peer) {
-    if (!peer || !peer->connection || !peer->connection->is_open()) {
-        return;
-    }
-
-    const auto stats_id = peer->remote_extensions.find(
-        pbl4::network::extension::kPbStatsName);
-    if (stats_id == peer->remote_extensions.end() || stats_id->second == 0) {
-        return;
-    }
-
-    try {
-        peer->connection->send_message(
-            pbl4::network::extension::make_peer_stats(
-                stats_id->second,
-                {peer->downloaded_bytes, peer->uploaded_bytes}));
-    } catch (const std::exception& ex) {
-        std::cout << "[EXTENSION] Could not send pb_stats to " << peer->endpoint_str
-                  << ": " << ex.what() << std::endl;
-    }
-}
-
-void TorrentSession::send_peer_exchange(const std::shared_ptr<ActivePeer>& peer) {
-    if (!peer || !peer->connection || !peer->connection->is_open()) {
-        return;
-    }
-    const auto pex_id = peer->remote_extensions.find(
-        pbl4::network::extension::kUtPexName);
-    if (pex_id == peer->remote_extensions.end() || pex_id->second == 0) {
-        return;
-    }
-
-    std::vector<pbl4::network::extension::PexPeer> peers;
-    std::unordered_set<std::string> seen;
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        const auto append = [&](const std::string& ip, std::uint16_t port) {
-            if (ip.find(':') != std::string::npos || port == 0) return;
-            const std::string endpoint = ip + ":" + std::to_string(port);
-            if (endpoint != peer->endpoint_str && seen.insert(endpoint).second && peers.size() < 200) {
-                peers.push_back({ip, port});
-            }
-        };
-        for (const auto& [endpoint, active] : active_peers_) {
-            if (active && active->outbound) append(active->ip, active->port);
-        }
-        for (const auto& endpoint : candidate_peer_endpoints_) {
-            const auto colon = endpoint.rfind(':');
-            if (colon == std::string::npos) continue;
-            try {
-                const auto port = static_cast<std::uint16_t>(std::stoul(endpoint.substr(colon + 1)));
-                append(endpoint.substr(0, colon), port);
-            } catch (...) {
-            }
-        }
-    }
-
-    std::vector<pbl4::network::extension::PexPeer> added;
-    std::vector<pbl4::network::extension::PexPeer> dropped;
-    std::unordered_set<std::string> current;
-    for (const auto& known : peers) {
-        const std::string endpoint = known.ip + ":" + std::to_string(known.port);
-        current.insert(endpoint);
-        if (peer->pex_advertised.find(endpoint) == peer->pex_advertised.end()) {
-            added.push_back(known);
-        }
-    }
-    for (const auto& previous : peer->pex_advertised) {
-        if (current.find(previous) != current.end()) continue;
-        const auto colon = previous.rfind(':');
-        if (colon == std::string::npos) continue;
-        try {
-            const auto port = static_cast<std::uint16_t>(std::stoul(previous.substr(colon + 1)));
-            dropped.push_back({previous.substr(0, colon), port});
-        } catch (...) {
-        }
-    }
-
-    if (!added.empty() || !dropped.empty()) {
-        try {
-            peer->connection->send_message(
-                pbl4::network::extension::make_pex_message(pex_id->second, added, dropped));
-            peer->pex_advertised = std::move(current);
-        } catch (const std::exception& ex) {
-            std::cout << "[PEX] Could not send peer list to " << peer->endpoint_str
-                      << ": " << ex.what() << std::endl;
         }
     }
 }
@@ -1270,14 +1080,14 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
         return false;
     }
 
-    // Giới hạn số request chạy song song mỗi peer (Pipeline: 4)
+    // Giới hạn số request chạy song song mỗi peer (pipeline, do picker quyết định; mặc định 4)
     std::size_t active_peer_requests = 0;
     for (const auto& pb : pending_blocks_) {
         if (pb.peer_endpoint == peer->endpoint_str) {
             active_peer_requests++;
         }
     }
-    if (active_peer_requests >= 4) {
+    if (active_peer_requests >= piece_picker_->pipeline_depth()) {
         return false;
     }
 
@@ -1324,7 +1134,12 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
         }
     }
 
-    const int next_piece = piece_picker_->pick_next_piece(unavailable_or_in_progress, peers_bits);
+    strategy::PickerContext picker_ctx;
+    picker_ctx.total_pieces = my_bitfield_.size();
+    picker_ctx.completed_pieces = completed_pieces_count_;
+    picker_ctx.in_progress_pieces = in_progress_pieces_.size();
+
+    const int next_piece = piece_picker_->pick_piece(picker_ctx, unavailable_or_in_progress, peers_bits);
     if (next_piece >= 0 && static_cast<std::size_t>(next_piece) < peer->bitfield.size() && peer->bitfield[next_piece]) {
         const std::size_t piece_sz = piece_manager_->pieceSize(next_piece);
         const std::size_t block_count = (piece_sz + pbl4::network::kStandardBlockSize - 1) / pbl4::network::kStandardBlockSize;
@@ -1345,6 +1160,45 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
                   << ", len: " << len << ") to " << peer->endpoint_str << std::endl;
         return true;
     } else {
+        // 3. Endgame: mọi piece còn thiếu đều đã có người xin. Cho phép xin TRÙNG block từ peer
+        // này (tối đa endgame_max_copies bản), block nào về trước thắng, bản còn lại bị cancel
+        // trong handle_piece_block. Tránh việc cả lượt tải bị kẹt chờ 1 peer chậm ở những block cuối.
+        if (piece_picker_->in_endgame(picker_ctx)) {
+            const std::size_t max_copies = piece_picker_->endgame_max_copies();
+            for (auto& [piece_idx, prog] : in_progress_pieces_) {
+                if (piece_idx >= peer->bitfield.size() || !peer->bitfield[piece_idx]) {
+                    continue;
+                }
+                for (std::size_t b = 0; b < prog.total_blocks; ++b) {
+                    if (prog.received_block_mask[b]) {
+                        continue;
+                    }
+                    const std::uint32_t begin = static_cast<std::uint32_t>(b * pbl4::network::kStandardBlockSize);
+                    std::size_t copies = 0;
+                    bool requested_by_this_peer = false;
+                    std::uint32_t len = 0;
+                    for (const auto& pb : pending_blocks_) {
+                        if (pb.piece_index == piece_idx && pb.begin == begin) {
+                            ++copies;
+                            len = pb.length;
+                            if (pb.peer_endpoint == peer->endpoint_str) {
+                                requested_by_this_peer = true;
+                            }
+                        }
+                    }
+                    if (requested_by_this_peer || copies == 0 || copies >= max_copies) {
+                        continue;
+                    }
+                    peer->connection->send_request(piece_idx, begin, len);
+                    pending_blocks_.push_back({piece_idx, begin, len, peer->endpoint_str, std::chrono::steady_clock::now()});
+                    std::cout << "[DOWNLOAD-REQ][ENDGAME] Duplicate request for piece #" << piece_idx
+                              << " (begin: " << begin << ", len: " << len << ") to " << peer->endpoint_str
+                              << " | copies: " << (copies + 1) << "/" << max_copies << std::endl;
+                    return true;
+                }
+            }
+        }
+
         static auto last_warn = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
         if (now - last_warn > std::chrono::seconds(5)) {
@@ -1579,4 +1433,3 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
 }
 
 }  // namespace p2p::network
-
