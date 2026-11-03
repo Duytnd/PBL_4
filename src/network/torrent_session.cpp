@@ -1,6 +1,7 @@
 #include "network/torrent_session.h"
 
 #include "core/hash_utils.h"
+#include "network/extension.h"
 #include "network/lsd.h"
 
 #include <algorithm>
@@ -223,25 +224,25 @@ bool TorrentSession::start() {
     // có thể chậm và khóa request tạo torrent.
     if (config_.enable_dht) {
         try {
-            const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
-            dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
-            if (dht_->start()) {
-                std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
+            if (config_.shared_dht) {
+                // Dùng shared DHT node từ StateBridge (tất cả sessions dùng chung 1 node)
+                dht_shared_ = config_.shared_dht;
+                std::cout << "[DHT] Using shared Kademlia node on UDP port " << dht_shared_->port() << std::endl;
 
                 dht_init_thread_ = std::thread([this]() {
-                    if (!running_) {
-                        return;
-                    }
+                    if (!running_) return;
+
+                    // Announce bản thân + lấy peers từ DHT
+                    auto* d = dht();
+                    if (!d) return;
 
                     if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
-                        dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                        d->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
                     }
 
-                    if (!running_) {
-                        return;
-                    }
+                    if (!running_) return;
 
-                    const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                    const auto dht_peers = d->getPeers(info_hash_raw_);
                     for (const auto& peer : dht_peers) {
                         if (running_) {
                             add_peer(peer.ip, peer.port);
@@ -249,15 +250,44 @@ bool TorrentSession::start() {
                     }
 
                     if (running_) {
-                        dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                        d->announcePeer(info_hash_raw_, config_.listen_port);
                     }
                 });
             } else {
-                std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
-                dht_.reset();
+                // Tạo node DHT riêng cho session này
+                const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
+                dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
+                if (dht_->start()) {
+                    std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
+
+                    dht_init_thread_ = std::thread([this]() {
+                        if (!running_) return;
+
+                        if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
+                            dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                        }
+
+                        if (!running_) return;
+
+                        const auto dht_peers = dht_->getPeers(info_hash_raw_);
+                        for (const auto& peer : dht_peers) {
+                            if (running_) {
+                                add_peer(peer.ip, peer.port);
+                            }
+                        }
+
+                        if (running_) {
+                            dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                        }
+                    });
+                } else {
+                    std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
+                    dht_.reset();
+                }
             }
         } catch (...) {
             dht_.reset();
+            dht_shared_.reset();
         }
     }
 
@@ -301,6 +331,8 @@ void TorrentSession::stop() {
         if (dht_) {
             dht_->stop();
         }
+        // shared_dht không stop ở đây — do StateBridge quản lý lifecycle
+        dht_shared_.reset();
     }
 
     // Đóng Inbound Acceptor ngay lập tức
@@ -417,7 +449,7 @@ TorrentSessionStats TorrentSession::stats() const {
     s.completed_pieces = completed_pieces_count_;
     s.connected_peers = active_peers_.size();
     s.total_peers_known = known_peer_endpoints_.size();
-    s.dht_nodes_count = dht_ ? dht_->routingTable().size() : 0;
+    s.dht_nodes_count = dht() ? dht()->routingTable().size() : 0;
     s.download_rate = current_download_rate_;
     s.upload_rate = current_upload_rate_;
     s.error_message = error_message_;
@@ -567,14 +599,22 @@ void TorrentSession::orchestration_loop() {
                 last_lsd_time = now;
             }
 
-            // 5. Announce và truy vấn định kỳ DHT (mỗi 60 giây)
-            if (config_.enable_dht && dht_ && now - last_dht_time >= std::chrono::seconds(60)) {
-                const auto dht_peers = dht_->getPeers(info_hash_raw_);
-                for (const auto& p : dht_peers) {
-                    add_peer(p.ip, p.port);
+            // 5. Announce và truy vấn định kỳ DHT (mỗi 10 giây nếu chưa có peer, 60 giây nếu đã có)
+            {
+                auto* d = dht();
+                const bool has_peers = [this]() {
+                    std::lock_guard<std::mutex> lk(session_mutex_);
+                    return !active_peers_.empty();
+                }();
+                const auto dht_interval = has_peers ? std::chrono::seconds(60) : std::chrono::seconds(10);
+                if (config_.enable_dht && d && now - last_dht_time >= dht_interval) {
+                    const auto dht_peers = d->getPeers(info_hash_raw_);
+                    for (const auto& p : dht_peers) {
+                        add_peer(p.ip, p.port);
+                    }
+                    d->announcePeer(info_hash_raw_, config_.listen_port);
+                    last_dht_time = now;
                 }
-                dht_->announcePeer(info_hash_raw_, config_.listen_port);
-                last_dht_time = now;
             }
         }
 
@@ -731,9 +771,9 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
         peer->connection->send_bitfield(current_bits);
 
         // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
-        if (dht_ && peer->connection->is_open()) {
+        if (auto* d = dht(); d && peer->connection->is_open()) {
             try {
-                peer->connection->send_port(dht_->port());
+                peer->connection->send_port(d->port());
             } catch (...) {}
         }
 
@@ -882,11 +922,95 @@ void TorrentSession::handle_peer_message(
             }
             break;
         }
+        case pbl4::network::PeerMessageId::Extended: {
+            if (msg.payload.empty()) {
+                break;
+            }
+
+            const Byte extension_id = msg.payload[0];
+            if (extension_id == pbl4::network::extension::kExtendedHandshakeId) {
+                try {
+                    const auto remote_mapping = pbl4::network::extension::parse_extended_handshake(msg);
+                    for (const auto& [name, remote_id] : remote_mapping) {
+                        peer->remote_extensions[name] = remote_id;
+                    }
+                    if (peer->connection->is_open()) {
+                        peer->connection->send_message(
+                            pbl4::network::extension::make_extended_handshake(
+                                std::optional<std::uint32_t>(
+                                    static_cast<std::uint32_t>(metadata_.infoRaw.size()))));
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[METADATA] Invalid extended handshake from "
+                              << peer->endpoint_str << ": " << e.what() << std::endl;
+                }
+                break;
+            }
+
+            const auto pex_it = peer->remote_extensions.find(pbl4::network::extension::kUtPexName);
+            const Byte pex_id = pex_it != peer->remote_extensions.end() ? pex_it->second : pbl4::network::extension::kUtPexId;
+            if (extension_id == pex_id) {
+                try {
+                    const auto pex_msg = pbl4::network::extension::parse_pex_message(msg, pex_id);
+                    for (const auto& peer_info : pex_msg.added) {
+                        if (!peer_info.ip.empty() && peer_info.port != 0) {
+                            add_peer(peer_info.ip, peer_info.port);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[PEX] Failed to handle peer list from "
+                              << peer->endpoint_str << ": " << e.what() << std::endl;
+                }
+                break;
+            }
+
+            const auto metadata_it = peer->remote_extensions.find(pbl4::network::extension::kUtMetadataName);
+            const Byte metadata_id = metadata_it != peer->remote_extensions.end()
+                ? metadata_it->second
+                : pbl4::network::extension::kUtMetadataId;
+            if (extension_id != metadata_id) {
+                break;
+            }
+
+            try {
+                const auto metadata_msg = pbl4::network::extension::parse_metadata_message(msg, metadata_id);
+                if (metadata_msg.type == pbl4::network::extension::MetadataMessage::Type::Request) {
+                    const std::size_t total_size = metadata_.infoRaw.size();
+                    const std::size_t block_count = (total_size + pbl4::network::extension::kMetadataBlockSize - 1) /
+                        pbl4::network::extension::kMetadataBlockSize;
+                    if (metadata_msg.piece >= block_count) {
+                        peer->connection->send_message(
+                            pbl4::network::extension::make_metadata_reject(metadata_id, metadata_msg.piece));
+                        break;
+                    }
+
+                    const std::size_t offset = static_cast<std::size_t>(metadata_msg.piece) *
+                        pbl4::network::extension::kMetadataBlockSize;
+                    const std::size_t remaining = std::min<std::size_t>(
+                        pbl4::network::extension::kMetadataBlockSize, total_size - offset);
+                    const std::string metadata_payload = metadata_.infoRaw;
+                    const Bytes block_data(metadata_payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                        metadata_payload.begin() + static_cast<std::ptrdiff_t>(offset + remaining));
+                    peer->connection->send_message(
+                        pbl4::network::extension::make_metadata_data(
+                            metadata_id,
+                            metadata_msg.piece,
+                            static_cast<std::uint32_t>(total_size),
+                            block_data));
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[METADATA] Failed to handle metadata message from "
+                          << peer->endpoint_str << ": " << e.what() << std::endl;
+            }
+            break;
+        }
         case pbl4::network::PeerMessageId::Port: {
             const auto remote_dht_port = pbl4::network::peer_protocol::parse_port(msg);
             std::cout << "[DHT] Peer " << peer->endpoint_str << " sent DHT Port: " << remote_dht_port << std::endl;
-            if (dht_ && remote_dht_port != 0) {
-                dht_->ping(peer->ip, remote_dht_port);
+            if (auto* d = dht(); d && remote_dht_port != 0) {
+                d->ping(peer->ip, remote_dht_port);
+                // Announce ngay để peer kia biết mình qua DHT
+                d->announcePeer(info_hash_raw_, config_.listen_port);
             }
             break;
         }

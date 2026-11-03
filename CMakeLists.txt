@@ -209,35 +209,6 @@ if(WIN32)
 endif()
 add_test(NAME test_nat_traversal COMMAND test_nat_traversal)
 
-# Message Stream Encryption (MSE / PE - Giai đoạn 5)
-add_executable(test_encryption
-    tests/test_encryption.cpp
-    src/network/encryption.cpp
-    src/network/nat_traversal.cpp
-    src/network/peer_protocol.cpp
-)
-target_include_directories(test_encryption PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(test_encryption PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-if(WIN32)
-    target_link_libraries(test_encryption PRIVATE ws2_32 crypt32)
-endif()
-add_test(NAME test_encryption COMMAND test_encryption)
-
-# NAT Traversal: UPnP & NAT-PMP (Giai đoạn 5)
-add_executable(test_nat_traversal
-    tests/test_nat_traversal.cpp
-    src/network/nat_traversal.cpp
-)
-target_include_directories(test_nat_traversal PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party/asio
-)
-target_link_libraries(test_nat_traversal PRIVATE Threads::Threads)
-if(WIN32)
-    target_link_libraries(test_nat_traversal PRIVATE ws2_32 crypt32)
-endif()
-add_test(NAME test_nat_traversal COMMAND test_nat_traversal)
-
 # Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy, LSD, DHT)
 add_executable(test_torrent_session
     tests/test_torrent_session.cpp
@@ -315,25 +286,6 @@ if(WIN32)
     target_link_libraries(dht_tool PRIVATE ws2_32 crypt32)
 endif()
 
-# Công cụ CLI BitTorrent chính thức: tạo .torrent (p2p create), kiểm tra metadata (p2p info), verify
-add_executable(p2p
-    tools/torrent_tool.cpp
-    src/core/bencode.cpp
-    src/core/hash_utils.cpp
-    src/core/path_sanitizer.cpp
-    src/core/torrent_file.cpp
-    src/core/torrent_builder.cpp
-    src/core/piece_manager.cpp
-)
-target_include_directories(p2p PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party
-)
-target_link_libraries(p2p PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-if(WIN32)
-    target_link_libraries(p2p PRIVATE ws2_32 crypt32)
-endif()
-
 # Chương trình chính: BitTorrent Client với Web UI
 set(P2P_CLIENT_SOURCES
     src/main.cpp
@@ -376,20 +328,8 @@ if(WIN32)
     target_link_libraries(p2p_client PRIVATE ws2_32 crypt32)
 endif()
 
-# Giữ target p2p_server để tương thích ngược hoàn toàn
-add_executable(p2p_server ${P2P_CLIENT_SOURCES})
-target_include_directories(p2p_server PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party
-    ${CMAKE_SOURCE_DIR}/third_party/asio
-)
-target_link_libraries(p2p_server PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-if(WIN32)
-    target_link_libraries(p2p_server PRIVATE ws2_32 crypt32)
-endif()
-
 # Tracker server thật (BEP 3 + BEP 23): bind 0.0.0.0 để các máy khác trong
-# LAN announce tới được (khác p2p_server, chỉ bind 127.0.0.1 cho web UI).
+# LAN announce tới được.
 add_executable(p2p_tracker
     tracker/main.cpp
     tracker/tracker_server.cpp
