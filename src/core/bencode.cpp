@@ -165,8 +165,7 @@ BencodeValue Bencode::parse(const std::string& input, std::size_t* next) {
     const auto value = parseValue(input, pos);
     if (next != nullptr) {
         *next = pos;
-    }
-    if (pos != input.size()) {
+    } else if (pos != input.size()) {
         // Nếu sau khi đọc 1 giá trị mà còn dư ký tự, đó là dữ liệu thừa.
         throw std::invalid_argument("Bencode: trailing bytes after value");
     }

@@ -57,6 +57,17 @@ void testDecodeRejectsTrailingBytes() {
     CHECK_THROWS(decodeBencode("i42eGARBAGE"));
 }
 
+void testDecodePrefixReturnsTrailingPayloadOffset() {
+    const std::string rawTail("\0\xff" "DATA", 6);
+    const std::string input = "d8:msg_typei1e5:piecei0ee" + rawTail;
+    std::size_t next = 0;
+    const auto decoded = decodeBencode(input, &next);
+    const auto* dict = decoded.get_if<BencodeDict>();
+    CHECK(dict != nullptr);
+    CHECK_EQ(next, std::size_t(25));
+    CHECK_EQ(input.substr(next), rawTail);
+}
+
 void testDecodeRejectsMalformedInput() {
     CHECK_THROWS(decodeBencode(""));
     CHECK_THROWS(decodeBencode("i42"));          // thiếu 'e'
@@ -99,6 +110,7 @@ int main() {
     RUN(testEncodeDecodeList);
     RUN(testEncodeDecodeDictSortsKeys);
     RUN(testDecodeRejectsTrailingBytes);
+    RUN(testDecodePrefixReturnsTrailingPayloadOffset);
     RUN(testDecodeRejectsMalformedInput);
     RUN(testRoundTripNestedStructure);
     return TEST_REPORT();

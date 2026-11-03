@@ -13,8 +13,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
+#include <filesystem>                             
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -214,6 +215,7 @@ private:
         std::string endpoint_str;
         std::string ip;
         std::uint16_t port = 0;
+        bool outbound = false;
         std::string remote_peer_id;
         std::shared_ptr<pbl4::network::PeerConnection> connection;
         std::vector<bool> bitfield;
@@ -223,6 +225,10 @@ private:
         bool peer_interested = false;
         std::uint64_t downloaded_bytes = 0;
         std::uint64_t uploaded_bytes = 0;
+        std::uint64_t remote_downloaded_bytes = 0;
+        std::uint64_t remote_uploaded_bytes = 0;
+        std::map<std::string, pbl4::network::Byte> remote_extensions;
+        std::unordered_set<std::string> pex_advertised;
         double download_rate = 0.0;
         double upload_rate = 0.0;
         std::chrono::steady_clock::time_point last_active;
@@ -287,6 +293,8 @@ private:
     void handle_request_block(
         std::shared_ptr<ActivePeer> peer,
         const pbl4::network::RequestPayload& req_payload);
+    void send_peer_stats(const std::shared_ptr<ActivePeer>& peer);
+    void send_peer_exchange(const std::shared_ptr<ActivePeer>& peer);
 
     bool request_next_blocks(std::shared_ptr<ActivePeer> peer);
     void broadcast_have(std::uint32_t piece_index);

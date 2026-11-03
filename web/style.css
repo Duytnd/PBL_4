@@ -135,6 +135,35 @@ select {
   margin-bottom: 14px;
 }
 
+.magnet-add-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.magnet-add-row input {
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+@media (max-width: 520px) {
+  .magnet-add-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .magnet-add-row label {
+    grid-column: 1 / -1;
+  }
+}
+
 .torrent-status {
   min-height: 24px;
   padding: 10px 12px;

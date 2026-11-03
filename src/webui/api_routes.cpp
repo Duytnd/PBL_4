@@ -6,6 +6,8 @@
 #include "core/path_sanitizer.h"
 #include "core/torrent_builder.h"
 #include "core/torrent_file.h"
+#include "network/magnet_resolver.h"
+#include "network/tracker_client.h"
 #include "webui/state_bridge.h"
 
 #include <chrono>
@@ -308,9 +310,14 @@ void saveDhtBootstrapConfig(const std::string& host, std::uint16_t port) {
            << "  \"port\": " << port << "\n"
            << "}\n";
 
-    setenv("DHT_BOOTSTRAP_HOST", host.c_str(), 1);
     std::string portValue = std::to_string(port);
+#ifdef _WIN32
+    _putenv_s("DHT_BOOTSTRAP_HOST", host.c_str());
+    _putenv_s("DHT_BOOTSTRAP_PORT", portValue.c_str());
+#else
+    setenv("DHT_BOOTSTRAP_HOST", host.c_str(), 1);
     setenv("DHT_BOOTSTRAP_PORT", portValue.c_str(), 1);
+#endif
 }
 
 std::pair<std::string, std::uint16_t> extractDhtBootstrapFromRequest(const httplib::Request& req) {
@@ -519,6 +526,74 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
     }
 }
 
+void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
+    if (!req.form.has_field("magnet_uri")) {
+        res.status = 400;
+        res.set_content("Missing magnet_uri field", "text/plain");
+        return;
+    }
+
+    const std::string magnetUri = req.form.get_field("magnet_uri");
+    try {
+        const auto magnet = network::parse_magnet_uri(magnetUri);
+        const std::filesystem::path downloadDir = resolveDownloadDir();
+        std::error_code ec;
+        std::filesystem::create_directories(downloadDir, ec);
+
+        TorrentSessionConfig config;
+        config.download_dir = downloadDir;
+        config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_tracker = parseBoolField(req.form, "enable_tracker", true);
+        config.enable_lsd = true;
+        config.enable_dht = parseBoolField(req.form, "enable_dht", true);
+        const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
+        config.dht_bootstrap_host = defaultDhtHost;
+        config.dht_bootstrap_port = defaultDhtPort;
+
+        network::MagnetResolveOptions resolveOptions;
+        resolveOptions.peer_id = TrackerClient::makePeerId();
+        resolveOptions.listen_port = config.listen_port;
+        resolveOptions.enable_trackers = config.enable_tracker;
+        resolveOptions.enable_dht = config.enable_dht;
+        resolveOptions.dht_bootstrap_host = config.dht_bootstrap_host;
+        resolveOptions.dht_bootstrap_port = config.dht_bootstrap_port;
+        resolveOptions.dht_port = config.listen_port;
+        config.client_peer_id = resolveOptions.peer_id;
+
+        TorrentFileMetadata metadata = network::resolve_magnet_uri(magnetUri, resolveOptions);
+        if (!metadata.filePaths.empty()) {
+            res.status = 400;
+            res.set_content("Multi-file magnet metadata is not supported", "text/plain");
+            return;
+        }
+        const std::uint64_t pieceLength = static_cast<std::uint64_t>(metadata.pieceLength);
+        if (metadata.length == 0 || pieceLength == 0 ||
+            metadata.pieces.size() != (metadata.length + pieceLength - 1) / pieceLength) {
+            res.status = 400;
+            res.set_content("Invalid magnet metadata: piece count does not match file length", "text/plain");
+            return;
+        }
+
+        const std::string infoHashHex = sha1Hex(metadata.infoRaw);
+        if (!StateBridge::instance().getSession(infoHashHex)) {
+            auto session = std::make_shared<TorrentSession>(metadata, config);
+            if (!session->start()) {
+                res.status = 503;
+                res.set_content("Failed to start torrent session", "text/plain");
+                return;
+            }
+            StateBridge::instance().addSession(session, magnetUri);
+        }
+
+        res.status = 200;
+        res.set_content("{\"status\":\"ok\",\"info_hash\":\"" + infoHashHex + "\"}",
+            "application/json");
+    } catch (const std::exception& error) {
+        res.status = 400;
+        res.set_content(std::string("Failed to resolve magnet: ") + error.what(), "text/plain");
+    }
+}
+
 void handleRemoveTorrent(const httplib::Request& req, httplib::Response& res) {
     std::string hash = req.has_param("hash") ? req.get_param_value("hash") : "";
     if (hash.empty() && req.has_param("info_hash")) {
@@ -555,6 +630,10 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Post("/api/torrents/add", [](const httplib::Request& req, httplib::Response& res) {
         handleAddTorrent(req, res);
+    });
+
+    server.Post("/api/torrents/add-magnet", [](const httplib::Request& req, httplib::Response& res) {
+        handleAddMagnet(req, res);
     });
 
     server.Post("/api/torrents/remove", [](const httplib::Request& req, httplib::Response& res) {

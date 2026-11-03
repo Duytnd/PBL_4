@@ -30,7 +30,9 @@ PeerConnection::PeerConnection(PeerConnection&& other) noexcept
 	  remote_handshake_(other.remote_handshake_),
 	  remote_endpoint_str_(std::move(other.remote_endpoint_str_)),
 	  remote_address_str_(std::move(other.remote_address_str_)),
-	  remote_port_(other.remote_port_) {
+	  remote_port_(other.remote_port_),
+	  mse_(std::move(other.mse_)),
+	  encryption_policy_(other.encryption_policy_) {
 	other.handshake_completed_ = false;
 	other.remote_port_ = 0;
 }
@@ -50,6 +52,8 @@ PeerConnection& PeerConnection::operator=(PeerConnection&& other) noexcept {
 		remote_endpoint_str_ = std::move(other.remote_endpoint_str_);
 		remote_address_str_ = std::move(other.remote_address_str_);
 		remote_port_ = other.remote_port_;
+		mse_ = std::move(other.mse_);
+		encryption_policy_ = other.encryption_policy_;
 
 		other.handshake_completed_ = false;
 		other.remote_port_ = 0;
@@ -305,6 +309,14 @@ void PeerConnection::send_all(const Byte* data, std::size_t size) {
 		return;
 	}
 
+	Bytes encrypted_buf;
+	const Byte* send_ptr = data;
+	if (mse_ && mse_->is_active()) {
+		encrypted_buf.assign(data, data + size);
+		mse_->encrypt_send(encrypted_buf.data(), size);
+		send_ptr = encrypted_buf.data();
+	}
+
 	auto& ioc = static_cast<asio::io_context&>(socket_.get_executor().context());
 	asio::steady_timer timer(socket_.get_executor());
 	timer.expires_after(io_timeout_);
@@ -319,7 +331,7 @@ void PeerConnection::send_all(const Byte* data, std::size_t size) {
 		}
 	});
 
-	asio::async_write(socket_, asio::buffer(data, size),
+	asio::async_write(socket_, asio::buffer(send_ptr, size),
 					  [&](const asio::error_code& ec, std::size_t) {
 						  write_ec = ec;
 						  timer.cancel();
@@ -384,6 +396,107 @@ void PeerConnection::receive_exact(Byte* data, std::size_t size) {
 	if (read_ec) {
 		close();
 		throw std::runtime_error("read failed: " + read_ec.message());
+	}
+
+	if (mse_ && mse_->is_active()) {
+		mse_->decrypt_recv(data, size);
+	}
+}
+
+void PeerConnection::set_encryption_session(std::unique_ptr<MseSession> mse) noexcept {
+	mse_ = std::move(mse);
+}
+
+bool PeerConnection::perform_mse_handshake_outbound(
+	const InfoHash& info_hash,
+	EncryptionCrypto preferred_crypto) {
+	if (!is_open()) {
+		return false;
+	}
+	try {
+		mse_ = std::make_unique<MseSession>();
+
+		// 1. Gửi Ya (96 byte)
+		const auto step1 = mse_->make_initiator_step1(0);
+		Bytes raw_step1(step1.begin(), step1.end());
+		asio::write(socket_, asio::buffer(raw_step1));
+
+		// 2. Nhận Yb (96 byte)
+		Bytes yb(kDhKeySize);
+		asio::read(socket_, asio::buffer(yb.data(), yb.size()));
+
+		// 3. Tính secret S
+		if (!mse_->compute_secret(yb.data(), yb.size())) {
+			return false;
+		}
+
+		// 4. Gửi Step 3: req1 + hash_skey + Encrypted(VC + ...)
+		const auto step3 = mse_->make_initiator_step3(info_hash, preferred_crypto, {}, 0);
+		asio::write(socket_, asio::buffer(step3));
+
+		// 5. Nhận Step 4: 14 byte (VC + crypto_select + len(PadD))
+		Bytes step4(14);
+		asio::read(socket_, asio::buffer(step4.data(), step4.size()));
+
+		EncryptionCrypto selected = EncryptionCrypto::None;
+		if (!mse_->parse_receiver_step4(step4.data(), step4.size(), selected)) {
+			return false;
+		}
+
+		if (selected == EncryptionCrypto::RC4) {
+			mse_->set_active(true);
+		} else {
+			mse_->set_active(false);
+		}
+		return true;
+	} catch (...) {
+		mse_.reset();
+		return false;
+	}
+}
+
+bool PeerConnection::perform_mse_handshake_inbound(
+	const std::vector<InfoHash>& known_hashes,
+	InfoHash& out_matched_hash) {
+	if (!is_open()) {
+		return false;
+	}
+	try {
+		mse_ = std::make_unique<MseSession>();
+
+		// 1. Nhận Ya (96 byte)
+		Bytes ya(kDhKeySize);
+		asio::read(socket_, asio::buffer(ya.data(), ya.size()));
+
+		// 2. Tính secret S
+		if (!mse_->compute_secret(ya.data(), ya.size())) {
+			return false;
+		}
+
+		// 3. Gửi Yb (96 byte)
+		const auto step2 = mse_->make_receiver_step2(0);
+		asio::write(socket_, asio::buffer(step2));
+
+		// 4. Nhận Step 3: 54 byte (req1 (20) + hash_skey (20) + VC (8) + crypto (4) + pad_len (2))
+		Bytes step3(54);
+		asio::read(socket_, asio::buffer(step3.data(), step3.size()));
+
+		EncryptionCrypto provided = EncryptionCrypto::None;
+		Bytes initial_payload;
+		if (!mse_->parse_initiator_step3(step3.data(), step3.size(), known_hashes,
+										out_matched_hash, provided, initial_payload)) {
+			return false;
+		}
+
+		// 5. Gửi Step 4: Encrypted(VC + crypto_select + PadD)
+		const auto step4 = mse_->make_receiver_step4(EncryptionCrypto::RC4, 0);
+		asio::write(socket_, asio::buffer(step4));
+
+		mse_->set_active(true);
+		return true;
+	} catch (...) {
+		mse_.reset();
+		return false;
 	}
 }
 

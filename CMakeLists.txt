@@ -151,29 +151,107 @@ add_executable(test_peer_protocol
 target_include_directories(test_peer_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_peer_protocol COMMAND test_peer_protocol)
 
+# BEP 10 extended handshake and the group's pb_stats extension
+add_executable(test_extension
+    tests/test_extension.cpp
+    src/network/extension.cpp
+    src/network/magnet_link.cpp
+    src/network/peer_protocol.cpp
+    src/core/bencode.cpp
+)
+target_include_directories(test_extension PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_extension COMMAND test_extension)
+
 # Peer Connection (TCP socket via Asio, loopback integration test)
 add_executable(test_peer_connection
     tests/test_peer_connection.cpp
     src/network/peer_protocol.cpp
     src/network/peer_connection.cpp
+    src/network/encryption.cpp
+    src/network/encryption.cpp
+    src/network/nat_traversal.cpp
 )
 target_include_directories(test_peer_connection PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
-target_link_libraries(test_peer_connection PRIVATE Threads::Threads)
+target_link_libraries(test_peer_connection PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 if(WIN32)
     target_link_libraries(test_peer_connection PRIVATE ws2_32 crypt32)
 endif()
 add_test(NAME test_peer_connection COMMAND test_peer_connection)
 
+# Message Stream Encryption (MSE / PE - Giai đoạn 5)
+add_executable(test_encryption
+    tests/test_encryption.cpp
+    src/network/encryption.cpp
+    src/network/peer_protocol.cpp
+)
+target_include_directories(test_encryption PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_encryption PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_encryption PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_encryption COMMAND test_encryption)
+
+# NAT Traversal: UPnP & NAT-PMP (Giai đoạn 5)
+add_executable(test_nat_traversal
+    tests/test_nat_traversal.cpp
+    src/network/nat_traversal.cpp
+)
+target_include_directories(test_nat_traversal PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(test_nat_traversal PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_nat_traversal PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_nat_traversal COMMAND test_nat_traversal)
+
+# Message Stream Encryption (MSE / PE - Giai đoạn 5)
+add_executable(test_encryption
+    tests/test_encryption.cpp
+    src/network/encryption.cpp
+    src/network/nat_traversal.cpp
+    src/network/peer_protocol.cpp
+)
+target_include_directories(test_encryption PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_encryption PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_encryption PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_encryption COMMAND test_encryption)
+
+# NAT Traversal: UPnP & NAT-PMP (Giai đoạn 5)
+add_executable(test_nat_traversal
+    tests/test_nat_traversal.cpp
+    src/network/nat_traversal.cpp
+)
+target_include_directories(test_nat_traversal PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(test_nat_traversal PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(test_nat_traversal PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_nat_traversal COMMAND test_nat_traversal)
+
 # Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy, LSD, DHT)
 add_executable(test_torrent_session
     tests/test_torrent_session.cpp
     src/network/torrent_session.cpp
+    src/network/extension.cpp
+    src/network/magnet_link.cpp
+    src/network/magnet_resolver.cpp
     src/network/peer_protocol.cpp
     src/network/peer_connection.cpp
+    src/network/encryption.cpp
+    src/network/encryption.cpp
+    src/network/nat_traversal.cpp
     src/core/piece_manager.cpp
+    src/core/torrent_builder.cpp
     src/core/torrent_file.cpp
     src/core/bencode.cpp
     src/core/hash_utils.cpp
@@ -205,12 +283,15 @@ add_executable(peer_wire_tool
     tools/peer_wire_tool.cpp
     src/network/peer_protocol.cpp
     src/network/peer_connection.cpp
+    src/network/encryption.cpp
+    src/network/encryption.cpp
+    src/network/nat_traversal.cpp
 )
 target_include_directories(peer_wire_tool PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
-target_link_libraries(peer_wire_tool PRIVATE Threads::Threads)
+target_link_libraries(peer_wire_tool PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 if(WIN32)
     target_link_libraries(peer_wire_tool PRIVATE ws2_32 crypt32)
 endif()
@@ -266,8 +347,13 @@ set(P2P_CLIENT_SOURCES
     src/webui/api_routes.cpp
     src/webui/state_bridge.cpp
     src/network/torrent_session.cpp
+    src/network/extension.cpp
+    src/network/magnet_link.cpp
+    src/network/magnet_resolver.cpp
     src/network/peer_protocol.cpp
     src/network/peer_connection.cpp
+    src/network/encryption.cpp
+    src/network/nat_traversal.cpp
     src/network/tracker_client.cpp
     src/network/tracker_protocol.cpp
     src/strategy/piece_picker.cpp

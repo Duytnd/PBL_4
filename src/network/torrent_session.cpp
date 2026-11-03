@@ -1,6 +1,7 @@
 #include "network/torrent_session.h"
 
 #include "core/hash_utils.h"
+#include "network/extension.h"
 #include "network/lsd.h"
 
 #include <algorithm>
@@ -670,6 +671,7 @@ void TorrentSession::connect_candidate_peers() {
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
+            peer->outbound = true;
             peer->endpoint_str = ep_str;
             peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(conn));
             peer->bitfield.assign(metadata_.pieces.size(), false);
@@ -740,6 +742,17 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                   << " pieces) to " << peer->endpoint_str << std::endl;
         peer->connection->send_bitfield(current_bits);
 
+        const bool remote_supports_extensions =
+            peer->connection->remote_handshake().supports_extension();
+        if (remote_supports_extensions) {
+            const auto metadata_size = metadata_.infoRaw.size() <=
+                    pbl4::network::extension::kMaxMetadataSize
+                ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(metadata_.infoRaw.size()))
+                : std::nullopt;
+            peer->connection->send_message(
+                pbl4::network::extension::make_extended_handshake(metadata_size));
+        }
+
         // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
         if (dht() && peer->connection->is_open()) {
             try {
@@ -758,7 +771,13 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
         }
 
         // Vòng lặp nhận và xử lý message
+        auto last_pex_time = std::chrono::steady_clock::now();
         while (running_ && !paused_ && peer->connection->is_open()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_pex_time >= std::chrono::seconds(60)) {
+                send_peer_exchange(peer);
+                last_pex_time = now;
+            }
             if (!peer->peer_choking && peer->am_interested) {
                 request_next_blocks(peer);
             }
@@ -773,8 +792,12 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                 }
             }
         }
+    } catch (const std::exception& ex) {
+        std::cout << "[PEER-WIRE] Peer worker stopped for " << peer->endpoint_str
+                  << ": " << ex.what() << std::endl;
     } catch (...) {
-        // Socket closed or error during peer communication
+        std::cout << "[PEER-WIRE] Peer worker stopped for " << peer->endpoint_str
+                  << " due to an unknown error" << std::endl;
     }
 
     if (peer->connection && peer->connection->is_open()) {
@@ -901,6 +924,80 @@ void TorrentSession::handle_peer_message(
             }
             break;
         }
+        case pbl4::network::PeerMessageId::Extended: {
+            if (msg.payload.empty()) {
+                break;
+            }
+
+            try {
+                if (msg.payload[0] == pbl4::network::extension::kExtendedHandshakeId) {
+                    peer->remote_extensions =
+                        pbl4::network::extension::parse_extended_handshake(msg);
+                    send_peer_stats(peer);
+                    send_peer_exchange(peer);
+                } else if (msg.payload[0] == pbl4::network::extension::kUtMetadataId) {
+                    const auto request = pbl4::network::extension::parse_metadata_message(
+                        msg, pbl4::network::extension::kUtMetadataId);
+                    if (request.type == pbl4::network::extension::MetadataMessage::Type::Request) {
+                        const auto metadata_id = peer->remote_extensions.find(
+                            pbl4::network::extension::kUtMetadataName);
+                        if (metadata_id == peer->remote_extensions.end() || metadata_id->second == 0) {
+                            break;
+                        }
+                        const std::size_t offset =
+                            static_cast<std::size_t>(request.piece) *
+                            pbl4::network::extension::kMetadataBlockSize;
+                        if (metadata_.infoRaw.size() > pbl4::network::extension::kMaxMetadataSize ||
+                            offset >= metadata_.infoRaw.size()) {
+                            peer->connection->send_message(
+                                pbl4::network::extension::make_metadata_reject(
+                                    metadata_id->second, request.piece));
+                            break;
+                        }
+                        const std::size_t size = std::min<std::size_t>(
+                            pbl4::network::extension::kMetadataBlockSize,
+                            metadata_.infoRaw.size() - offset);
+                        const auto* begin = reinterpret_cast<const pbl4::network::Byte*>(
+                            metadata_.infoRaw.data() + offset);
+                        const pbl4::network::Bytes data(begin, begin + size);
+                        peer->connection->send_message(
+                            pbl4::network::extension::make_metadata_data(
+                                metadata_id->second, request.piece,
+                                static_cast<std::uint32_t>(metadata_.infoRaw.size()), data));
+                    }
+                } else if (msg.payload[0] == pbl4::network::extension::kUtPexId) {
+                    const auto pex = pbl4::network::extension::parse_pex_message(
+                        msg, pbl4::network::extension::kUtPexId);
+                    for (const auto& dropped : pex.dropped) {
+                        const std::string endpoint = dropped.ip + ":" + std::to_string(dropped.port);
+                        std::lock_guard<std::mutex> lock(session_mutex_);
+                        if (active_peers_.find(endpoint) == active_peers_.end()) {
+                            known_peer_endpoints_.erase(endpoint);
+                            candidate_peer_endpoints_.erase(
+                                std::remove(candidate_peer_endpoints_.begin(),
+                                    candidate_peer_endpoints_.end(), endpoint),
+                                candidate_peer_endpoints_.end());
+                        }
+                    }
+                    for (const auto& added : pex.added) {
+                        if (added.ip != peer->ip || added.port != peer->port) {
+                            add_peer(added.ip, added.port);
+                        }
+                    }
+                } else if (msg.payload[0] == pbl4::network::extension::kPbStatsId) {
+                    const auto stats = pbl4::network::extension::parse_peer_stats(
+                        msg, pbl4::network::extension::kPbStatsId);
+                    if (stats) {
+                        peer->remote_downloaded_bytes = stats->downloaded;
+                        peer->remote_uploaded_bytes = stats->uploaded;
+                    }
+                }
+            } catch (const std::exception& ex) {
+                std::cout << "[EXTENSION] Ignoring invalid extension message from "
+                          << peer->endpoint_str << ": " << ex.what() << std::endl;
+            }
+            break;
+        }
         default:
             break;
     }
@@ -930,9 +1027,13 @@ void TorrentSession::handle_request_block(
             reinterpret_cast<const pbl4::network::Byte*>(block_data.data()),
             block_data.size());
 
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        uploaded_bytes_ += block_data.size();
-        peer->uploaded_bytes += block_data.size();
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            uploaded_bytes_ += block_data.size();
+            peer->uploaded_bytes += block_data.size();
+        }
+
+        send_peer_stats(peer);
 
         std::cout << "[UPLOAD] Sent piece #" << req.index << " (offset: " << req.begin
                   << ", size: " << block_data.size() << " bytes) to " << peer->endpoint_str
@@ -946,6 +1047,7 @@ void TorrentSession::handle_piece_block(
     std::shared_ptr<ActivePeer> peer,
     const pbl4::network::PiecePayload& piece) {
     bool torrent_finished = false;
+    bool block_counted = false;
     PieceCompletedCallback piece_cb;
     TorrentFinishedCallback finished_cb;
     std::size_t completed_snapshot = 0;
@@ -988,6 +1090,7 @@ void TorrentSession::handle_piece_block(
 
         downloaded_bytes_ += piece.data.size();
         peer->downloaded_bytes += piece.data.size();
+        block_counted = true;
 
         // Xoá khỏi pending blocks
         pending_blocks_.erase(
@@ -1049,6 +1152,10 @@ void TorrentSession::handle_piece_block(
         }
     }
 
+    if (block_counted) {
+        send_peer_stats(peer);
+    }
+
     // Announce tracker và callback phải chạy NGOÀI session_mutex_ (mutex không recursive:
     // process_tracker_announce tự khoá lại, gọi trong lock sẽ deadlock và treo cả Web UI).
     if (piece_verified && piece_cb) {
@@ -1058,6 +1165,96 @@ void TorrentSession::handle_piece_block(
         process_tracker_announce("completed");
         if (finished_cb) {
             finished_cb();
+        }
+    }
+}
+
+void TorrentSession::send_peer_stats(const std::shared_ptr<ActivePeer>& peer) {
+    if (!peer || !peer->connection || !peer->connection->is_open()) {
+        return;
+    }
+
+    const auto stats_id = peer->remote_extensions.find(
+        pbl4::network::extension::kPbStatsName);
+    if (stats_id == peer->remote_extensions.end() || stats_id->second == 0) {
+        return;
+    }
+
+    try {
+        peer->connection->send_message(
+            pbl4::network::extension::make_peer_stats(
+                stats_id->second,
+                {peer->downloaded_bytes, peer->uploaded_bytes}));
+    } catch (const std::exception& ex) {
+        std::cout << "[EXTENSION] Could not send pb_stats to " << peer->endpoint_str
+                  << ": " << ex.what() << std::endl;
+    }
+}
+
+void TorrentSession::send_peer_exchange(const std::shared_ptr<ActivePeer>& peer) {
+    if (!peer || !peer->connection || !peer->connection->is_open()) {
+        return;
+    }
+    const auto pex_id = peer->remote_extensions.find(
+        pbl4::network::extension::kUtPexName);
+    if (pex_id == peer->remote_extensions.end() || pex_id->second == 0) {
+        return;
+    }
+
+    std::vector<pbl4::network::extension::PexPeer> peers;
+    std::unordered_set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        const auto append = [&](const std::string& ip, std::uint16_t port) {
+            if (ip.find(':') != std::string::npos || port == 0) return;
+            const std::string endpoint = ip + ":" + std::to_string(port);
+            if (endpoint != peer->endpoint_str && seen.insert(endpoint).second && peers.size() < 200) {
+                peers.push_back({ip, port});
+            }
+        };
+        for (const auto& [endpoint, active] : active_peers_) {
+            if (active && active->outbound) append(active->ip, active->port);
+        }
+        for (const auto& endpoint : candidate_peer_endpoints_) {
+            const auto colon = endpoint.rfind(':');
+            if (colon == std::string::npos) continue;
+            try {
+                const auto port = static_cast<std::uint16_t>(std::stoul(endpoint.substr(colon + 1)));
+                append(endpoint.substr(0, colon), port);
+            } catch (...) {
+            }
+        }
+    }
+
+    std::vector<pbl4::network::extension::PexPeer> added;
+    std::vector<pbl4::network::extension::PexPeer> dropped;
+    std::unordered_set<std::string> current;
+    for (const auto& known : peers) {
+        const std::string endpoint = known.ip + ":" + std::to_string(known.port);
+        current.insert(endpoint);
+        if (peer->pex_advertised.find(endpoint) == peer->pex_advertised.end()) {
+            added.push_back(known);
+        }
+    }
+    for (const auto& previous : peer->pex_advertised) {
+        if (current.find(previous) != current.end()) continue;
+        const auto colon = previous.rfind(':');
+        if (colon == std::string::npos) continue;
+        try {
+            const auto port = static_cast<std::uint16_t>(std::stoul(previous.substr(colon + 1)));
+            dropped.push_back({previous.substr(0, colon), port});
+        } catch (...) {
+        }
+    }
+
+    if (!added.empty() || !dropped.empty()) {
+        try {
+            peer->connection->send_message(
+                pbl4::network::extension::make_pex_message(pex_id->second, added, dropped));
+            peer->pex_advertised = std::move(current);
+        } catch (const std::exception& ex) {
+            std::cout << "[PEX] Could not send peer list to " << peer->endpoint_str
+                      << ": " << ex.what() << std::endl;
         }
     }
 }

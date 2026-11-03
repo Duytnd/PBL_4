@@ -2,6 +2,8 @@
 
 #include "core/hash_utils.h"
 #include "core/torrent_builder.h"
+#include "network/extension.h"
+#include "network/magnet_resolver.h"
 #include "network/peer_connection.h"
 #include "network/peer_protocol.h"
 #include "network/torrent_session.h"
@@ -11,6 +13,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <exception>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -65,6 +69,256 @@ void testSessionInitializationAndStats() {
     CHECK(!session.is_running());
     CHECK_EQ(session.metadata().name, std::string("sample_file.bin"));
     CHECK(!session.info_hash_hex().empty());
+}
+
+void testMagnetResolverFetchesAndVerifiesMetadata() {
+    std::cout << "[TEST] Magnet resolver retrieves BEP 9 metadata and verifies BTIH...\n";
+    const std::filesystem::path temp_dir = "./test_magnet_resolver";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    const std::string file_data = "magnet metadata integration sample";
+    const auto source_path = temp_dir / "seed.txt";
+    {
+        std::ofstream output(source_path, std::ios::binary);
+        output << file_data;
+    }
+    const auto torrent_bytes = TorrentBuilder::buildTorrent(source_path, "", 16384);
+    const auto expected_metadata = TorrentFile::parse(torrent_bytes);
+    const std::string raw_hash = sha1Digest(expected_metadata.infoRaw);
+
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(
+        server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    std::exception_ptr server_error;
+
+    std::thread server([&]() {
+        try {
+            PeerConnection peer(acceptor.accept(), std::chrono::seconds(5));
+            const auto incoming = peer.receive_handshake();
+            PeerHandshake reply;
+            std::memcpy(reply.info_hash.data(), raw_hash.data(), raw_hash.size());
+            reply.peer_id.fill(0x66);
+            reply.set_supports_extension(true);
+            peer.send_handshake(reply);
+
+            const auto local_extension_handshake = peer.receive_message();
+            if (local_extension_handshake.id != static_cast<Byte>(PeerMessageId::Extended) ||
+                local_extension_handshake.payload.empty() ||
+                local_extension_handshake.payload[0] != extension::kExtendedHandshakeId ||
+                incoming.info_hash != reply.info_hash) {
+                throw std::runtime_error("resolver sent an invalid handshake");
+            }
+
+            BencodeDict mappings;
+            mappings.emplace(extension::kUtMetadataName, BencodeValue(std::int64_t(9)));
+            BencodeDict extended;
+            extended.emplace("m", BencodeValue(std::move(mappings)));
+            extended.emplace("metadata_size",
+                BencodeValue(static_cast<std::int64_t>(expected_metadata.infoRaw.size())));
+            const std::string extended_bytes = encodeBencode(extended);
+            peer.send_message(peer_protocol::make_extended(
+                extension::kExtendedHandshakeId,
+                Bytes(extended_bytes.begin(), extended_bytes.end())));
+
+            const auto request = peer.receive_message();
+            const auto parsed_request = extension::parse_metadata_message(request, 9);
+            if (parsed_request.type != extension::MetadataMessage::Type::Request ||
+                parsed_request.piece != 0) {
+                throw std::runtime_error("resolver sent an invalid metadata request");
+            }
+            const auto* begin = reinterpret_cast<const Byte*>(expected_metadata.infoRaw.data());
+            const Bytes metadata_block(begin, begin + expected_metadata.infoRaw.size());
+            peer.send_message(extension::make_metadata_data(
+                extension::kUtMetadataId, 0,
+                static_cast<std::uint32_t>(expected_metadata.infoRaw.size()), metadata_block));
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    network::MagnetLink magnet;
+    magnet.info_hash = raw_hash;
+    magnet.info_hash_hex = sha1Hex(expected_metadata.infoRaw);
+    const auto resolved = network::fetch_magnet_metadata_from_peers(
+        magnet, {{"127.0.0.1", port}}, std::string(20, 'R'));
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+
+    CHECK_EQ(resolved.infoRaw, expected_metadata.infoRaw);
+    CHECK_EQ(resolved.name, expected_metadata.name);
+    CHECK(resolved.pieces == expected_metadata.pieces);
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testTorrentSessionServesBep9Metadata() {
+    std::cout << "[TEST] TorrentSession serves BEP 9 metadata to an extension peer...\n";
+    const std::filesystem::path temp_dir = "./test_metadata_serve";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    const auto source_path = temp_dir / "metadata_seed.txt";
+    const std::string source_data = "session metadata serving sample";
+    {
+        std::ofstream output(source_path, std::ios::binary);
+        output << source_data;
+    }
+    const auto torrent_bytes = TorrentBuilder::buildTorrent(source_path, "", 16384);
+    const auto metadata = TorrentFile::parse(torrent_bytes);
+
+    asio::io_context port_ioc;
+    asio::ip::tcp::acceptor port_probe(
+        port_ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const auto listen_port = port_probe.local_endpoint().port();
+    port_probe.close();
+
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.listen_port = listen_port;
+    config.enable_tracker = false;
+    config.enable_lsd = false;
+    config.enable_dht = false;
+    TorrentSession session(metadata, config);
+    CHECK(session.start());
+
+    PeerConnection client = PeerConnection::connect_to(
+        "127.0.0.1", listen_port, std::chrono::seconds(5));
+    PeerHandshake local_handshake;
+    const std::string raw_hash = sha1Digest(metadata.infoRaw);
+    std::memcpy(local_handshake.info_hash.data(), raw_hash.data(), raw_hash.size());
+    local_handshake.peer_id.fill('M');
+    local_handshake.set_supports_extension(true);
+    client.send_handshake(local_handshake);
+    const auto remote_handshake = client.receive_handshake();
+    CHECK(remote_handshake.supports_extension());
+
+    client.send_bitfield(std::vector<bool>{false});
+    client.send_message(extension::make_extended_handshake());
+
+    const auto bitfield = client.receive_message();
+    CHECK_EQ(bitfield.id, static_cast<Byte>(PeerMessageId::Bitfield));
+    const auto extended_handshake = client.receive_message();
+    const auto mappings = extension::parse_extended_handshake(extended_handshake);
+    CHECK_EQ(extension::parse_metadata_size(extended_handshake).value(),
+        static_cast<std::uint32_t>(metadata.infoRaw.size()));
+
+    client.send_message(extension::make_metadata_request(
+        mappings.at(extension::kUtMetadataName), 0));
+    PeerMessage metadata_response;
+    do {
+        metadata_response = client.receive_message();
+    } while (metadata_response.id != static_cast<Byte>(PeerMessageId::Extended) ||
+        metadata_response.payload.empty() ||
+        metadata_response.payload[0] != extension::kUtMetadataId);
+    const auto parsed = extension::parse_metadata_message(
+        metadata_response, extension::kUtMetadataId);
+    CHECK(parsed.type == extension::MetadataMessage::Type::Data);
+    CHECK_EQ(parsed.total_size, static_cast<std::uint32_t>(metadata.infoRaw.size()));
+    CHECK_EQ(std::string(parsed.data.begin(), parsed.data.end()), metadata.infoRaw);
+
+    client.close();
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testTorrentSessionConnectsToPexPeer() {
+    std::cout << "[TEST] TorrentSession connects to a peer learned through PEX...\n";
+    const std::filesystem::path temp_dir = "./test_pex_discovery";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    const auto source_path = temp_dir / "pex_seed.txt";
+    {
+        std::ofstream output(source_path, std::ios::binary);
+        output << "pex discovery integration sample";
+    }
+    const auto torrent_bytes = TorrentBuilder::buildTorrent(source_path, "", 16384);
+    const auto metadata = TorrentFile::parse(torrent_bytes);
+    const std::string raw_hash = sha1Digest(metadata.infoRaw);
+
+    asio::io_context port_ioc;
+    asio::ip::tcp::acceptor session_port_probe(
+        port_ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const auto session_port = session_port_probe.local_endpoint().port();
+    session_port_probe.close();
+    asio::ip::tcp::acceptor pex_listener(
+        port_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto pex_port = pex_listener.local_endpoint().port();
+
+    std::promise<void> discovered_connection;
+    auto discovered_future = discovered_connection.get_future();
+    std::thread discovered_peer([&]() {
+        try {
+            PeerConnection peer(pex_listener.accept(), std::chrono::seconds(5));
+            const auto incoming = peer.receive_handshake();
+            if (incoming.info_hash != InfoHash([&]() {
+                    InfoHash hash{};
+                    std::memcpy(hash.data(), raw_hash.data(), raw_hash.size());
+                    return hash;
+                }())) {
+                throw std::runtime_error("PEX-discovered connection used the wrong info_hash");
+            }
+            PeerHandshake reply;
+            reply.info_hash = incoming.info_hash;
+            reply.peer_id.fill('P');
+            peer.send_handshake(reply);
+            discovered_connection.set_value();
+        } catch (...) {
+            try {
+                discovered_connection.set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+    });
+
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.listen_port = session_port;
+    config.enable_tracker = false;
+    config.enable_lsd = false;
+    config.enable_dht = false;
+    TorrentSession session(metadata, config);
+    CHECK(session.start());
+
+    PeerConnection client = PeerConnection::connect_to(
+        "127.0.0.1", session_port, std::chrono::seconds(5));
+    PeerHandshake local_handshake;
+    std::memcpy(local_handshake.info_hash.data(), raw_hash.data(), raw_hash.size());
+    local_handshake.peer_id.fill('X');
+    local_handshake.set_supports_extension(true);
+    client.send_handshake(local_handshake);
+    CHECK(client.receive_handshake().supports_extension());
+    client.send_bitfield(std::vector<bool>{false});
+    client.send_message(extension::make_extended_handshake());
+
+    const auto remote_bitfield = client.receive_message();
+    CHECK_EQ(remote_bitfield.id, static_cast<Byte>(PeerMessageId::Bitfield));
+    const auto remote_extended = client.receive_message();
+    const auto remote_extensions = extension::parse_extended_handshake(remote_extended);
+    CHECK(remote_extensions.find(extension::kUtPexName) != remote_extensions.end());
+
+    client.send_message(extension::make_pex_message(
+        extension::kUtPexId, {{"127.0.0.1", pex_port}}));
+    const bool connected = discovered_future.wait_for(std::chrono::seconds(5)) ==
+        std::future_status::ready;
+    CHECK(connected);
+    if (connected) {
+        discovered_future.get();
+    } else {
+        asio::error_code ignored;
+        pex_listener.close(ignored);
+    }
+
+    client.close();
+    session.stop();
+    if (discovered_peer.joinable()) discovered_peer.join();
+    std::filesystem::remove_all(temp_dir, ec);
 }
 
 void testSessionExistingFileSeeding() {
@@ -583,6 +837,9 @@ void testSessionStartDoesNotBlockOnDhtBootstrap() {
 }
 
 int main() {
+    testMagnetResolverFetchesAndVerifiesMetadata();
+    testTorrentSessionServesBep9Metadata();
+    testTorrentSessionConnectsToPexPeer();
     testSessionResumesFromPartFile();
     testSessionInitializationAndStats();
     testSessionTrackerDisabledStillRunsDht();

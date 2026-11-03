@@ -1,5 +1,6 @@
 #pragma once
 
+#include "encryption.h"
 #include "peer_protocol.h"
 
 #include <chrono>
@@ -78,6 +79,23 @@ public:
 	asio::ip::tcp::socket& socket() noexcept;
 	const asio::ip::tcp::socket& socket() const noexcept;
 
+	// MSE / Protocol Encryption (Giai đoạn 5)
+	void set_encryption_session(std::unique_ptr<MseSession> mse) noexcept;
+	MseSession* encryption_session() noexcept { return mse_.get(); }
+	const MseSession* encryption_session() const noexcept { return mse_.get(); }
+	bool is_encrypted() const noexcept { return mse_ && mse_->is_active(); }
+	EncryptionPolicy encryption_policy() const noexcept { return encryption_policy_; }
+	void set_encryption_policy(EncryptionPolicy policy) noexcept { encryption_policy_ = policy; }
+
+	// Thực hiện bắt tay MSE mã hóa trước khi bắt tay BitTorrent
+	bool perform_mse_handshake_outbound(
+		const InfoHash& info_hash,
+		EncryptionCrypto preferred_crypto = EncryptionCrypto::RC4);
+
+	bool perform_mse_handshake_inbound(
+		const std::vector<InfoHash>& known_hashes,
+		InfoHash& out_matched_hash);
+
 	// Timeout configuration
 	void set_io_timeout(std::chrono::milliseconds timeout) noexcept;
 	std::chrono::milliseconds io_timeout() const noexcept;
@@ -122,6 +140,8 @@ private:
 	void send_all(const Byte* data, std::size_t size);
 	void receive_exact(Byte* data, std::size_t size);
 	void update_endpoint_info();
+	std::unique_ptr<MseSession> mse_;
+	EncryptionPolicy encryption_policy_{EncryptionPolicy::Tolerant};
 };
 
 }  // namespace pbl4::network

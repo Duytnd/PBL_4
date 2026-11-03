@@ -67,6 +67,11 @@
 
         <div id="torrent-builder" class="torrent-builder">
           <input id="torrent-source" type="file" hidden>
+          <div class="magnet-add-row">
+            <label for="magnet-add-input">Magnet link</label>
+            <input id="magnet-add-input" type="url" placeholder="magnet:?xt=urn:btih:..." autocomplete="off">
+            <button id="add-magnet-btn" type="button" class="btn">Add magnet</button>
+          </div>
           <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px;">
             <label for="tracker-announce-input" style="font-size: 13px; font-weight: 500; color: var(--text);">Tracker URL:</label>
             <input id="tracker-announce-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="http://&lt;LAN IP&gt;:6969/announce">

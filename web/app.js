@@ -535,6 +535,33 @@
     }
   }
 
+  async function handleAddMagnet(uri) {
+    const magnetUri = (uri || '').trim();
+    if (!magnetUri) {
+      setStatus('Paste a magnet link first.', 'error');
+      return;
+    }
+
+    try {
+      setStatus('Finding peers and retrieving magnet metadata...');
+      const formData = new FormData();
+      formData.append('magnet_uri', magnetUri);
+      const response = await fetch('/api/torrents/add-magnet', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) {
+        throw new Error(await response.text() || 'Failed to resolve magnet');
+      }
+      setStatus('Magnet resolved and added to the swarm.', 'success');
+      const input = document.getElementById('magnet-add-input');
+      if (input) input.value = '';
+      await syncTorrentsFromServer();
+    } catch (error) {
+      setStatus(`Failed to add magnet: ${error.message}`, 'error');
+    }
+  }
+
   function openFilePicker(mode) {
     activeAction = mode;
     const input = document.getElementById('torrent-source');
@@ -547,6 +574,8 @@
     const input = document.getElementById('torrent-source');
     const createTorrentButton = document.getElementById('create-torrent-btn');
     const addTorrentButton = document.getElementById('add-torrent-btn');
+    const addMagnetButton = document.getElementById('add-magnet-btn');
+    const magnetAddInput = document.getElementById('magnet-add-input');
     const dropzone = document.getElementById('torrent-dropzone');
     const dashboardDropzone = document.getElementById('dashboard-dropzone');
     const copyMagnetBtn = document.getElementById('copy-magnet-btn');
@@ -578,6 +607,12 @@
 
     if (addTorrentButton) {
       addTorrentButton.addEventListener('click', () => openFilePicker('add'));
+    }
+
+    if (addMagnetButton) {
+      addMagnetButton.addEventListener('click', () => {
+        handleAddMagnet(magnetAddInput ? magnetAddInput.value : '');
+      });
     }
 
     if (input) {
