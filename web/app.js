@@ -267,50 +267,276 @@
   }
 
 
+  function getFileCategory(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)) return 'image';
+    if (['mp4', 'mov', 'webm', 'mkv', 'avi'].includes(ext)) return 'video';
+    if (['mp3', 'wav', 'flac', 'm4a', 'ogg'].includes(ext)) return 'audio';
+    if (['doc', 'docx'].includes(ext)) return 'word';
+    if (['xls', 'xlsx', 'csv'].includes(ext)) return 'excel';
+    if (['ppt', 'pptx'].includes(ext)) return 'powerpoint';
+    if (['pdf'].includes(ext)) return 'pdf';
+    if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'archive';
+    if (['txt', 'md', 'c', 'cpp', 'h', 'py', 'js', 'json', 'html', 'css', 'sh'].includes(ext)) return 'code';
+    return 'generic';
+  }
+
+  function renderFileIconSvg(category, ext) {
+    if (category === 'word') {
+      return `
+        <div class="file-icon-badge" style="color: #185abd;">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" fill="#e8f0fe"/>
+            <path d="M14 2v6h6" fill="#c2d7fe"/>
+            <rect x="3" y="8" width="9" height="11" rx="1.5" fill="#185abd"/>
+            <text x="7.5" y="16.5" font-size="7.5" font-weight="900" fill="#ffffff" text-anchor="middle" font-family="system-ui, sans-serif">W</text>
+          </svg>
+          <span class="file-type-pill" style="background: #185abd;">WORD</span>
+        </div>`;
+    }
+    if (category === 'excel') {
+      return `
+        <div class="file-icon-badge" style="color: #107c41;">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" fill="#e6f4ea"/>
+            <path d="M14 2v6h6" fill="#ceead6"/>
+            <rect x="3" y="8" width="9" height="11" rx="1.5" fill="#107c41"/>
+            <text x="7.5" y="16.5" font-size="7.5" font-weight="900" fill="#ffffff" text-anchor="middle" font-family="system-ui, sans-serif">X</text>
+          </svg>
+          <span class="file-type-pill" style="background: #107c41;">EXCEL</span>
+        </div>`;
+    }
+    if (category === 'powerpoint') {
+      return `
+        <div class="file-icon-badge" style="color: #c43e1c;">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" fill="#fce8e6"/>
+            <path d="M14 2v6h6" fill="#fad2cf"/>
+            <rect x="3" y="8" width="9" height="11" rx="1.5" fill="#c43e1c"/>
+            <text x="7.5" y="16.5" font-size="7.5" font-weight="900" fill="#ffffff" text-anchor="middle" font-family="system-ui, sans-serif">P</text>
+          </svg>
+          <span class="file-type-pill" style="background: #c43e1c;">PPT</span>
+        </div>`;
+    }
+    if (category === 'pdf') {
+      return `
+        <div class="file-icon-badge" style="color: #dc2626;">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" fill="#fee2e2"/>
+            <path d="M14 2v6h6" fill="#fca5a5"/>
+            <rect x="3" y="9" width="10" height="9" rx="1.5" fill="#dc2626"/>
+            <text x="8" y="15.5" font-size="5" font-weight="900" fill="#ffffff" text-anchor="middle" font-family="system-ui, sans-serif">PDF</text>
+          </svg>
+          <span class="file-type-pill" style="background: #dc2626;">PDF</span>
+        </div>`;
+    }
+    if (category === 'video') {
+      return `
+        <div class="file-icon-badge" style="color: #7c3aed;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="4" width="20" height="16" rx="2.5" fill="#f5f3ff"/>
+            <polygon points="10 8 16 12 10 16 10 8" fill="#7c3aed" stroke="none"/>
+          </svg>
+          <span class="file-type-pill" style="background: #7c3aed;">VIDEO</span>
+        </div>`;
+    }
+    if (category === 'audio') {
+      return `
+        <div class="file-icon-badge" style="color: #db2777;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="3" fill="#fdf2f8"/>
+            <path d="M9 18V5l12-2v13" stroke="#db2777"/>
+            <circle cx="6" cy="18" r="3" fill="#db2777"/>
+            <circle cx="18" cy="16" r="3" fill="#db2777"/>
+          </svg>
+          <span class="file-type-pill" style="background: #db2777;">AUDIO</span>
+        </div>`;
+    }
+    if (category === 'archive') {
+      return `
+        <div class="file-icon-badge" style="color: #d97706;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v3" fill="#fef3c7"/>
+            <path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8"/>
+            <rect x="3" y="8" width="18" height="4" rx="1" fill="#fde68a"/>
+            <line x1="10" y1="12" x2="14" y2="12"/>
+          </svg>
+          <span class="file-type-pill" style="background: #d97706;">ZIP</span>
+        </div>`;
+    }
+    if (category === 'code') {
+      return `
+        <div class="file-icon-badge" style="color: #0f766e;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" fill="#f0fdfa"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <polyline points="9 13 7 15 9 17" stroke="#0f766e"/>
+            <polyline points="15 13 17 15 15 17" stroke="#0f766e"/>
+          </svg>
+          <span class="file-type-pill" style="background: #0f766e;">${(ext || 'TXT').toUpperCase()}</span>
+        </div>`;
+    }
+    return `
+      <div class="file-icon-badge" style="color: #64748b;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" fill="#f8fafc"/>
+          <polyline points="13 2 13 9 20 9"/>
+        </svg>
+        <span class="file-type-pill" style="background: #64748b;">${(ext || 'FILE').toUpperCase()}</span>
+      </div>`;
+  }
+
+  let currentLightboxFile = null;
+
+  async function openFileOnComputer(filename) {
+    if (!filename) return;
+    setStatus(`Đang mở "${filename}" bằng ứng dụng mặc định...`);
+    try {
+      const res = await fetch(`/api/files/open?name=${encodeURIComponent(filename)}`, { method: 'POST' });
+      if (res.ok) {
+        setStatus(`Đã mở "${filename}" trên máy tính!`, 'success');
+      } else {
+        const err = await res.text();
+        setStatus(`Không thể mở trực tiếp: ${err}`, 'error');
+        window.open(`/api/files/content?name=${encodeURIComponent(filename)}`, '_blank');
+      }
+    } catch (err) {
+      setStatus(`Lỗi khi mở file: ${err.message}`, 'error');
+    }
+  }
+
+  async function openDownloadsFolder() {
+    setStatus('Đang mở thư mục Downloads...');
+    try {
+      const res = await fetch('/api/files/open?folder=1', { method: 'POST' });
+      if (res.ok) {
+        setStatus('Đã mở thư mục Downloads trên máy tính!', 'success');
+      } else {
+        setStatus('Không thể mở thư mục downloads', 'error');
+      }
+    } catch (err) {
+      setStatus(`Lỗi khi mở thư mục: ${err.message}`, 'error');
+    }
+  }
+
+  function openLightbox(filename, sizeStr, isVideo = false) {
+    currentLightboxFile = filename;
+    const modal = document.getElementById('lightbox-modal');
+    const img = document.getElementById('lightbox-img');
+    const video = document.getElementById('lightbox-video');
+    const title = document.getElementById('lightbox-filename');
+    const size = document.getElementById('lightbox-filesize');
+    const downloadBtn = document.getElementById('lightbox-btn-download');
+
+    if (!modal) return;
+
+    title.textContent = filename;
+    size.textContent = sizeStr || '';
+    downloadBtn.href = `/api/files/content?name=${encodeURIComponent(filename)}`;
+    downloadBtn.download = filename;
+
+    const fileUrl = `/api/files/content?name=${encodeURIComponent(filename)}`;
+    if (isVideo) {
+      img.hidden = true;
+      video.hidden = false;
+      video.src = fileUrl;
+      video.play().catch(() => {});
+    } else {
+      video.hidden = true;
+      video.pause();
+      img.hidden = false;
+      img.src = fileUrl;
+    }
+
+    modal.hidden = false;
+  }
+
+  function closeLightbox() {
+    const modal = document.getElementById('lightbox-modal');
+    const video = document.getElementById('lightbox-video');
+    if (modal) modal.hidden = true;
+    if (video) {
+      video.pause();
+      video.src = '';
+    }
+    currentLightboxFile = null;
+  }
+
   function renderFilesList() {
     const container = document.getElementById('files-list');
+    const countEl = document.getElementById('files-count');
     if (!container) return;
 
+    if (countEl) {
+      countEl.textContent = `${torrentList.length} file${torrentList.length === 1 ? '' : 's'}`;
+    }
+
     if (!torrentList.length) {
-      container.innerHTML = '<div class="files-empty">No downloaded files yet. Add a .torrent file from the Torrents tab.</div>';
+      container.innerHTML = '<div class="files-empty">Chưa có file nào được tải về. Thêm file .torrent hoặc magnet link để bắt đầu.</div>';
       return;
     }
 
-    // Build table rows from torrentList
-    const rows = torrentList.map((t) => {
+    const cardsHtml = torrentList.map((t) => {
       const stateInfo = normalizeTorrentState(t.state);
       const progress = Math.min(Math.max(Number(t.progress) || 0, 0), 100);
-      const badgeStyle = STATE_BADGE_STYLE[stateInfo.kind] || '';
-      const barColor = stateInfo.kind === 'seeding' ? '#16a34a' : '#2563eb';
+      const category = getFileCategory(t.name);
+      const ext = (t.name.split('.').pop() || '').toLowerCase();
+      const contentUrl = `/api/files/content?name=${encodeURIComponent(t.name)}`;
+
+      let previewHtml = '';
+      if (category === 'image') {
+        previewHtml = `
+          <div class="file-card-preview img-thumb-wrap">
+            <img src="${contentUrl}" alt="${escapeHtml(t.name)}" loading="lazy" class="file-thumb-img" onerror="this.style.display='none'; this.nextElementSibling.style.opacity='1';">
+            <div class="file-zoom-hint">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+              Phóng to
+            </div>
+          </div>`;
+      } else {
+        previewHtml = `
+          <div class="file-card-preview">
+            ${renderFileIconSvg(category, ext)}
+          </div>`;
+      }
+
+      const isCompleted = progress >= 100;
+      const statusText = isCompleted ? '✓ Hoàn thành' : `${progress.toFixed(0)}%`;
+      const statusColor = isCompleted ? '#16a34a' : '#2563eb';
+
       return `
-        <div class="file-row">
-          <div class="file-icon-wrap">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
-              <polyline points="13 2 13 9 20 9"/>
-            </svg>
-          </div>
-          <div class="file-info">
-            <div class="file-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-            <div class="file-meta">
-              <span class="file-size">${formatBytes(t.length)}</span>
-              <span class="file-sep">•</span>
-              <span class="file-badge" style="${BADGE_BASE}${badgeStyle}">${stateInfo.label}</span>
-              <span class="file-sep">•</span>
-              <span class="file-progress-text">${progress.toFixed(1)}%</span>
+        <div class="file-card" data-filename="${escapeHtml(t.name)}" data-category="${category}" data-filesize="${formatBytes(t.length)}" title="Click để ${category === 'image' ? 'phóng to ảnh' : (category === 'video' ? 'xem video' : 'mở file')}">
+          ${previewHtml}
+          <div class="file-card-body">
+            <div class="file-card-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
+            <div class="file-card-meta">
+              <span>${formatBytes(t.length)}</span>
+              <span style="color: ${statusColor}; font-weight: 600;">${statusText}</span>
             </div>
-            <div class="file-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.toFixed(0)}">
-              <div class="file-progress-bar" style="width:${progress}%; background:${barColor};"></div>
-            </div>
-          </div>
-          <div class="file-dl">
-            <span class="file-dl-label">↓</span>
-            <span>${formatSpeed(t.downloadRate || 0)}</span>
+            ${!isCompleted ? `
+              <div class="file-card-progress">
+                <div class="file-card-progress-bar" style="width: ${progress}%;"></div>
+              </div>` : ''}
           </div>
         </div>`;
     }).join('');
 
-    container.innerHTML = `<div class="files-table">${rows}</div>`;
+    container.innerHTML = `<div class="files-explorer-grid">${cardsHtml}</div>`;
+
+    container.querySelectorAll('.file-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        const filename = card.getAttribute('data-filename');
+        const category = card.getAttribute('data-category');
+        const filesize = card.getAttribute('data-filesize');
+        if (category === 'image') {
+          openLightbox(filename, filesize, false);
+        } else if (category === 'video') {
+          openLightbox(filename, filesize, true);
+        } else {
+          openFileOnComputer(filename);
+        }
+      });
+    });
   }
 
   function renderTorrentList() {
@@ -704,6 +930,41 @@
     bindDropzone(dashboardDropzone, 'create');
   }
 
+  function bindFilesViewEvents() {
+    const openFolderBtn = document.getElementById('open-downloads-folder-btn');
+    if (openFolderBtn) {
+      openFolderBtn.addEventListener('click', openDownloadsFolder);
+    }
+
+    const closeBtn = document.getElementById('lightbox-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', closeLightbox);
+    }
+
+    const modal = document.getElementById('lightbox-modal');
+    if (modal) {
+      const backdrop = modal.querySelector('.lightbox-backdrop');
+      if (backdrop) {
+        backdrop.addEventListener('click', closeLightbox);
+      }
+    }
+
+    const btnOpenApp = document.getElementById('lightbox-btn-open-app');
+    if (btnOpenApp) {
+      btnOpenApp.addEventListener('click', () => {
+        if (currentLightboxFile) {
+          openFileOnComputer(currentLightboxFile);
+        }
+      });
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeLightbox();
+      }
+    });
+  }
+
   // Initial render & polling
   fetchSystemInfo();
   renderTorrentList();
@@ -712,6 +973,7 @@
   bindFilePicker();
   bindTorrentListActions();
   bindListControls();
+  bindFilesViewEvents();
   syncTorrentsFromServer();
   setInterval(syncTorrentsFromServer, 2000);
 })();

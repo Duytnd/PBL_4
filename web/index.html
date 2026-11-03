@@ -110,9 +110,41 @@
       </section>
 
       <section class="view" id="view-files" aria-label="Files" hidden>
+        <div class="files-header">
+          <div>
+            <h2 class="files-title">Files Explorer</h2>
+            <div id="files-count" class="files-subtitle">0 files</div>
+          </div>
+          <button id="open-downloads-folder-btn" class="btn" type="button" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; font-size: 13px;">
+            <svg class="icon" viewBox="0 0 24 24" style="width: 15px; height: 15px;" aria-hidden="true"><path d="M3 7c0-1.1.9-2 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+            <span>Mở thư mục trên máy</span>
+          </button>
+        </div>
         <div id="files-list" class="files-list" aria-live="polite"></div>
       </section>
     </main>
+  </div>
+
+  <!-- Lightbox Modal for Image / Video Preview -->
+  <div id="lightbox-modal" class="lightbox-modal" hidden>
+    <div class="lightbox-backdrop"></div>
+    <div class="lightbox-dialog" role="dialog" aria-modal="true">
+      <button id="lightbox-close" class="lightbox-close-btn" aria-label="Close" type="button">&times;</button>
+      <div class="lightbox-body">
+        <img id="lightbox-img" class="lightbox-img" src="" alt="Preview">
+        <video id="lightbox-video" class="lightbox-video" controls hidden></video>
+      </div>
+      <div class="lightbox-footer">
+        <div class="lightbox-info">
+          <div id="lightbox-filename" class="lightbox-filename"></div>
+          <div id="lightbox-filesize" class="lightbox-filesize"></div>
+        </div>
+        <div class="lightbox-actions">
+          <button id="lightbox-btn-open-app" class="btn" type="button" style="padding: 6px 12px; font-size: 13px;">Mở trên máy</button>
+          <a id="lightbox-btn-download" class="btn btn-primary" href="" download style="padding: 6px 12px; font-size: 13px; text-decoration: none; display: inline-flex; align-items: center;">Tải về</a>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="app.js" defer></script>

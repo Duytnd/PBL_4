@@ -614,6 +614,146 @@ void handleRemoveTorrent(const httplib::Request& req, httplib::Response& res) {
     }
 }
 
+std::string getMimeType(const std::string& extension) {
+    std::string ext = extension;
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".webp") return "image/webp";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".bmp") return "image/bmp";
+    if (ext == ".ico") return "image/x-icon";
+    if (ext == ".mp4") return "video/mp4";
+    if (ext == ".mov") return "video/quicktime";
+    if (ext == ".webm") return "video/webm";
+    if (ext == ".mkv") return "video/x-matroska";
+    if (ext == ".avi") return "video/x-msvideo";
+    if (ext == ".mp3") return "audio/mpeg";
+    if (ext == ".wav") return "audio/wav";
+    if (ext == ".ogg") return "audio/ogg";
+    if (ext == ".flac") return "audio/flac";
+    if (ext == ".pdf") return "application/pdf";
+    if (ext == ".doc") return "application/msword";
+    if (ext == ".docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (ext == ".xls") return "application/vnd.ms-excel";
+    if (ext == ".xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (ext == ".ppt") return "application/vnd.ms-powerpoint";
+    if (ext == ".pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (ext == ".txt") return "text/plain; charset=utf-8";
+    if (ext == ".csv") return "text/csv; charset=utf-8";
+    if (ext == ".json") return "application/json";
+    if (ext == ".xml") return "application/xml";
+    if (ext == ".zip") return "application/zip";
+    if (ext == ".rar") return "application/x-rar-compressed";
+    if (ext == ".7z") return "application/x-7z-compressed";
+    if (ext == ".tar" || ext == ".gz") return "application/gzip";
+    return "application/octet-stream";
+}
+
+void handleFileContent(const httplib::Request& req, httplib::Response& res) {
+    std::string name;
+    if (req.has_param("name")) {
+        name = req.get_param_value("name");
+    } else if (req.has_param("file")) {
+        name = req.get_param_value("file");
+    }
+    if (name.empty()) {
+        res.status = 400;
+        res.set_content("Missing file name", "text/plain");
+        return;
+    }
+
+    const std::filesystem::path safeName = safeFileName(name);
+    const std::filesystem::path downloadDir = resolveDownloadDir();
+    const std::filesystem::path filePath = downloadDir / safeName;
+
+    if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+        res.status = 404;
+        res.set_content("File not found", "text/plain");
+        return;
+    }
+
+    const std::string ext = filePath.extension().string();
+    const std::string mime = getMimeType(ext);
+
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        res.status = 500;
+        res.set_content("Failed to read file", "text/plain");
+        return;
+    }
+
+    const auto fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::string buffer;
+    buffer.resize(static_cast<std::size_t>(fileSize));
+    file.read(&buffer[0], fileSize);
+
+    res.status = 200;
+    res.set_header("Content-Disposition", "inline; filename=\"" + asciiFallbackName(safeName.string()) + "\"");
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_content(std::move(buffer), mime);
+}
+
+void handleFileOpen(const httplib::Request& req, httplib::Response& res) {
+    const std::filesystem::path downloadDir = resolveDownloadDir();
+    std::filesystem::path targetPath;
+
+    if (req.has_param("folder") && req.get_param_value("folder") == "1") {
+        targetPath = downloadDir;
+    } else {
+        std::string name;
+        if (req.has_param("name")) {
+            name = req.get_param_value("name");
+        } else if (!req.body.empty()) {
+            if (req.is_multipart_form_data() && req.form.has_field("name")) {
+                name = req.form.get_field("name");
+            } else {
+                auto pos = req.body.find("\"name\"");
+                if (pos != std::string::npos) {
+                    auto start = req.body.find('"', pos + 6);
+                    if (start != std::string::npos) {
+                        auto end = req.body.find('"', start + 1);
+                        if (end != std::string::npos) {
+                            name = req.body.substr(start + 1, end - start - 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (name.empty()) {
+            res.status = 400;
+            res.set_content("{\"status\":\"error\",\"message\":\"Missing file name\"}", "application/json");
+            return;
+        }
+
+        const std::filesystem::path safeName = safeFileName(name);
+        targetPath = downloadDir / safeName;
+        if (!std::filesystem::exists(targetPath)) {
+            res.status = 404;
+            res.set_content("{\"status\":\"error\",\"message\":\"File does not exist on disk\"}", "application/json");
+            return;
+        }
+    }
+
+#if defined(__APPLE__)
+    std::string cmd = "open \"" + targetPath.string() + "\" &";
+    std::system(cmd.c_str());
+#elif defined(_WIN32)
+    std::string cmd = "start \"\" \"" + targetPath.string() + "\"";
+    std::system(cmd.c_str());
+#else
+    std::string cmd = "xdg-open \"" + targetPath.string() + "\" &";
+    std::system(cmd.c_str());
+#endif
+
+    res.status = 200;
+    res.set_content("{\"status\":\"ok\",\"message\":\"Opened " + jsonEscape(targetPath.filename().string()) + "\"}", "application/json");
+}
+
 }  // namespace
 
 void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::path& /*tempDir*/) {
@@ -642,6 +782,14 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Get("/api/torrents", [](const httplib::Request& /*req*/, httplib::Response& res) {
         res.set_content(StateBridge::instance().toJsonString(), "application/json");
+    });
+
+    server.Get("/api/files/content", [](const httplib::Request& req, httplib::Response& res) {
+        handleFileContent(req, res);
+    });
+
+    server.Post("/api/files/open", [](const httplib::Request& req, httplib::Response& res) {
+        handleFileOpen(req, res);
     });
 
     server.Get("/api/status", [](const httplib::Request& /*req*/, httplib::Response& res) {
