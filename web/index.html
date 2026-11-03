@@ -29,6 +29,10 @@
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17a8 8 0 1 1 16 0"/><path d="M12 17l4-5"/></svg>
         <span>Speed</span>
       </a>
+      <a href="#/files" data-view="files">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7c0-1.1.9-2 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        <span>Files</span>
+      </a>
     </nav>
 
     <main>
@@ -103,6 +107,10 @@
           <div class="tile"><div class="tile-label">Download speed</div><div class="tile-value">0 B/s</div></div>
           <div class="tile"><div class="tile-label">Upload speed</div><div class="tile-value">0 B/s</div></div>
         </div>
+      </section>
+
+      <section class="view" id="view-files" aria-label="Files" hidden>
+        <div id="files-list" class="files-list" aria-live="polite"></div>
       </section>
     </main>
   </div>

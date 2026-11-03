@@ -1,7 +1,7 @@
 'use strict';
 
 (() => {
-  const VIEWS = ['dashboard', 'torrents', 'speed'];
+  const VIEWS = ['dashboard', 'torrents', 'speed', 'files'];
   let currentAnnounceUrl = 'http://127.0.0.1:6969/announce';
   const PIECE_LENGTH = 262144;
   const torrentList = [];
@@ -266,6 +266,53 @@
     card.querySelector('.torrent-remove').setAttribute('aria-label', `Remove ${torrent.name}`);
   }
 
+
+  function renderFilesList() {
+    const container = document.getElementById('files-list');
+    if (!container) return;
+
+    if (!torrentList.length) {
+      container.innerHTML = '<div class="files-empty">No downloaded files yet. Add a .torrent file from the Torrents tab.</div>';
+      return;
+    }
+
+    // Build table rows from torrentList
+    const rows = torrentList.map((t) => {
+      const stateInfo = normalizeTorrentState(t.state);
+      const progress = Math.min(Math.max(Number(t.progress) || 0, 0), 100);
+      const badgeStyle = STATE_BADGE_STYLE[stateInfo.kind] || '';
+      const barColor = stateInfo.kind === 'seeding' ? '#16a34a' : '#2563eb';
+      return `
+        <div class="file-row">
+          <div class="file-icon-wrap">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+              <polyline points="13 2 13 9 20 9"/>
+            </svg>
+          </div>
+          <div class="file-info">
+            <div class="file-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
+            <div class="file-meta">
+              <span class="file-size">${formatBytes(t.length)}</span>
+              <span class="file-sep">•</span>
+              <span class="file-badge" style="${BADGE_BASE}${badgeStyle}">${stateInfo.label}</span>
+              <span class="file-sep">•</span>
+              <span class="file-progress-text">${progress.toFixed(1)}%</span>
+            </div>
+            <div class="file-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.toFixed(0)}">
+              <div class="file-progress-bar" style="width:${progress}%; background:${barColor};"></div>
+            </div>
+          </div>
+          <div class="file-dl">
+            <span class="file-dl-label">↓</span>
+            <span>${formatSpeed(t.downloadRate || 0)}</span>
+          </div>
+        </div>`;
+    }).join('');
+
+    container.innerHTML = `<div class="files-table">${rows}</div>`;
+  }
+
   function renderTorrentList() {
     const container = document.getElementById('torrent-list');
     if (!container) return;
@@ -332,6 +379,7 @@
         if (index !== -1) torrentList.splice(index, 1);
         renderTorrentList();
         updateDashboardTiles();
+        renderFilesList();
         setStatus('Torrent removed.', 'info');
       } else if (button.classList.contains('torrent-copy-magnet') && torrent && torrent.magnetUri) {
         try {
@@ -419,6 +467,7 @@
         });
         renderTorrentList();
         updateDashboardTiles();
+        renderFilesList();
       }
     } catch (_) {
       setConnectionLost(true);
