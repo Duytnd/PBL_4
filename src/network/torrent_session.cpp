@@ -414,19 +414,38 @@ SessionState TorrentSession::state() const noexcept {
 
 void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     if (ip.empty() || port == 0) return;
-    const std::string ep = ip + ":" + std::to_string(port);
 
-    bool is_new = false;
+    const std::string local_ip = (dht() && !dht()->localIp().empty()) ? dht()->localIp() : "";
+    bool has_private_alternative = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
+        for (const auto& existing : known_peer_endpoints_) {
+            const auto colon = existing.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string existing_ip = existing.substr(0, colon);
+            if (KademliaNode::is_private_ipv4(existing_ip)) {
+                has_private_alternative = true;
+                break;
+            }
+        }
+        if (!KademliaNode::should_connect_peer(local_ip, ip, has_private_alternative)) {
+            std::cout << "[ADD-PEER] Skipping public peer " << ip << ":" << port
+                      << " while LAN private peers are preferred" << std::endl;
+            return;
+        }
+
+        const std::string ep = ip + ":" + std::to_string(port);
+        bool is_new = false;
         if (known_peer_endpoints_.insert(ep).second) {
             candidate_peer_endpoints_.push_back(ep);
             is_new = true;
         }
+
+        std::cout << "[ADD-PEER] " << ep
+                  << (is_new ? " -> added to candidates" : " -> already known, skipped")
+                  << " | running=" << running_ << " paused=" << paused_ << std::endl;
     }
-    std::cout << "[ADD-PEER] " << ep
-              << (is_new ? " -> added to candidates" : " -> already known, skipped")
-              << " | running=" << running_ << " paused=" << paused_ << std::endl;
+
     if (running_ && !paused_) {
         connect_candidate_peers();
     }

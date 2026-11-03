@@ -71,6 +71,15 @@ void testSessionInitializationAndStats() {
     CHECK(!session.info_hash_hex().empty());
 }
 
+void testKademliaNodeFiltersPublicPeersOnPrivateNetworks() {
+    std::cout << "[TEST] Kademlia peer filtering keeps private LAN peers while rejecting public leaks on private WiFi...\n";
+
+    CHECK(!KademliaNode::should_connect_peer("192.168.1.50", "117.3.54.230", true));
+    CHECK(KademliaNode::should_connect_peer("192.168.1.50", "192.168.1.25", false));
+    CHECK(!KademliaNode::should_connect_peer("8.8.8.8", "117.3.54.230", false));
+    CHECK(KademliaNode::should_connect_peer("10.0.0.5", "127.0.0.1", false));
+}
+
 void testMagnetResolverFetchesAndVerifiesMetadata() {
     std::cout << "[TEST] Magnet resolver retrieves BEP 9 metadata and verifies BTIH...\n";
     const std::filesystem::path temp_dir = "./test_magnet_resolver";

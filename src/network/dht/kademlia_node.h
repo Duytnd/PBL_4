@@ -63,6 +63,13 @@ public:
     void setLocalIp(const std::string& ip) { localIp_ = ip; }
     [[nodiscard]] const std::string& localIp() const { return localIp_; }
 
+    static bool is_private_ipv4(const std::string& ip);
+    static bool is_public_ipv4(const std::string& ip);
+    static bool should_connect_peer(
+        const std::string& local_ip,
+        const std::string& candidate_ip,
+        bool has_private_peer_alternative = false);
+
 private:
     struct PendingCall {
         bool done = false;

@@ -62,6 +62,21 @@ std::vector<DhtContact> sortedByDistance(std::vector<DhtContact> contacts, const
     return contacts;
 }
 
+bool is_valid_ipv4(const std::string& ip) {
+    if (ip.empty()) {
+        return false;
+    }
+    struct in_addr addr{};
+    return inet_pton(AF_INET, ip.c_str(), &addr) == 1;
+}
+
+bool is_loopback_or_invalid_ip(const std::string& ip) {
+    if (!is_valid_ipv4(ip)) {
+        return true;
+    }
+    return ip == "127.0.0.1" || ip == "0.0.0.0" || ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0;
+}
+
 std::string detectLocalLanIp() {
 #ifdef _WIN32
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -106,6 +121,56 @@ std::string detectLocalLanIp() {
 }
 
 }  // namespace
+
+bool KademliaNode::is_private_ipv4(const std::string& ip) {
+    if (!is_valid_ipv4(ip) || is_loopback_or_invalid_ip(ip)) {
+        return false;
+    }
+
+    std::uint32_t octet1 = 0;
+    std::uint32_t octet2 = 0;
+    std::uint32_t octet3 = 0;
+    std::uint32_t octet4 = 0;
+    if (std::sscanf(ip.c_str(), "%u.%u.%u.%u", &octet1, &octet2, &octet3, &octet4) != 4) {
+        return false;
+    }
+
+    return (octet1 == 10) ||
+           (octet1 == 172 && octet2 >= 16 && octet2 <= 31) ||
+           (octet1 == 192 && octet2 == 168);
+}
+
+bool KademliaNode::is_public_ipv4(const std::string& ip) {
+    return is_valid_ipv4(ip) && !is_loopback_or_invalid_ip(ip) && !is_private_ipv4(ip);
+}
+
+bool KademliaNode::should_connect_peer(
+    const std::string& local_ip,
+    const std::string& candidate_ip,
+    bool has_private_peer_alternative) {
+    if (candidate_ip.empty()) {
+        return false;
+    }
+    if (candidate_ip == "127.0.0.1" || candidate_ip == "0.0.0.0") {
+        return true;
+    }
+    if (is_loopback_or_invalid_ip(candidate_ip)) {
+        return false;
+    }
+
+    if (is_private_ipv4(candidate_ip)) {
+        return true;
+    }
+
+    // Nếu máy đang ở mạng private/LAN: ưu tiên private peer, public chỉ được
+    // nếu không có private alternative nào. Nếu máy không ở private LAN, tuyệt
+    // đối không add public peer từ DHT/PEX; chỉ kết nối đúng peer đã biết rõ.
+    if (local_ip.empty() || !is_private_ipv4(local_ip) || local_ip == "127.0.0.1") {
+        return false;
+    }
+
+    return !has_private_peer_alternative;
+}
 
 KademliaNode::KademliaNode(NodeId selfId, std::uint16_t port)
     : selfId_(selfId), port_(port), secret_(NodeId::random().toString()), routingTable_(selfId) {}
@@ -455,6 +520,9 @@ std::vector<KrpcPeerInfo> KademliaNode::getPeers(const std::string& infoHash) {
                 if ((p.ip == "127.0.0.1" || p.ip.empty()) && contact.ip != "127.0.0.1") {
                     p.ip = contact.ip;
                 }
+                if (!KademliaNode::should_connect_peer(localIp_, p.ip, false)) {
+                    continue;
+                }
                 foundPeers.push_back(p);
             }
             for (const auto& node : response.nodes) {
@@ -467,6 +535,22 @@ std::vector<KrpcPeerInfo> KademliaNode::getPeers(const std::string& infoHash) {
             break;
         }
         shortlist = sortedByDistance(shortlist, target, RoutingTable::kBucketSize);
+    }
+
+    if (is_private_ipv4(localIp_)) {
+        const bool has_private_peer = std::any_of(
+            foundPeers.begin(), foundPeers.end(), [](const KrpcPeerInfo& peer) {
+                return KademliaNode::is_private_ipv4(peer.ip);
+            });
+        if (has_private_peer) {
+            foundPeers.erase(
+                std::remove_if(
+                    foundPeers.begin(), foundPeers.end(),
+                    [](const KrpcPeerInfo& peer) {
+                        return !KademliaNode::is_private_ipv4(peer.ip);
+                    }),
+                foundPeers.end());
+        }
     }
 
     {
