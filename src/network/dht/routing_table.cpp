@@ -12,6 +12,7 @@ void RoutingTable::insert(const DhtContact& contact) {
         return;  // không tự thêm mình vào routing table
     }
 
+    std::lock_guard<std::mutex> lock(mutex_);
     const std::size_t bucketIndex = selfId_.commonPrefixLength(contact.id);
     auto& bucket = buckets_[bucketIndex];
 
@@ -34,6 +35,7 @@ void RoutingTable::insert(const DhtContact& contact) {
 }
 
 void RoutingTable::remove(const NodeId& nodeId) {
+    std::lock_guard<std::mutex> lock(mutex_);
     const std::size_t bucketIndex = selfId_.commonPrefixLength(nodeId);
     auto& bucket = buckets_[bucketIndex];
     bucket.erase(
@@ -44,6 +46,7 @@ void RoutingTable::remove(const NodeId& nodeId) {
 }
 
 std::vector<DhtContact> RoutingTable::closestTo(const NodeId& target, std::size_t count) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<DhtContact> all;
     for (const auto& bucket : buckets_) {
         all.insert(all.end(), bucket.begin(), bucket.end());
@@ -60,6 +63,7 @@ std::vector<DhtContact> RoutingTable::closestTo(const NodeId& target, std::size_
 }
 
 std::size_t RoutingTable::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::size_t total = 0;
     for (const auto& bucket : buckets_) {
         total += bucket.size();
@@ -68,6 +72,7 @@ std::size_t RoutingTable::size() const {
 }
 
 bool RoutingTable::contains(const NodeId& nodeId) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     const std::size_t bucketIndex = selfId_.commonPrefixLength(nodeId);
     const auto& bucket = buckets_[bucketIndex];
     return std::any_of(bucket.begin(), bucket.end(), [&](const DhtContact& contact) {

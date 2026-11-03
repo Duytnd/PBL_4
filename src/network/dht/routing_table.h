@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,7 @@ public:
     [[nodiscard]] const NodeId& selfId() const { return selfId_; }
 
 private:
+    mutable std::mutex mutex_;
     NodeId selfId_;
     std::size_t bucketSize_;
     // index = commonPrefixLength(selfId_, contact.id), 0..NodeId::kBitLength

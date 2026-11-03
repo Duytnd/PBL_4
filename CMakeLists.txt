@@ -253,9 +253,8 @@ if(WIN32)
     target_link_libraries(p2p PRIVATE ws2_32 crypt32)
 endif()
 
-# Chương trình chính: chạy web UI thật, nối nút "Create Torrent" tới
-# core::TorrentBuilder qua POST /api/torrents/create (xem src/webui/).
-add_executable(p2p_server
+# Chương trình chính: BitTorrent Client với Web UI
+set(P2P_CLIENT_SOURCES
     src/main.cpp
     src/core/bencode.cpp
     src/core/hash_utils.cpp
@@ -280,13 +279,25 @@ add_executable(p2p_server
     src/network/dht/kademlia_node.cpp
 )
 
+add_executable(p2p_client ${P2P_CLIENT_SOURCES})
+target_include_directories(p2p_client PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(p2p_client PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(p2p_client PRIVATE ws2_32 crypt32)
+endif()
+
+# Giữ target p2p_server để tương thích ngược hoàn toàn
+add_executable(p2p_server ${P2P_CLIENT_SOURCES})
 target_include_directories(p2p_server PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
 target_link_libraries(p2p_server PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-
 if(WIN32)
     target_link_libraries(p2p_server PRIVATE ws2_32 crypt32)
 endif()

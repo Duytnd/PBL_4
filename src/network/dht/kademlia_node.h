@@ -56,8 +56,12 @@ public:
     void announcePeer(const std::string& infoHash, std::uint16_t announcePort);
 
     [[nodiscard]] RoutingTable& routingTable() { return routingTable_; }
+    [[nodiscard]] const RoutingTable& routingTable() const { return routingTable_; }
     [[nodiscard]] const NodeId& selfId() const { return selfId_; }
     [[nodiscard]] std::uint16_t port() const { return port_; }
+
+    void setLocalIp(const std::string& ip) { localIp_ = ip; }
+    [[nodiscard]] const std::string& localIp() const { return localIp_; }
 
 private:
     struct PendingCall {
@@ -68,6 +72,7 @@ private:
     NodeId selfId_;
     std::uint16_t port_;
     std::string secret_;
+    std::string localIp_;
 
     std::atomic<bool> running_{false};
     std::thread receiveThread_;

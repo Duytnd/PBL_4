@@ -1,6 +1,7 @@
 #include "webui/state_bridge.h"
 
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 
 namespace p2p {
@@ -65,7 +66,7 @@ std::vector<TorrentViewInfo> StateBridge::getAllTorrents() {
         info.completed_pieces = stats.completed_pieces;
         info.total_pieces = stats.total_pieces;
         info.connected_peers = stats.connected_peers;
-        info.dht_nodes = stats.dht_nodes_count;
+        info.dht_nodes = shared_dht_ ? shared_dht_->routingTable().size() : stats.dht_nodes_count;
         info.error_message = stats.error_message;
         list.push_back(std::move(info));
     }
@@ -103,6 +104,45 @@ std::uint16_t StateBridge::allocatePort() {
     }
     // Cả dải 6881-6950 đều bận: trả về cổng kế tiếp, start() sẽ báo lỗi bind rõ ràng.
     return next_port_;
+}
+
+std::shared_ptr<KademliaNode> StateBridge::sharedDht() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shared_dht_;
+}
+
+std::shared_ptr<KademliaNode> StateBridge::getOrCreateSharedDht(
+    std::uint16_t preferredPort,
+    const std::string& bootstrapHost,
+    std::uint16_t bootstrapPort) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shared_dht_) {
+        if (!bootstrapHost.empty() && bootstrapPort != 0) {
+            std::thread([dht = shared_dht_, host = bootstrapHost, port = bootstrapPort]() {
+                dht->bootstrap(host, port);
+            }).detach();
+        }
+        return shared_dht_;
+    }
+
+    std::uint16_t port = preferredPort != 0 ? preferredPort : 6881;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        auto node = std::make_shared<KademliaNode>(NodeId::random(), port);
+        if (node->start()) {
+            std::cout << "[DHT] Shared Kademlia node started on UDP port " << node->port() << std::endl;
+            shared_dht_ = std::move(node);
+            break;
+        }
+        port++;
+    }
+
+    if (shared_dht_ && !bootstrapHost.empty() && bootstrapPort != 0) {
+        std::thread([dht = shared_dht_, host = bootstrapHost, port = bootstrapPort]() {
+            dht->bootstrap(host, port);
+        }).detach();
+    }
+
+    return shared_dht_;
 }
 
 static std::string escapeJsonString(const std::string& input) {

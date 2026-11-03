@@ -1,5 +1,6 @@
 #pragma once
 
+#include "network/dht/kademlia_node.h"
 #include "network/torrent_session.h"
 
 #include <cstdint>
@@ -46,6 +47,13 @@ public:
     // Cấp phát cổng kế tiếp cho session mới
     std::uint16_t allocatePort();
 
+    // Node DHT dùng chung cho toàn bộ server
+    std::shared_ptr<KademliaNode> getOrCreateSharedDht(
+        std::uint16_t preferredPort = 6881,
+        const std::string& bootstrapHost = "",
+        std::uint16_t bootstrapPort = 0);
+    std::shared_ptr<KademliaNode> sharedDht() const;
+
 private:
     StateBridge() = default;
     ~StateBridge() = default;
@@ -60,6 +68,7 @@ private:
     };
     std::unordered_map<std::string, Entry> sessions_;
     std::uint16_t next_port_ = 6881;
+    std::shared_ptr<KademliaNode> shared_dht_;
 };
 
 }  // namespace p2p

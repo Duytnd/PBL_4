@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -15,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <iostream>
 #include <random>
 
 namespace p2p {
@@ -60,6 +62,49 @@ std::vector<DhtContact> sortedByDistance(std::vector<DhtContact> contacts, const
     return contacts;
 }
 
+std::string detectLocalLanIp() {
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock != INVALID_SOCKET) {
+        sockaddr_in loopback{};
+        loopback.sin_family = AF_INET;
+        loopback.sin_addr.s_addr = inet_addr("8.8.8.8");
+        loopback.sin_port = htons(53);
+        if (connect(sock, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)) == 0) {
+            sockaddr_in local{};
+            int len = sizeof(local);
+            if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+                char ipStr[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr))) {
+                    closesocket(sock);
+                    return std::string(ipStr);
+                }
+            }
+        }
+        closesocket(sock);
+    }
+#else
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) == 0) {
+        for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                char ipStr[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &sin->sin_addr, ipStr, sizeof(ipStr))) {
+                    std::string ip(ipStr);
+                    if (ip != "127.0.0.1" && ip.rfind("127.", 0) != 0 && ip.rfind("169.254.", 0) != 0) {
+                        freeifaddrs(ifap);
+                        return ip;
+                    }
+                }
+            }
+        }
+        freeifaddrs(ifap);
+    }
+#endif
+    return "127.0.0.1";
+}
+
 }  // namespace
 
 KademliaNode::KademliaNode(NodeId selfId, std::uint16_t port)
@@ -77,12 +122,21 @@ bool KademliaNode::start() {
         return false;
     }
 
+#ifndef _WIN32
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+#endif
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port_);
 
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        std::cerr << "[DHT] bind failed on port " << port_ << ": " << strerror(errno) << std::endl;
         closeSocketHandle(sock);
         return false;
     }
@@ -98,6 +152,9 @@ bool KademliaNode::start() {
 #endif
 
     socketHandle_ = static_cast<long long>(sock);
+    if (localIp_.empty()) {
+        localIp_ = detectLocalLanIp();
+    }
     running_ = true;
     receiveThread_ = std::thread(&KademliaNode::receiveLoop, this);
     return true;
@@ -193,7 +250,12 @@ void KademliaNode::handleQuery(const KrpcMessage& query, const std::string& from
                 const auto it = announcedPeers_.find(query.infoHash);
                 if (it != announcedPeers_.end()) {
                     for (const auto& contact : it->second) {
-                        peers.push_back({contact.ip, contact.port});
+                        std::string peerIp = contact.ip;
+                        if ((peerIp == "127.0.0.1" || peerIp.empty() || contact.id == selfId_) &&
+                            fromIp != "127.0.0.1" && fromIp != "localhost") {
+                            peerIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+                        }
+                        peers.push_back({peerIp, contact.port});
                     }
                 }
             }
@@ -389,7 +451,12 @@ std::vector<KrpcPeerInfo> KademliaNode::getPeers(const std::string& infoHash) {
             if (!response.token.empty()) {
                 tokens.emplace_back(DhtContact{response.nodeId, contact.ip, contact.port}, response.token);
             }
-            foundPeers.insert(foundPeers.end(), response.values.begin(), response.values.end());
+            for (auto p : response.values) {
+                if ((p.ip == "127.0.0.1" || p.ip.empty()) && contact.ip != "127.0.0.1") {
+                    p.ip = contact.ip;
+                }
+                foundPeers.push_back(p);
+            }
             for (const auto& node : response.nodes) {
                 routingTable_.insert(DhtContact{node.id, node.ip, node.port});
                 shortlist.push_back(DhtContact{node.id, node.ip, node.port});
@@ -434,7 +501,8 @@ void KademliaNode::announcePeer(const std::string& infoHash, std::uint16_t annou
         return contact.id == selfId_;
     });
     if (!exists) {
-        list.push_back(DhtContact{selfId_, "127.0.0.1", announcePort});
+        const std::string myIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+        list.push_back(DhtContact{selfId_, myIp, announcePort});
     }
 }
 

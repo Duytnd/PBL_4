@@ -71,6 +71,11 @@
             <label for="tracker-announce-input" style="font-size: 13px; font-weight: 500; color: var(--text);">Tracker URL:</label>
             <input id="tracker-announce-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="http://&lt;LAN IP&gt;:6969/announce">
           </div>
+          <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px;">
+            <label for="dht-bootstrap-input" style="font-size: 13px; font-weight: 500; color: var(--text);">DHT Bootstrap:</label>
+            <input id="dht-bootstrap-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="&lt;IP máy kia&gt;:6881 (để tải không cần Tracker)">
+            <button id="save-dht-btn" type="button" class="btn" style="padding: 6px 12px; font-size: 12px;">Connect DHT</button>
+          </div>
           <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
           <div id="magnet-box" class="magnet-box" style="display: none; margin-top: 10px; padding: 12px; background: #eaf1ff; border: 1px solid #bfdbfe; border-radius: 8px;">
             <div style="font-weight: 600; margin-bottom: 6px; color: #1e40af;">Magnet Link (share it so others can download):</div>

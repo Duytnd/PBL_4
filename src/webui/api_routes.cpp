@@ -426,6 +426,10 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         config.enable_dht = enableDht;
         config.dht_bootstrap_host = dhtBootstrapHost;
         config.dht_bootstrap_port = dhtBootstrapPort;
+        if (enableDht) {
+            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
+                6881, dhtBootstrapHost, dhtBootstrapPort);
+        }
 
         // Trùng torrent: không start thêm session (tránh chiếm port vô ích).
         if (!StateBridge::instance().getSession(infoHashHex)) {
@@ -492,6 +496,10 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
         const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
         config.dht_bootstrap_host = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
         config.dht_bootstrap_port = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
+        if (config.enable_dht) {
+            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
+                6881, config.dht_bootstrap_host, config.dht_bootstrap_port);
+        }
 
         if (!StateBridge::instance().getSession(infoHashHex)) {
             auto session = std::make_shared<TorrentSession>(meta, config);
@@ -537,6 +545,10 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
     // Giới hạn body trước khi httplib đọc vào RAM (file + vài field form).
     server.set_payload_max_length(kMaxUploadBytes + 1024 * 1024);
 
+    // Tự động khởi động node DHT dùng chung (UDP 6881) ngay khi server chạy
+    const auto [bootHost, bootPort] = loadDhtBootstrapConfig();
+    StateBridge::instance().getOrCreateSharedDht(6881, bootHost, bootPort);
+
     server.Post("/api/torrents/create", [](const httplib::Request& req, httplib::Response& res) {
         handleCreateTorrent(req, res);
     });
@@ -581,6 +593,13 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
         }
 
         saveDhtBootstrapConfig(host, port);
+        auto sharedDht = StateBridge::instance().getOrCreateSharedDht(6881, host, port);
+        if (sharedDht) {
+            std::thread([sharedDht, h = host, p = port]() {
+                sharedDht->bootstrap(h, p);
+            }).detach();
+        }
+
         std::string json = "{\"status\":\"ok\",\"host\":\"" + jsonEscape(host) + "\",\"port\":" + std::to_string(port) +
                            ",\"config_path\":\"" + jsonEscape(resolveDhtConfigPath().string()) + "\"}";
         res.set_content(json, "application/json");
@@ -588,8 +607,14 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Get("/api/dht/status", [](const httplib::Request& /*req*/, httplib::Response& res) {
         const auto [host, port] = loadDhtBootstrapConfig();
-        const bool enabled = true;
-        std::string json = "{\"enabled\":" + std::string(enabled ? "true" : "false") +
+        const auto sharedDht = StateBridge::instance().sharedDht();
+        const bool running = sharedDht != nullptr;
+        const std::size_t nodesCount = sharedDht ? sharedDht->routingTable().size() : 0;
+        const std::uint16_t dhtPort = sharedDht ? sharedDht->port() : 0;
+        std::string json = "{\"enabled\":true"
+                           ",\"running\":" + std::string(running ? "true" : "false") +
+                           ",\"port\":" + std::to_string(dhtPort) +
+                           ",\"nodes_count\":" + std::to_string(nodesCount) +
                            ",\"bootstrap_host\":\"" + jsonEscape(host) + "\",\"bootstrap_port\":" + std::to_string(port) +
                            ",\"source\":\"" + getDhtBootstrapSource() + "\",\"config_path\":\"" + jsonEscape(resolveDhtConfigPath().string()) + "\"}";
         res.set_content(json, "application/json");

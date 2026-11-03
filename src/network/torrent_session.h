@@ -100,6 +100,7 @@ struct TorrentSessionConfig {
     std::uint16_t dht_port = 0;                 // Port UDP cho DHT (0 = dùng listen_port)
     std::string dht_bootstrap_host;             // Địa chỉ node DHT bootstrap
     std::uint16_t dht_bootstrap_port = 0;       // Cổng node DHT bootstrap
+    std::shared_ptr<KademliaNode> shared_dht;   // Node DHT dùng chung giữa các session (nếu có)
     std::string client_peer_id;                 // Tự sinh nếu để rỗng (-PB0001-...)
 };
 
@@ -148,7 +149,8 @@ public:
     [[nodiscard]] std::string info_hash_hex() const;
     [[nodiscard]] const std::string& peer_id() const noexcept;
     [[nodiscard]] std::filesystem::path save_path() const;
-    [[nodiscard]] KademliaNode* dht() noexcept { return dht_.get(); }
+    [[nodiscard]] KademliaNode* dht() noexcept { return dht_shared_ ? dht_shared_.get() : dht_.get(); }
+    [[nodiscard]] const KademliaNode* dht() const noexcept { return dht_shared_ ? dht_shared_.get() : dht_.get(); }
 
     // Thay đổi chiến lược (Piece Picker & Choker)
     void set_piece_picker(std::unique_ptr<strategy::PiecePicker> picker);
@@ -260,6 +262,7 @@ private:
     std::unique_ptr<LocalServiceDiscovery> lsd_;
 
     // DHT (BEP 5)
+    std::shared_ptr<KademliaNode> dht_shared_;
     std::unique_ptr<KademliaNode> dht_;
 
     // Các hàm nội bộ

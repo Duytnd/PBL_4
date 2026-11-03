@@ -21,6 +21,44 @@
         }
       }
     } catch (_) {}
+    loadDhtConfig();
+  }
+
+  async function loadDhtConfig() {
+    try {
+      const res = await fetch('/api/dht/status');
+      if (res.ok) {
+        const data = await res.json();
+        const input = document.getElementById('dht-bootstrap-input');
+        if (input && !input.value.trim() && data.bootstrap_host) {
+          input.value = `${data.bootstrap_host}:${data.bootstrap_port || 6881}`;
+        }
+      }
+    } catch (_) {}
+  }
+
+  async function handleSaveDhtBootstrap() {
+    const input = document.getElementById('dht-bootstrap-input');
+    if (!input || !input.value.trim()) return;
+    const parts = input.value.trim().split(':');
+    const host = parts[0].trim();
+    const port = parts[1] ? parseInt(parts[1].trim(), 10) : 6881;
+    try {
+      setStatus(`Connecting to DHT bootstrap node ${host}:${port}...`);
+      const res = await fetch('/api/dht/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, port })
+      });
+      if (res.ok) {
+        setStatus(`DHT bootstrap connected to ${host}:${port}`, 'success');
+        await syncTorrentsFromServer();
+      } else {
+        setStatus('Failed to set DHT bootstrap', 'error');
+      }
+    } catch (err) {
+      setStatus(`Failed to set DHT bootstrap: ${err.message}`, 'error');
+    }
   }
 
   function showView() {
@@ -396,6 +434,13 @@
     formData.append('announce', announceUrl);
     formData.append('piece_length', String(PIECE_LENGTH));
 
+    const dhtInput = document.getElementById('dht-bootstrap-input');
+    if (dhtInput && dhtInput.value.trim()) {
+      const parts = dhtInput.value.trim().split(':');
+      formData.append('dht_bootstrap_host', parts[0].trim());
+      if (parts[1]) formData.append('dht_bootstrap_port', parts[1].trim());
+    }
+
     const response = await fetch('/api/torrents/create', {
       method: 'POST',
       body: formData,
@@ -466,6 +511,13 @@
       setStatus(`Uploading and starting ${file.name}...`);
       const formData = new FormData();
       formData.append('file', file, file.name);
+
+      const dhtInput = document.getElementById('dht-bootstrap-input');
+      if (dhtInput && dhtInput.value.trim()) {
+        const parts = dhtInput.value.trim().split(':');
+        formData.append('dht_bootstrap_host', parts[0].trim());
+        if (parts[1]) formData.append('dht_bootstrap_port', parts[1].trim());
+      }
       const res = await fetch('/api/torrents/add', {
         method: 'POST',
         body: formData,
@@ -513,6 +565,11 @@
           setTimeout(() => { copyMagnetBtn.textContent = 'Copy Magnet'; }, 2000);
         }
       });
+    }
+
+    const saveDhtBtn = document.getElementById('save-dht-btn');
+    if (saveDhtBtn) {
+      saveDhtBtn.addEventListener('click', handleSaveDhtBootstrap);
     }
 
     if (createTorrentButton) {
