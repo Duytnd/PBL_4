@@ -95,5 +95,31 @@ private:
     std::mt19937 rng_;
 };
 
+
+// Chien luoc chon piece tuan tu (sequential) -- tu index 0 den N-1.
+// Tien cho xem truoc file video: dam bao phan dau san sang som nhat.
+// Luu y: chien luoc nay lam yeu su da dang piece trong mang,
+// chi dung khi muon stream/xem truoc, khong phai che do mac dinh.
+struct SequentialConfig {
+    std::size_t pipeline_depth = 4;
+};
+
+class SequentialPicker : public PiecePicker {
+public:
+    explicit SequentialPicker(SequentialConfig config = SequentialConfig());
+
+    int pick_next_piece(const std::vector<bool>& my_bitfield,
+                        const std::vector<std::vector<bool>>& peers_bitfields) override;
+
+    int pick_piece(const PickerContext& ctx,
+                   const std::vector<bool>& my_bitfield,
+                   const std::vector<std::vector<bool>>& peers_bitfields) override;
+
+    std::size_t pipeline_depth() const override;
+
+private:
+    SequentialConfig config_;
+};
+
 }  // namespace strategy
 }  // namespace p2p

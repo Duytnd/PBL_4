@@ -86,5 +86,39 @@ std::size_t RarestFirstPicker::endgame_max_copies() const {
     return std::max<std::size_t>(1, config_.endgame_max_copies);
 }
 
+
+SequentialPicker::SequentialPicker(SequentialConfig config)
+    : config_(config) {}
+
+int SequentialPicker::pick_next_piece(const std::vector<bool>& my_bitfield,
+                                      const std::vector<std::vector<bool>>& peers_bitfields) {
+    PickerContext empty_ctx;
+    return pick_piece(empty_ctx, my_bitfield, peers_bitfields);
+}
+
+int SequentialPicker::pick_piece(const PickerContext& /*ctx*/,
+                                 const std::vector<bool>& my_bitfield,
+                                 const std::vector<std::vector<bool>>& peers_bitfields) {
+    if (my_bitfield.empty()) return -1;
+    const std::size_t num_pieces = my_bitfield.size();
+
+    // Duyệt tuần tự từ mảnh 0 đến N-1.
+    for (std::size_t i = 0; i < num_pieces; ++i) {
+        if (my_bitfield[i]) continue;  // Mảnh đã có hoặc đang tải
+
+        // Kiểm tra xem có peer nào có mảnh i không (early exit, 0 dynamic allocation)
+        for (const auto& pbf : peers_bitfields) {
+            if (pbf.size() == num_pieces && pbf[i]) {
+                return static_cast<int>(i);
+            }
+        }
+    }
+    return -1;  // không còn gì để tải
+}
+
+std::size_t SequentialPicker::pipeline_depth() const {
+    return std::max<std::size_t>(1, config_.pipeline_depth);
+}
+
 }  // namespace strategy
 }  // namespace p2p

@@ -28,6 +28,30 @@ add_executable(test_choker
 target_include_directories(test_choker PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_choker COMMAND test_choker)
 
+# PeerPolicy (Nguoi 3): gioi han ket noi, ban peer sai hash
+add_executable(test_peer_policy
+    tests/test_peer_policy.cpp
+    src/strategy/peer_policy.cpp
+)
+target_include_directories(test_peer_policy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_peer_policy COMMAND test_peer_policy)
+
+# BandwidthLimiter (Nguoi 3): token-bucket rate limiter
+add_executable(test_bandwidth_limiter
+    tests/test_bandwidth_limiter.cpp
+    src/bench/bandwidth_limiter.cpp
+)
+target_include_directories(test_bandwidth_limiter PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_bandwidth_limiter COMMAND test_bandwidth_limiter)
+
+# Metrics (Nguoi 3): do luong, so sanh chien luoc
+add_executable(test_metrics
+    tests/test_metrics.cpp
+    src/bench/metrics.cpp
+)
+target_include_directories(test_metrics PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_metrics COMMAND test_metrics)
+
 # DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
 add_executable(test_kademlia
     tests/test_kademlia.cpp
@@ -259,6 +283,9 @@ add_executable(test_torrent_session
     src/network/udp_rendezvous.cpp
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
+    src/strategy/peer_policy.cpp
+    src/bench/bandwidth_limiter.cpp
+    src/bench/metrics.cpp
     src/network/lsd.cpp
     src/network/dht/node_id.cpp
     src/network/dht/routing_table.cpp
@@ -340,6 +367,9 @@ set(P2P_CLIENT_SOURCES
     src/network/tracker_protocol.cpp
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
+    src/strategy/peer_policy.cpp
+    src/bench/bandwidth_limiter.cpp
+    src/bench/metrics.cpp
     src/network/lsd.cpp
     src/network/udp_rendezvous.cpp
     src/network/utp_engine.cpp
