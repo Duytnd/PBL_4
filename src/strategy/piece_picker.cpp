@@ -86,5 +86,43 @@ std::size_t RarestFirstPicker::endgame_max_copies() const {
     return std::max<std::size_t>(1, config_.endgame_max_copies);
 }
 
+
+SequentialPicker::SequentialPicker(SequentialConfig config)
+    : config_(config) {}
+
+int SequentialPicker::pick_next_piece(const std::vector<bool>& my_bitfield,
+                                      const std::vector<std::vector<bool>>& peers_bitfields) {
+    PickerContext empty_ctx;
+    return pick_piece(empty_ctx, my_bitfield, peers_bitfields);
+}
+
+int SequentialPicker::pick_piece(const PickerContext& /*ctx*/,
+                                 const std::vector<bool>& my_bitfield,
+                                 const std::vector<std::vector<bool>>& peers_bitfields) {
+    if (my_bitfield.empty()) return -1;
+    const std::size_t num_pieces = my_bitfield.size();
+
+    // Tao bitmask: peer nao dang co piece nao?
+    std::vector<bool> peer_has(num_pieces, false);
+    for (const auto& pbf : peers_bitfields) {
+        if (pbf.size() != num_pieces) continue;
+        for (std::size_t i = 0; i < num_pieces; ++i) {
+            if (pbf[i]) peer_has[i] = true;
+        }
+    }
+
+    // Chon piece nho nhat chua co va it nhat 1 peer dang giu.
+    for (std::size_t i = 0; i < num_pieces; ++i) {
+        if (!my_bitfield[i] && peer_has[i]) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;  // khong con gi de tai
+}
+
+std::size_t SequentialPicker::pipeline_depth() const {
+    return std::max<std::size_t>(1, config_.pipeline_depth);
+}
+
 }  // namespace strategy
 }  // namespace p2p

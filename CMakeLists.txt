@@ -28,6 +28,22 @@ add_executable(test_choker
 target_include_directories(test_choker PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_choker COMMAND test_choker)
 
+# PeerPolicy (Nguoi 3): gioi han ket noi, ban peer sai hash
+add_executable(test_peer_policy
+    tests/test_peer_policy.cpp
+    src/strategy/peer_policy.cpp
+)
+target_include_directories(test_peer_policy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_peer_policy COMMAND test_peer_policy)
+
+# BandwidthLimiter (Nguoi 3): token-bucket rate limiter
+add_executable(test_bandwidth_limiter
+    tests/test_bandwidth_limiter.cpp
+    src/bench/bandwidth_limiter.cpp
+)
+target_include_directories(test_bandwidth_limiter PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_bandwidth_limiter COMMAND test_bandwidth_limiter)
+
 # DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
 add_executable(test_kademlia
     tests/test_kademlia.cpp
