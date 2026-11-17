@@ -45,6 +45,8 @@ public:
     void refill();
 
 private:
+    void refill_internal();  // Hàm nội bộ — caller phải giữ mutex_
+
     mutable std::mutex mutex_;
 
     std::uint64_t rate_;                            // bytes/s (0 = unlimited)

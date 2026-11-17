@@ -26,6 +26,7 @@ void BandwidthLimiter::set_rate(std::uint64_t rate_bytes_per_sec) {
     if (tokens_ > static_cast<double>(bucket_max_)) {
         tokens_ = static_cast<double>(bucket_max_);
     }
+    last_refill_ = std::chrono::steady_clock::now();
 }
 
 std::uint64_t BandwidthLimiter::rate() const {
@@ -34,13 +35,9 @@ std::uint64_t BandwidthLimiter::rate() const {
 }
 
 // ---------------------------------------------------------------------------
-// refill() — public, thread-safe.
-// Nạp token theo thời gian đã trôi qua. Thường không cần gọi tay vì
-// consume() tự nạp trước khi kiểm tra; dùng khi muốn "warm up" bucket
-// sau thời gian dài idle.
+// refill_internal() — caller phải giữ mutex_.
 // ---------------------------------------------------------------------------
-void BandwidthLimiter::refill() {
-    std::lock_guard<std::mutex> lock(mutex_);
+void BandwidthLimiter::refill_internal() {
     if (rate_ == 0) return;
 
     auto now     = std::chrono::steady_clock::now();
@@ -52,6 +49,17 @@ void BandwidthLimiter::refill() {
 }
 
 // ---------------------------------------------------------------------------
+// refill() — public, thread-safe.
+// Nạp token theo thời gian đã trôi qua. Thường không cần gọi tay vì
+// consume() tự nạp trước khi kiểm tra; dùng khi muốn "warm up" bucket
+// sau thời gian dài idle.
+// ---------------------------------------------------------------------------
+void BandwidthLimiter::refill() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    refill_internal();
+}
+
+// ---------------------------------------------------------------------------
 // Tiêu bytes token. Trả true nếu đủ token (hoặc rate=0).
 // ---------------------------------------------------------------------------
 bool BandwidthLimiter::consume(std::uint64_t bytes) {
@@ -60,14 +68,7 @@ bool BandwidthLimiter::consume(std::uint64_t bytes) {
     // rate == 0 → không giới hạn
     if (rate_ == 0) return true;
 
-    // Nạp token theo thời gian trước khi kiểm tra
-    {
-        auto now     = std::chrono::steady_clock::now();
-        double delta = std::chrono::duration<double>(now - last_refill_).count();
-        last_refill_ = now;
-        double added = static_cast<double>(rate_) * delta;
-        tokens_ = std::min(tokens_ + added, static_cast<double>(bucket_max_));
-    }
+    refill_internal();
 
     double needed = static_cast<double>(bytes);
     if (tokens_ >= needed) {

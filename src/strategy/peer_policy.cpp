@@ -9,6 +9,7 @@ PeerPolicy::PeerPolicy(PeerPolicyConfig config)
     : config_(config) {}
 
 bool PeerPolicy::is_banned(const std::string& address) const {
+    if (address.empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     return banned_.count(address) > 0;
 }
@@ -18,6 +19,7 @@ bool PeerPolicy::at_connection_limit(std::size_t current_connections) const {
 }
 
 bool PeerPolicy::report_bad_piece(const std::string& address) {
+    if (address.empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     if (banned_.count(address)) return false;  // đã ban rồi, không cần xử lý lại
 

@@ -102,22 +102,18 @@ int SequentialPicker::pick_piece(const PickerContext& /*ctx*/,
     if (my_bitfield.empty()) return -1;
     const std::size_t num_pieces = my_bitfield.size();
 
-    // Tao bitmask: peer nao dang co piece nao?
-    std::vector<bool> peer_has(num_pieces, false);
-    for (const auto& pbf : peers_bitfields) {
-        if (pbf.size() != num_pieces) continue;
-        for (std::size_t i = 0; i < num_pieces; ++i) {
-            if (pbf[i]) peer_has[i] = true;
-        }
-    }
-
-    // Chon piece nho nhat chua co va it nhat 1 peer dang giu.
+    // Duyệt tuần tự từ mảnh 0 đến N-1.
     for (std::size_t i = 0; i < num_pieces; ++i) {
-        if (!my_bitfield[i] && peer_has[i]) {
-            return static_cast<int>(i);
+        if (my_bitfield[i]) continue;  // Mảnh đã có hoặc đang tải
+
+        // Kiểm tra xem có peer nào có mảnh i không (early exit, 0 dynamic allocation)
+        for (const auto& pbf : peers_bitfields) {
+            if (pbf.size() == num_pieces && pbf[i]) {
+                return static_cast<int>(i);
+            }
         }
     }
-    return -1;  // khong con gi de tai
+    return -1;  // không còn gì để tải
 }
 
 std::size_t SequentialPicker::pipeline_depth() const {

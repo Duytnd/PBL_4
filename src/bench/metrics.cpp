@@ -14,13 +14,34 @@ Metrics::Metrics() : start_time_(std::chrono::steady_clock::now()) {}
 void Metrics::record_downloaded(std::uint64_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     total_downloaded_ += bytes;
-    dl_samples_.push_back({std::chrono::steady_clock::now(), bytes});
+    auto now = std::chrono::steady_clock::now();
+    dl_samples_.push_back({now, bytes});
+
+    // Giới hạn kích thước vector nếu không ai gọi snapshot() trong thời gian dài
+    if (dl_samples_.size() > 200) {
+        auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(kWindowSeconds));
+        dl_samples_.erase(
+            std::remove_if(dl_samples_.begin(), dl_samples_.end(),
+                           [cutoff](const Sample& s) { return s.ts < cutoff; }),
+            dl_samples_.end());
+    }
 }
 
 void Metrics::record_uploaded(std::uint64_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     total_uploaded_ += bytes;
-    ul_samples_.push_back({std::chrono::steady_clock::now(), bytes});
+    auto now = std::chrono::steady_clock::now();
+    ul_samples_.push_back({now, bytes});
+
+    if (ul_samples_.size() > 200) {
+        auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(kWindowSeconds));
+        ul_samples_.erase(
+            std::remove_if(ul_samples_.begin(), ul_samples_.end(),
+                           [cutoff](const Sample& s) { return s.ts < cutoff; }),
+            ul_samples_.end());
+    }
 }
 
 void Metrics::record_piece_completed() {
