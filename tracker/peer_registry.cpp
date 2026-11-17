@@ -31,7 +31,7 @@ bool PeerRegistry::upsert(const std::string& infoHash, const PeerRegistration& p
         entries.erase(oldest);
     }
 
-    entries.push_back(Entry{peer, now});
+    entries.push_back(Entry{peer, now, {}, 0, {}});
     return true;
 }
 
@@ -114,6 +114,73 @@ std::size_t PeerRegistry::peerCount(const std::string& infoHash) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = swarms_.find(infoHash);
     return it == swarms_.end() ? 0 : it->second.size();
+}
+
+bool PeerRegistry::updateUdpEndpoint(
+    const std::string& infoHash,
+    const std::string& peerId,
+    const std::string& sourceIp,
+    std::uint16_t sourcePort,
+    std::uint16_t announcedTcpPort,
+    Clock::time_point now) {
+    if (sourceIp.empty() || sourcePort == 0 || announcedTcpPort == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto swarm = swarms_.find(infoHash);
+    if (swarm == swarms_.end()) {
+        return false;
+    }
+
+    const auto entry = std::find_if(swarm->second.begin(), swarm->second.end(), [&](const Entry& candidate) {
+        return candidate.peer.peerId == peerId;
+    });
+    if (entry == swarm->second.end() || entry->peer.ip != sourceIp ||
+        entry->peer.port != announcedTcpPort ||
+        now - entry->lastSeen > std::chrono::seconds(expirySeconds_)) {
+        return false;
+    }
+
+    entry->udpIp = sourceIp;
+    entry->udpPort = sourcePort;
+    entry->udpLastSeen = now;
+    return true;
+}
+
+std::optional<TrackerPeer> PeerRegistry::getUdpEndpointByTcpEndpoint(
+    const std::string& infoHash,
+    const std::string& requesterPeerId,
+    const std::string& requesterIp,
+    const std::string& targetIp,
+    std::uint16_t targetTcpPort,
+    Clock::time_point now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto swarm = swarms_.find(infoHash);
+    if (swarm == swarms_.end()) {
+        return std::nullopt;
+    }
+
+    const auto& entries = swarm->second;
+    const auto requester = std::find_if(entries.begin(), entries.end(), [&](const Entry& candidate) {
+        return candidate.peer.peerId == requesterPeerId && candidate.peer.ip == requesterIp &&
+               now - candidate.lastSeen <= std::chrono::seconds(expirySeconds_);
+    });
+    if (requester == entries.end()) {
+        return std::nullopt;
+    }
+
+    const auto target = std::find_if(entries.begin(), entries.end(), [&](const Entry& candidate) {
+        return candidate.peer.peerId != requesterPeerId && candidate.peer.ip == targetIp &&
+               candidate.peer.port == targetTcpPort && candidate.udpPort != 0 &&
+               now - candidate.udpLastSeen <= std::chrono::seconds(120) &&
+               now - candidate.lastSeen <= std::chrono::seconds(expirySeconds_);
+    });
+    if (target == entries.end()) {
+        return std::nullopt;
+    }
+
+    return TrackerPeer{target->udpIp, target->udpPort};
 }
 
 }  // namespace p2p

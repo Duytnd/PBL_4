@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,11 +50,28 @@ public:
 
     [[nodiscard]] bool hasPeer(const std::string& infoHash, const std::string& peerId) const;
     [[nodiscard]] std::size_t peerCount(const std::string& infoHash) const;
+    bool updateUdpEndpoint(
+        const std::string& infoHash,
+        const std::string& peerId,
+        const std::string& sourceIp,
+        std::uint16_t sourcePort,
+        std::uint16_t announcedTcpPort,
+        Clock::time_point now = Clock::now());
+    [[nodiscard]] std::optional<TrackerPeer> getUdpEndpointByTcpEndpoint(
+        const std::string& infoHash,
+        const std::string& requesterPeerId,
+        const std::string& requesterIp,
+        const std::string& targetIp,
+        std::uint16_t targetTcpPort,
+        Clock::time_point now = Clock::now()) const;
 
 private:
     struct Entry {
         PeerRegistration peer;
         Clock::time_point lastSeen;
+        std::string udpIp;
+        std::uint16_t udpPort = 0;
+        Clock::time_point udpLastSeen{};
     };
 
     int expirySeconds_;

@@ -547,8 +547,12 @@ void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
         config.enable_lsd = true;
         config.enable_dht = parseBoolField(req.form, "enable_dht", true);
         const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
-        config.dht_bootstrap_host = defaultDhtHost;
-        config.dht_bootstrap_port = defaultDhtPort;
+        config.dht_bootstrap_host = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
+        config.dht_bootstrap_port = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
+        if (config.enable_dht) {
+            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
+                6881, config.dht_bootstrap_host, config.dht_bootstrap_port);
+        }
 
         network::MagnetResolveOptions resolveOptions;
         resolveOptions.peer_id = TrackerClient::makePeerId();

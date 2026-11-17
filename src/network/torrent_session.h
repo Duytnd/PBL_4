@@ -28,6 +28,12 @@ class LocalServiceDiscovery;
 struct LsdPeer;
 }
 
+namespace pbl4::network {
+class NatTraversal;
+class UtpEngine;
+class UtpStream;
+}
+
 namespace p2p::network {
 
 // Trạng thái hoạt động của TorrentSession
@@ -98,6 +104,8 @@ struct TorrentSessionConfig {
     bool enable_tracker = true;                 // Cho phép announce tới tracker nếu có URL
     bool enable_lsd = true;                     // Tự tìm kiếm peer qua LSD (BEP 14)
     bool enable_dht = true;                     // Tự tìm kiếm peer qua DHT (BEP 5)
+    bool enable_port_mapping = true;            // Tự mở cổng peer qua UPnP/NAT-PMP nếu router hỗ trợ
+    bool enable_utp = true;                     // uTP + UDP hole-punch fallback qua tracker
     std::uint16_t dht_port = 0;                 // Port UDP cho DHT (0 = dùng listen_port)
     std::string dht_bootstrap_host;             // Địa chỉ node DHT bootstrap
     std::uint16_t dht_bootstrap_port = 0;       // Cổng node DHT bootstrap
@@ -166,6 +174,7 @@ private:
     // Cấu hình & Metadata
     TorrentFileMetadata metadata_;
     TorrentSessionConfig config_;
+    std::atomic<std::uint16_t> advertised_port_{0};
     std::string peer_id_;
     std::string info_hash_raw_;    // 20 bytes binary
     std::string info_hash_hex_;    // 40 ký tự hex
@@ -180,6 +189,14 @@ private:
     // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
     std::atomic<int> announce_inflight_{0};
     std::thread dht_init_thread_;
+    std::thread nat_init_thread_;
+    std::atomic<bool> nat_mapping_initialization_done_{false};
+    std::shared_ptr<pbl4::network::UtpEngine> utp_engine_;
+    asio::ip::udp::endpoint tracker_udp_endpoint_;
+    std::chrono::steady_clock::time_point next_udp_registration_;
+    std::atomic<std::uint32_t> next_rendezvous_transaction_{1};
+    std::unordered_map<std::uint32_t, std::string> pending_rendezvous_targets_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_rendezvous_request_;
     SessionState state_{SessionState::Stopped};
     std::string error_message_;
 
@@ -238,7 +255,10 @@ private:
 
     std::unordered_map<std::string, std::shared_ptr<ActivePeer>> active_peers_;
     std::unordered_set<std::string> known_peer_endpoints_;
+    std::unordered_set<std::string> discovered_tcp_peer_endpoints_;
     std::vector<std::string> candidate_peer_endpoints_;
+    std::vector<std::string> utp_peer_candidates_;
+    std::unordered_set<std::string> queued_utp_peer_endpoints_;
 
     // Quản lý block đang xin (In-flight block requests)
     struct PendingBlock {
@@ -267,6 +287,12 @@ private:
     // LSD
     std::unique_ptr<LocalServiceDiscovery> lsd_;
 
+    // NAT port mapping for inbound peer connections
+    std::unique_ptr<pbl4::network::NatTraversal> nat_traversal_;
+    bool tcp_port_mapped_{false};
+    std::uint16_t mapped_tcp_port_{0};
+    std::chrono::steady_clock::time_point next_port_mapping_refresh_;
+
     // DHT (BEP 5)
     std::shared_ptr<KademliaNode> dht_shared_;
     std::unique_ptr<KademliaNode> dht_;
@@ -276,11 +302,19 @@ private:
     void check_existing_files();
     void orchestration_loop();
     void acceptor_loop();
+    void accept_utp_stream(std::shared_ptr<pbl4::network::UtpStream> stream);
     void peer_worker_loop(std::shared_ptr<ActivePeer> peer);
 
     void process_tracker_announce(const std::string& event);
     void perform_choker_update();
     void connect_candidate_peers();
+    void connect_utp_candidates();
+    void send_udp_registration();
+    void request_peer_holepunch(const std::string& ip, std::uint16_t tcp_port);
+    bool handle_rendezvous_datagram(
+        const char* data,
+        std::size_t size,
+        const asio::ip::udp::endpoint& source);
     void cleanup_disconnected_peers();
     void update_rates();
 

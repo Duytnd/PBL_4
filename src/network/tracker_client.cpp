@@ -120,4 +120,13 @@ TrackerResponse TrackerClient::announceHttp(const std::string& announceUrl, cons
     throw std::runtime_error("TrackerClient: tracker announce failed after retries");
 }
 
+std::pair<std::string, std::uint16_t> TrackerClient::udpRendezvousEndpoint(
+    const std::string& announceUrl) {
+    const ParsedUrl url = parseHttpUrl(announceUrl);
+    if (url.port <= 0 || url.port > 65535) {
+        throw std::invalid_argument("TrackerClient: announce port is outside the UDP range");
+    }
+    return {url.host, static_cast<std::uint16_t>(url.port)};
+}
+
 }  // namespace p2p

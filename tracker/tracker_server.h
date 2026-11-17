@@ -4,6 +4,7 @@
 #include "tracker/peer_registry.h"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,18 @@ public:
     bool addPeer(const std::string& infoHash, const PeerRegistration& peer);
     void removePeer(const std::string& infoHash, const std::string& peerId);
     std::string announce(const TrackerRequest& request);
+    bool registerUdpEndpoint(
+        const std::string& infoHash,
+        const std::string& peerId,
+        const std::string& sourceIp,
+        std::uint16_t sourcePort,
+        std::uint16_t announcedTcpPort);
+    [[nodiscard]] std::optional<TrackerPeer> rendezvousEndpoint(
+        const std::string& infoHash,
+        const std::string& requesterPeerId,
+        const std::string& requesterIp,
+        const std::string& targetIp,
+        std::uint16_t targetTcpPort) const;
 
     [[nodiscard]] std::vector<TrackerPeer> getPeers(const std::string& infoHash) const;
     [[nodiscard]] bool hasPeer(const std::string& infoHash, const std::string& peerId) const;

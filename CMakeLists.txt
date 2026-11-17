@@ -57,6 +57,31 @@ if(WIN32)
     target_link_libraries(lsd_lib PRIVATE ws2_32)
 endif()
 
+add_library(libutp STATIC
+    third_party/libutp/utp_internal.cpp
+    third_party/libutp/utp_utils.cpp
+    third_party/libutp/utp_hash.cpp
+    third_party/libutp/utp_callbacks.cpp
+    third_party/libutp/utp_api.cpp
+    third_party/libutp/utp_packedsockaddr.cpp
+)
+target_include_directories(libutp PUBLIC ${CMAKE_SOURCE_DIR}/third_party/libutp)
+set_target_properties(libutp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(UNIX)
+    target_compile_definitions(libutp PRIVATE POSIX)
+endif()
+if(WIN32)
+    target_link_libraries(libutp PUBLIC ws2_32)
+endif()
+
+add_library(p2p_utp STATIC src/network/utp_engine.cpp)
+target_include_directories(p2p_utp PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+    ${CMAKE_SOURCE_DIR}/third_party/libutp
+)
+target_link_libraries(p2p_utp PUBLIC libutp Threads::Threads)
+
 add_executable(test_bencode
     tests/test_bencode.cpp
     src/core/bencode.cpp
@@ -130,6 +155,7 @@ add_executable(test_tracker_protocol
     tests/test_tracker_protocol.cpp
     src/core/bencode.cpp
     src/network/tracker_protocol.cpp
+    src/network/udp_rendezvous.cpp
     src/network/tracker_client.cpp
     tracker/tracker_server.cpp
     tracker/peer_registry.cpp
@@ -176,6 +202,7 @@ target_include_directories(test_peer_connection PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
 target_link_libraries(test_peer_connection PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(test_peer_connection PRIVATE p2p_utp)
 if(WIN32)
     target_link_libraries(test_peer_connection PRIVATE ws2_32 crypt32)
 endif()
@@ -229,6 +256,7 @@ add_executable(test_torrent_session
     src/core/path_sanitizer.cpp
     src/network/tracker_client.cpp
     src/network/tracker_protocol.cpp
+    src/network/udp_rendezvous.cpp
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
     src/network/lsd.cpp
@@ -244,6 +272,7 @@ target_include_directories(test_torrent_session PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party
 )
 target_link_libraries(test_torrent_session PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(test_torrent_session PRIVATE p2p_utp)
 if(WIN32)
     target_link_libraries(test_torrent_session PRIVATE ws2_32 crypt32)
 endif()
@@ -263,6 +292,7 @@ target_include_directories(peer_wire_tool PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
 target_link_libraries(peer_wire_tool PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(peer_wire_tool PRIVATE p2p_utp)
 if(WIN32)
     target_link_libraries(peer_wire_tool PRIVATE ws2_32 crypt32)
 endif()
@@ -311,6 +341,8 @@ set(P2P_CLIENT_SOURCES
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
     src/network/lsd.cpp
+    src/network/udp_rendezvous.cpp
+    src/network/utp_engine.cpp
     src/network/dht/node_id.cpp
     src/network/dht/routing_table.cpp
     src/network/dht/krpc.cpp
@@ -324,6 +356,7 @@ target_include_directories(p2p_client PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
 target_link_libraries(p2p_client PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(p2p_client PRIVATE p2p_utp)
 if(WIN32)
     target_link_libraries(p2p_client PRIVATE ws2_32 crypt32)
 endif()
@@ -336,9 +369,14 @@ add_executable(p2p_tracker
     tracker/peer_registry.cpp
     src/core/bencode.cpp
     src/network/tracker_protocol.cpp
+    src/network/udp_rendezvous.cpp
 )
 
-target_include_directories(p2p_tracker PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
+target_include_directories(p2p_tracker PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
 target_include_directories(p2p_tracker PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(p2p_tracker PRIVATE Threads::Threads)
 

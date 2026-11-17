@@ -1,4 +1,5 @@
 #include "peer_connection.h"
+#include "network/utp_engine.h"
 
 #include <algorithm>
 #include <system_error>
@@ -14,6 +15,19 @@ PeerConnection::PeerConnection(asio::ip::tcp::socket socket,
 	update_endpoint_info();
 }
 
+PeerConnection::PeerConnection(
+	std::shared_ptr<UtpStream> stream,
+	std::chrono::milliseconds io_timeout)
+	: owned_ioc_(std::make_unique<asio::io_context>()),
+	  socket_(*owned_ioc_),
+	  utp_stream_(std::move(stream)),
+	  io_timeout_(io_timeout) {
+	if (io_timeout_.count() < 0 || !utp_stream_) {
+		throw std::invalid_argument("uTP connection and nonnegative timeout are required");
+	}
+	update_endpoint_info();
+}
+
 PeerConnection::~PeerConnection() {
 	close();
 }
@@ -21,6 +35,7 @@ PeerConnection::~PeerConnection() {
 PeerConnection::PeerConnection(PeerConnection&& other) noexcept
 	: owned_ioc_(std::move(other.owned_ioc_)),
 	  socket_(std::move(other.socket_)),
+	  utp_stream_(std::move(other.utp_stream_)),
 	  io_timeout_(other.io_timeout_),
 	  am_choking_(other.am_choking_),
 	  am_interested_(other.am_interested_),
@@ -42,6 +57,7 @@ PeerConnection& PeerConnection::operator=(PeerConnection&& other) noexcept {
 		close();
 		owned_ioc_ = std::move(other.owned_ioc_);
 		socket_ = std::move(other.socket_);
+		utp_stream_ = std::move(other.utp_stream_);
 		io_timeout_ = other.io_timeout_;
 		am_choking_ = other.am_choking_;
 		am_interested_ = other.am_interested_;
@@ -113,6 +129,16 @@ PeerConnection PeerConnection::connect_to(const std::string& host, std::uint16_t
 	PeerConnection connection(std::move(socket), io_timeout);
 	connection.owned_ioc_ = std::move(ioc);
 	return connection;
+}
+
+PeerConnection PeerConnection::connect_utp_to(
+	const std::shared_ptr<UtpEngine>& engine,
+	const asio::ip::udp::endpoint& endpoint,
+	std::chrono::milliseconds io_timeout) {
+	if (!engine || io_timeout.count() < 0) {
+		throw std::invalid_argument("uTP engine and nonnegative timeout are required");
+	}
+	return PeerConnection(engine->connect_to(endpoint, io_timeout), io_timeout);
 }
 
 void PeerConnection::send_handshake(const PeerHandshake& handshake) {
@@ -251,6 +277,10 @@ void PeerConnection::send_port(std::uint16_t port) {
 }
 
 void PeerConnection::close() noexcept {
+	if (utp_stream_) {
+		utp_stream_->close();
+		return;
+	}
 	if (socket_.is_open()) {
 		asio::error_code ec;
 		socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -259,10 +289,13 @@ void PeerConnection::close() noexcept {
 }
 
 bool PeerConnection::is_open() const noexcept {
-	return socket_.is_open();
+	return utp_stream_ ? utp_stream_->is_open() : socket_.is_open();
 }
 
 PeerConnection::NativeSocket PeerConnection::native_handle() noexcept {
+	if (utp_stream_) {
+		return kInvalidSocket;
+	}
 	if (socket_.is_open()) {
 #ifdef _WIN32
 		return static_cast<NativeSocket>(static_cast<SOCKET>(socket_.native_handle()));
@@ -290,6 +323,13 @@ std::chrono::milliseconds PeerConnection::io_timeout() const noexcept {
 }
 
 void PeerConnection::update_endpoint_info() {
+	if (utp_stream_) {
+		const auto& endpoint = utp_stream_->remote_endpoint();
+		remote_address_str_ = endpoint.address().to_string();
+		remote_port_ = endpoint.port();
+		remote_endpoint_str_ = remote_address_str_ + ":" + std::to_string(remote_port_);
+		return;
+	}
 	if (socket_.is_open()) {
 		asio::error_code ec;
 		auto endpoint = socket_.remote_endpoint(ec);
@@ -315,6 +355,15 @@ void PeerConnection::send_all(const Byte* data, std::size_t size) {
 		encrypted_buf.assign(data, data + size);
 		mse_->encrypt_send(encrypted_buf.data(), size);
 		send_ptr = encrypted_buf.data();
+	}
+	if (utp_stream_) {
+		try {
+			utp_stream_->send_all(reinterpret_cast<const char*>(send_ptr), size, io_timeout_);
+		} catch (...) {
+			close();
+			throw;
+		}
+		return;
 	}
 
 	auto& ioc = static_cast<asio::io_context&>(socket_.get_executor().context());
@@ -359,6 +408,18 @@ void PeerConnection::receive_exact(Byte* data, std::size_t size) {
 		throw PeerConnectionClosedError("connection is closed");
 	}
 	if (size == 0) {
+		return;
+	}
+	if (utp_stream_) {
+		try {
+			utp_stream_->receive_exact(reinterpret_cast<char*>(data), size, io_timeout_);
+		} catch (...) {
+			close();
+			throw;
+		}
+		if (mse_ && mse_->is_active()) {
+			mse_->decrypt_recv(data, size);
+		}
 		return;
 	}
 
@@ -419,11 +480,11 @@ bool PeerConnection::perform_mse_handshake_outbound(
 		// 1. Gửi Ya (96 byte)
 		const auto step1 = mse_->make_initiator_step1(0);
 		Bytes raw_step1(step1.begin(), step1.end());
-		asio::write(socket_, asio::buffer(raw_step1));
+		send_all(raw_step1.data(), raw_step1.size());
 
 		// 2. Nhận Yb (96 byte)
 		Bytes yb(kDhKeySize);
-		asio::read(socket_, asio::buffer(yb.data(), yb.size()));
+		receive_exact(yb.data(), yb.size());
 
 		// 3. Tính secret S
 		if (!mse_->compute_secret(yb.data(), yb.size())) {
@@ -432,11 +493,11 @@ bool PeerConnection::perform_mse_handshake_outbound(
 
 		// 4. Gửi Step 3: req1 + hash_skey + Encrypted(VC + ...)
 		const auto step3 = mse_->make_initiator_step3(info_hash, preferred_crypto, {}, 0);
-		asio::write(socket_, asio::buffer(step3));
+		send_all(step3.data(), step3.size());
 
 		// 5. Nhận Step 4: 14 byte (VC + crypto_select + len(PadD))
 		Bytes step4(14);
-		asio::read(socket_, asio::buffer(step4.data(), step4.size()));
+		receive_exact(step4.data(), step4.size());
 
 		EncryptionCrypto selected = EncryptionCrypto::None;
 		if (!mse_->parse_receiver_step4(step4.data(), step4.size(), selected)) {
@@ -466,7 +527,7 @@ bool PeerConnection::perform_mse_handshake_inbound(
 
 		// 1. Nhận Ya (96 byte)
 		Bytes ya(kDhKeySize);
-		asio::read(socket_, asio::buffer(ya.data(), ya.size()));
+		receive_exact(ya.data(), ya.size());
 
 		// 2. Tính secret S
 		if (!mse_->compute_secret(ya.data(), ya.size())) {
@@ -475,11 +536,11 @@ bool PeerConnection::perform_mse_handshake_inbound(
 
 		// 3. Gửi Yb (96 byte)
 		const auto step2 = mse_->make_receiver_step2(0);
-		asio::write(socket_, asio::buffer(step2));
+		send_all(step2.data(), step2.size());
 
 		// 4. Nhận Step 3: 54 byte (req1 (20) + hash_skey (20) + VC (8) + crypto (4) + pad_len (2))
 		Bytes step3(54);
-		asio::read(socket_, asio::buffer(step3.data(), step3.size()));
+		receive_exact(step3.data(), step3.size());
 
 		EncryptionCrypto provided = EncryptionCrypto::None;
 		Bytes initial_payload;
@@ -490,7 +551,7 @@ bool PeerConnection::perform_mse_handshake_inbound(
 
 		// 5. Gửi Step 4: Encrypted(VC + crypto_select + PadD)
 		const auto step4 = mse_->make_receiver_step4(EncryptionCrypto::RC4, 0);
-		asio::write(socket_, asio::buffer(step4));
+		send_all(step4.data(), step4.size());
 
 		mse_->set_active(true);
 		return true;

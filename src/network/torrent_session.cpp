@@ -3,6 +3,9 @@
 #include "core/hash_utils.h"
 #include "network/extension.h"
 #include "network/lsd.h"
+#include "network/nat_traversal.h"
+#include "network/udp_rendezvous.h"
+#include "network/utp_engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -49,7 +52,8 @@ TorrentSession::TorrentSession(
     const TorrentFileMetadata& metadata,
     const TorrentSessionConfig& config)
     : metadata_(metadata),
-      config_(config) {
+            config_(config),
+            advertised_port_(config.listen_port) {
     if (config_.client_peer_id.empty()) {
         peer_id_ = generate_azureus_peer_id();
     } else {
@@ -189,8 +193,99 @@ bool TorrentSession::start() {
         return false;
     }
 
+    advertised_port_.store(config_.listen_port);
+    tcp_port_mapped_ = false;
+    mapped_tcp_port_ = 0;
+    nat_mapping_initialization_done_.store(!config_.enable_port_mapping);
+
     running_ = true;
     paused_ = false;
+
+    if (config_.enable_port_mapping) {
+        nat_init_thread_ = std::thread([this]() {
+            struct InitGuard {
+                std::atomic<bool>& done;
+                ~InitGuard() { done.store(true); }
+            } guard{nat_mapping_initialization_done_};
+
+            try {
+                auto nat = std::make_unique<pbl4::network::NatTraversal>();
+                if (!nat->discover(std::chrono::milliseconds(600))) {
+                    std::cout << "[NAT] No UPnP/NAT-PMP gateway found; inbound peer connections may require manual port forwarding"
+                              << std::endl;
+                    return;
+                }
+
+                const auto mapping = nat->map_port(
+                    config_.listen_port, 0, pbl4::network::NatProtocol::TCP);
+                if (!mapping.success) {
+                    std::cout << "[NAT] Could not map TCP peer port " << config_.listen_port
+                              << ": " << mapping.message << std::endl;
+                    return;
+                }
+                if (!running_) {
+                    nat->unmap_port(mapping.external_port, pbl4::network::NatProtocol::TCP);
+                    return;
+                }
+
+                advertised_port_.store(mapping.external_port);
+                mapped_tcp_port_ = mapping.external_port;
+                tcp_port_mapped_ = true;
+                next_port_mapping_refresh_ =
+                    std::chrono::steady_clock::now() + std::chrono::minutes(30);
+                nat_traversal_ = std::move(nat);
+                std::cout << "[NAT] TCP peer port mapped: " << config_.listen_port
+                          << " -> " << advertised_port_.load()
+                          << " | external IP=" << mapping.external_ip
+                          << " | " << mapping.message << std::endl;
+            } catch (const std::exception& ex) {
+                std::cout << "[NAT] Port mapping unavailable: " << ex.what() << std::endl;
+            }
+        });
+    }
+
+    if (config_.enable_utp && config_.enable_tracker && !metadata_.announce.empty()) {
+        try {
+            const auto [tracker_host, tracker_port] =
+                TrackerClient::udpRendezvousEndpoint(metadata_.announce);
+            asio::io_context resolver_ioc;
+            asio::ip::udp::resolver resolver(resolver_ioc);
+            asio::error_code resolve_ec;
+            const auto endpoints = resolver.resolve(
+                tracker_host, std::to_string(tracker_port), resolve_ec);
+            if (resolve_ec) {
+                throw std::runtime_error("tracker UDP resolve failed: " + resolve_ec.message());
+            }
+
+            bool found_ipv4 = false;
+            for (const auto& entry : endpoints) {
+                if (entry.endpoint().address().is_v4()) {
+                    tracker_udp_endpoint_ = entry.endpoint();
+                    found_ipv4 = true;
+                    break;
+                }
+            }
+            if (!found_ipv4) {
+                throw std::runtime_error("tracker has no IPv4 UDP endpoint");
+            }
+
+            utp_engine_ = std::make_shared<pbl4::network::UtpEngine>();
+            utp_engine_->set_accept_handler([this](std::shared_ptr<pbl4::network::UtpStream> stream) {
+                accept_utp_stream(std::move(stream));
+            });
+            utp_engine_->set_datagram_handler(
+                [this](const char* data, std::size_t size, const asio::ip::udp::endpoint& source) {
+                    return handle_rendezvous_datagram(data, size, source);
+                });
+            utp_engine_->start();
+            next_udp_registration_ = std::chrono::steady_clock::now();
+            std::cout << "[uTP] UDP transport started on local port " << utp_engine_->local_port()
+                      << "; tracker rendezvous at " << tracker_udp_endpoint_ << std::endl;
+        } catch (const std::exception& ex) {
+            utp_engine_.reset();
+            std::cout << "[uTP] UDP rendezvous unavailable: " << ex.what() << std::endl;
+        }
+    }
 
     if (completed_pieces_count_ == metadata_.pieces.size() && !metadata_.pieces.empty()) {
         set_state(SessionState::Seeding);
@@ -249,8 +344,12 @@ bool TorrentSession::start() {
                         }
                     }
 
+                    while (running_ && config_.enable_port_mapping &&
+                           !nat_mapping_initialization_done_.load()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
                     if (running_) {
-                        d->announcePeer(info_hash_raw_, config_.listen_port);
+                        d->announcePeer(info_hash_raw_, advertised_port_.load());
                     }
                 });
             } else {
@@ -276,8 +375,12 @@ bool TorrentSession::start() {
                             }
                         }
 
+                        while (running_ && config_.enable_port_mapping &&
+                               !nat_mapping_initialization_done_.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        }
                         if (running_) {
-                            dht_->announcePeer(info_hash_raw_, config_.listen_port);
+                            dht_->announcePeer(info_hash_raw_, advertised_port_.load());
                         }
                     });
                 } else {
@@ -355,6 +458,14 @@ void TorrentSession::stop() {
         orchestration_thread_.join();
     }
 
+    if (nat_init_thread_.joinable()) {
+        nat_init_thread_.join();
+    }
+
+    if (utp_engine_) {
+        utp_engine_->stop();
+    }
+
     // Đợi và dọn dẹp các worker threads của peer
     std::unordered_map<std::string, std::shared_ptr<ActivePeer>> peers_to_join;
     {
@@ -368,12 +479,27 @@ void TorrentSession::stop() {
         }
     }
 
+    if (nat_traversal_ && tcp_port_mapped_) {
+        try {
+            if (nat_traversal_->unmap_port(mapped_tcp_port_, pbl4::network::NatProtocol::TCP)) {
+                std::cout << "[NAT] Removed TCP peer port mapping " << mapped_tcp_port_ << std::endl;
+            } else {
+                std::cout << "[NAT] Could not remove TCP peer port mapping " << mapped_tcp_port_ << std::endl;
+            }
+        } catch (const std::exception& ex) {
+            std::cout << "[NAT] Failed to remove TCP peer port mapping: " << ex.what() << std::endl;
+        }
+        tcp_port_mapped_ = false;
+    }
+
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         active_peers_.clear();
         in_progress_pieces_.clear();
         pending_blocks_.clear();
         lsd_.reset();
+        nat_traversal_.reset();
+        utp_engine_.reset();
         dht_.reset();
     }
 }
@@ -435,6 +561,7 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
         }
 
         const std::string ep = ip + ":" + std::to_string(port);
+        discovered_tcp_peer_endpoints_.insert(ep);
         bool is_new = false;
         if (known_peer_endpoints_.insert(ep).second) {
             candidate_peer_endpoints_.push_back(ep);
@@ -449,6 +576,119 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     if (running_ && !paused_) {
         connect_candidate_peers();
     }
+}
+
+void TorrentSession::send_udp_registration() {
+    if (!utp_engine_ || !running_ || tracker_udp_endpoint_.port() == 0 ||
+        (config_.enable_port_mapping && !nat_mapping_initialization_done_.load())) {
+        return;
+    }
+    try {
+        utp_engine_->send_datagram(
+            tracker_udp_endpoint_,
+            udp_rendezvous::encode_register_request(
+                info_hash_raw_, peer_id_, advertised_port_.load()));
+    } catch (const std::exception& ex) {
+        std::cout << "[uTP] UDP registration failed: " << ex.what() << std::endl;
+    }
+}
+
+void TorrentSession::request_peer_holepunch(const std::string& ip, std::uint16_t tcp_port) {
+    if (!utp_engine_ || !running_ || tracker_udp_endpoint_.port() == 0 || tcp_port == 0) {
+        return;
+    }
+    const std::string tcp_endpoint = ip + ":" + std::to_string(tcp_port);
+    const auto now = std::chrono::steady_clock::now();
+    const std::uint32_t transaction = next_rendezvous_transaction_.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (discovered_tcp_peer_endpoints_.find(tcp_endpoint) == discovered_tcp_peer_endpoints_.end()) {
+            return;
+        }
+        const auto previous = last_rendezvous_request_.find(tcp_endpoint);
+        if (previous != last_rendezvous_request_.end() &&
+            now - previous->second < std::chrono::seconds(10)) {
+            return;
+        }
+        last_rendezvous_request_[tcp_endpoint] = now;
+        pending_rendezvous_targets_[transaction] = tcp_endpoint;
+        if (last_rendezvous_request_.size() > 512) {
+            for (auto it = last_rendezvous_request_.begin(); it != last_rendezvous_request_.end();) {
+                if (now - it->second > std::chrono::minutes(1)) {
+                    it = last_rendezvous_request_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    try {
+        utp_engine_->send_datagram(
+            tracker_udp_endpoint_,
+            udp_rendezvous::encode_punch_request(
+                info_hash_raw_, peer_id_, advertised_port_.load(), ip, tcp_port, transaction));
+        send_udp_registration();
+        std::cout << "[uTP] Requested UDP rendezvous for " << tcp_endpoint << std::endl;
+    } catch (const std::exception& ex) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        pending_rendezvous_targets_.erase(transaction);
+        std::cout << "[uTP] Hole-punch request failed: " << ex.what() << std::endl;
+    }
+}
+
+bool TorrentSession::handle_rendezvous_datagram(
+    const char* data,
+    std::size_t size,
+    const asio::ip::udp::endpoint& source) {
+    if (!data || size < 4 || std::memcmp(data, "P4UT", 4) != 0) {
+        return false;
+    }
+    if (source != tracker_udp_endpoint_) {
+        return true;
+    }
+
+    udp_rendezvous::Result result;
+    if (udp_rendezvous::decode_punch_result(data, size, result)) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (result.info_hash != info_hash_raw_) {
+            return true;
+        }
+        const auto pending = pending_rendezvous_targets_.find(result.transaction_id);
+        if (pending == pending_rendezvous_targets_.end()) {
+            return true;
+        }
+        const std::string expected_tcp_endpoint = pending->second;
+        pending_rendezvous_targets_.erase(pending);
+        const auto colon = expected_tcp_endpoint.find(':');
+        if (result.status == udp_rendezvous::Status::Ok &&
+            colon != std::string::npos &&
+            result.ip == expected_tcp_endpoint.substr(0, colon)) {
+            const std::string endpoint = result.ip + ":" + std::to_string(result.port);
+            if (queued_utp_peer_endpoints_.insert(endpoint).second &&
+                utp_peer_candidates_.size() < config_.max_connections * 2) {
+                utp_peer_candidates_.push_back(endpoint);
+            }
+        }
+        return true;
+    }
+
+    udp_rendezvous::Notification notification;
+    if (udp_rendezvous::decode_notification(data, size, notification)) {
+        if (notification.info_hash != info_hash_raw_) {
+            return true;
+        }
+        const std::string tcp_endpoint = notification.tcp_ip + ":" + std::to_string(notification.tcp_port);
+        const std::string endpoint = notification.ip + ":" + std::to_string(notification.port);
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (discovered_tcp_peer_endpoints_.find(tcp_endpoint) != discovered_tcp_peer_endpoints_.end() &&
+            queued_utp_peer_endpoints_.insert(endpoint).second &&
+            utp_peer_candidates_.size() < config_.max_connections * 2) {
+            utp_peer_candidates_.push_back(endpoint);
+        }
+        return true;
+    }
+    return true;
 }
 
 void TorrentSession::announce_tracker(const std::string& event) {
@@ -582,6 +822,14 @@ void TorrentSession::on_torrent_finished(TorrentFinishedCallback cb) {
 }
 
 void TorrentSession::orchestration_loop() {
+    while (running_ && config_.enable_port_mapping &&
+           !nat_mapping_initialization_done_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!running_) {
+        return;
+    }
+
     if (config_.enable_tracker) {
         process_tracker_announce("started");
     }
@@ -595,10 +843,35 @@ void TorrentSession::orchestration_loop() {
         if (!paused_) {
             const auto now = std::chrono::steady_clock::now();
 
+            if (nat_traversal_ && tcp_port_mapped_ && now >= next_port_mapping_refresh_) {
+                try {
+                    const auto mapping = nat_traversal_->map_port(
+                        config_.listen_port, mapped_tcp_port_, pbl4::network::NatProtocol::TCP);
+                    if (mapping.success && mapping.external_port == mapped_tcp_port_) {
+                        std::cout << "[NAT] Refreshed TCP peer port mapping " << mapped_tcp_port_ << std::endl;
+                        next_port_mapping_refresh_ = now + std::chrono::minutes(30);
+                    } else {
+                        std::cout << "[NAT] Failed to refresh TCP peer port mapping: "
+                                  << mapping.message << std::endl;
+                        next_port_mapping_refresh_ = now + std::chrono::minutes(5);
+                    }
+                } catch (const std::exception& ex) {
+                    std::cout << "[NAT] Failed to refresh TCP peer port mapping: "
+                              << ex.what() << std::endl;
+                    next_port_mapping_refresh_ = now + std::chrono::minutes(5);
+                }
+            }
+
             // 1. Cập nhật tốc độ & bảo trì kết nối mỗi giây
             update_rates();
             cleanup_disconnected_peers();
             connect_candidate_peers();
+            connect_utp_candidates();
+
+            if (utp_engine_ && now >= next_udp_registration_) {
+                send_udp_registration();
+                next_udp_registration_ = now + std::chrono::seconds(20);
+            }
 
             // 2. Chạy thuật toán chia băng thông (Tit-for-tat)
             if (now - last_choker_time >= config_.choker_interval) {
@@ -631,7 +904,7 @@ void TorrentSession::orchestration_loop() {
                     for (const auto& p : dht_peers) {
                         add_peer(p.ip, p.port);
                     }
-                    d->announcePeer(info_hash_raw_, config_.listen_port);
+                    d->announcePeer(info_hash_raw_, advertised_port_.load());
                     last_dht_time = now;
                 }
             }
@@ -686,6 +959,35 @@ void TorrentSession::acceptor_loop() {
     }
 }
 
+void TorrentSession::accept_utp_stream(std::shared_ptr<pbl4::network::UtpStream> stream) {
+    if (!stream || !running_ || paused_) {
+        if (stream) stream->close();
+        return;
+    }
+
+    auto peer = std::make_shared<ActivePeer>();
+    peer->connection = std::make_shared<pbl4::network::PeerConnection>(
+        std::move(stream), config_.peer_timeout);
+    peer->ip = peer->connection->remote_address();
+    peer->port = peer->connection->remote_port();
+    peer->endpoint_str = peer->ip + ":" + std::to_string(peer->port);
+    peer->bitfield.assign(metadata_.pieces.size(), false);
+    peer->last_active = std::chrono::steady_clock::now();
+    peer->worker_active = true;
+
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (!running_ || active_peers_.size() >= config_.max_connections ||
+            active_peers_.find(peer->endpoint_str) != active_peers_.end()) {
+            peer->connection->close();
+            return;
+        }
+        active_peers_[peer->endpoint_str] = peer;
+    }
+    peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
+    std::cout << "[uTP] Accepted peer stream from " << peer->endpoint_str << std::endl;
+}
+
 void TorrentSession::connect_candidate_peers() {
     std::vector<std::string> to_connect;
     {
@@ -733,12 +1035,67 @@ void TorrentSession::connect_candidate_peers() {
             peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
         } catch (const std::exception& ex) {
             std::cout << "[CONNECT] Failed to connect to " << ep_str << ": " << ex.what() << std::endl;
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            known_peer_endpoints_.erase(ep_str);
+            request_peer_holepunch(ip, port);
         } catch (...) {
             std::cout << "[CONNECT] Failed to connect to " << ep_str << " (unknown error)" << std::endl;
+            request_peer_holepunch(ip, port);
+        }
+    }
+}
+
+void TorrentSession::connect_utp_candidates() {
+    std::vector<std::string> candidates;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (!utp_engine_ || !running_ || paused_ || active_peers_.size() >= config_.max_connections) {
+            return;
+        }
+        while (!utp_peer_candidates_.empty() &&
+               active_peers_.size() + candidates.size() < config_.max_connections) {
+            std::string endpoint = std::move(utp_peer_candidates_.back());
+            utp_peer_candidates_.pop_back();
+            if (active_peers_.find(endpoint) == active_peers_.end()) {
+                candidates.push_back(std::move(endpoint));
+            } else {
+                queued_utp_peer_endpoints_.erase(endpoint);
+            }
+        }
+    }
+
+    for (const auto& endpoint : candidates) {
+        const auto colon = endpoint.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string ip = endpoint.substr(0, colon);
+        const auto port = static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
+        try {
+            const auto address = asio::ip::make_address_v4(ip);
+            auto connection = pbl4::network::PeerConnection::connect_utp_to(
+                utp_engine_, asio::ip::udp::endpoint(address, port), std::chrono::seconds(3));
+            auto peer = std::make_shared<ActivePeer>();
+            peer->ip = ip;
+            peer->port = port;
+            peer->endpoint_str = endpoint;
+            peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(connection));
+            peer->bitfield.assign(metadata_.pieces.size(), false);
+            peer->last_active = std::chrono::steady_clock::now();
+            peer->worker_active = true;
+
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                if (!running_ || active_peers_.size() >= config_.max_connections ||
+                    active_peers_.find(endpoint) != active_peers_.end()) {
+                    peer->connection->close();
+                    queued_utp_peer_endpoints_.erase(endpoint);
+                    continue;
+                }
+                active_peers_[endpoint] = peer;
+            }
+            peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
+            std::cout << "[uTP] Connected to peer " << endpoint << std::endl;
+        } catch (const std::exception& ex) {
+            std::cout << "[uTP] Connection to " << endpoint << " failed: " << ex.what() << std::endl;
             std::lock_guard<std::mutex> lock(session_mutex_);
-            known_peer_endpoints_.erase(ep_str);
+            queued_utp_peer_endpoints_.erase(endpoint);
         }
     }
 }
@@ -1029,7 +1386,7 @@ void TorrentSession::handle_peer_message(
             if (auto* d = dht(); d && remote_dht_port != 0) {
                 d->ping(peer->ip, remote_dht_port);
                 // Announce ngay để peer kia biết mình qua DHT
-                d->announcePeer(info_hash_raw_, config_.listen_port);
+                d->announcePeer(info_hash_raw_, advertised_port_.load());
             }
             break;
         }
@@ -1499,7 +1856,7 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
     TrackerRequest req;
     req.infoHash = info_hash_raw_;
     req.peerId = peer_id_;
-    req.port = config_.listen_port;
+    req.port = advertised_port_.load();
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         req.uploaded = uploaded_bytes_;
@@ -1542,6 +1899,7 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
         try {
             TrackerResponse resp = TrackerClient::announceHttp(url, req);
             if (resp.success) {
+                send_udp_registration();
                 std::cout << "[TRACKER-ANNOUNCE] Response OK | peers received: "
                           << resp.peers.size() << std::endl;
                 {

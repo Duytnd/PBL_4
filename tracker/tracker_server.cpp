@@ -9,6 +9,26 @@ bool TrackerServer::addPeer(const std::string& infoHash, const PeerRegistration&
     return registry_.upsert(infoHash, peer);
 }
 
+bool TrackerServer::registerUdpEndpoint(
+    const std::string& infoHash,
+    const std::string& peerId,
+    const std::string& sourceIp,
+    std::uint16_t sourcePort,
+    std::uint16_t announcedTcpPort) {
+    return registry_.updateUdpEndpoint(
+        infoHash, peerId, sourceIp, sourcePort, announcedTcpPort);
+}
+
+std::optional<TrackerPeer> TrackerServer::rendezvousEndpoint(
+    const std::string& infoHash,
+    const std::string& requesterPeerId,
+    const std::string& requesterIp,
+    const std::string& targetIp,
+    std::uint16_t targetTcpPort) const {
+    return registry_.getUdpEndpointByTcpEndpoint(
+        infoHash, requesterPeerId, requesterIp, targetIp, targetTcpPort);
+}
+
 void TrackerServer::removePeer(const std::string& infoHash, const std::string& peerId) {
     registry_.remove(infoHash, peerId);
 }

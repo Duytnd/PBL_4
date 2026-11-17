@@ -4,6 +4,7 @@
 
 #include "network/tracker_client.h"
 #include "network/tracker_protocol.h"
+#include "network/udp_rendezvous.h"
 #include "tracker/peer_registry.h"
 #include "tracker/tracker_server.h"
 
@@ -58,6 +59,62 @@ void testDecodeCompactPeersRejectsBadLength() {
     CHECK_THROWS(TrackerProtocol::decodeCompactPeers("12345"));  // không chia hết 6
 }
 
+void testUdpRendezvousRegisterAndPunchRequestCodec() {
+    const std::string infoHash(20, 'h');
+    const std::string peerId(20, 'p');
+    const auto registration = network::udp_rendezvous::encode_register_request(infoHash, peerId, 6881);
+    CHECK_EQ(registration.size(), std::size_t(48));
+
+    network::udp_rendezvous::Request decoded;
+    CHECK(network::udp_rendezvous::decode_request(registration.data(), registration.size(), decoded));
+    CHECK_EQ(static_cast<int>(decoded.opcode),
+             static_cast<int>(network::udp_rendezvous::Opcode::Register));
+    CHECK_EQ(decoded.info_hash, infoHash);
+    CHECK_EQ(decoded.peer_id, peerId);
+    CHECK_EQ(decoded.peer_tcp_port, std::uint16_t(6881));
+
+    const auto punch = network::udp_rendezvous::encode_punch_request(
+        infoHash, peerId, 6881, "198.51.100.20", 6882, 0x12345678);
+    CHECK_EQ(punch.size(), std::size_t(58));
+    CHECK(network::udp_rendezvous::decode_request(punch.data(), punch.size(), decoded));
+    CHECK_EQ(static_cast<int>(decoded.opcode),
+             static_cast<int>(network::udp_rendezvous::Opcode::Punch));
+    CHECK_EQ(decoded.peer_tcp_port, std::uint16_t(6881));
+    CHECK_EQ(decoded.target_ip, std::string("198.51.100.20"));
+    CHECK_EQ(decoded.target_tcp_port, std::uint16_t(6882));
+    CHECK_EQ(decoded.transaction_id, std::uint32_t(0x12345678));
+    CHECK(!network::udp_rendezvous::decode_request(punch.data(), punch.size() - 1, decoded));
+    CHECK_THROWS(network::udp_rendezvous::encode_punch_request(
+        infoHash, peerId, 6881, "not-an-ip", 6882, 1));
+}
+
+void testUdpRendezvousResultsAreBoundedAndRoundTrip() {
+    const std::string infoHash(20, 'h');
+    const auto request = network::udp_rendezvous::encode_punch_request(
+        infoHash, std::string(20, 'p'), 6880, "203.0.113.8", 6881, 42);
+    const auto response = network::udp_rendezvous::encode_punch_result(
+        network::udp_rendezvous::Status::Ok, infoHash, 42, "198.51.100.20", 52000);
+    CHECK(response.size() < request.size());
+
+    network::udp_rendezvous::Result decoded;
+    CHECK(network::udp_rendezvous::decode_punch_result(response.data(), response.size(), decoded));
+    CHECK_EQ(decoded.info_hash, infoHash);
+    CHECK_EQ(decoded.transaction_id, std::uint32_t(42));
+    CHECK_EQ(decoded.ip, std::string("198.51.100.20"));
+    CHECK_EQ(decoded.port, std::uint16_t(52000));
+
+    const auto notification = network::udp_rendezvous::encode_notification(
+        infoHash, "203.0.113.8", 6880, "203.0.113.8", 41000);
+    CHECK(notification.size() < request.size());
+    network::udp_rendezvous::Notification decodedNotification;
+    CHECK(network::udp_rendezvous::decode_notification(
+        notification.data(), notification.size(), decodedNotification));
+    CHECK_EQ(decodedNotification.tcp_ip, std::string("203.0.113.8"));
+    CHECK_EQ(decodedNotification.tcp_port, std::uint16_t(6880));
+    CHECK_EQ(decodedNotification.ip, std::string("203.0.113.8"));
+    CHECK_EQ(decodedNotification.port, std::uint16_t(41000));
+}
+
 void testSuccessResponseRoundTrip() {
     const std::vector<TrackerPeer> peers = {{"1.2.3.4", 1000}};
     const std::string response = TrackerProtocol::encodeSuccessResponse(1800, peers);
@@ -80,6 +137,13 @@ void testTrackerClientMakePeerIdHasPrefixAndLength() {
     const std::string peerId = TrackerClient::makePeerId("-PB0001-");
     CHECK_EQ(peerId.size(), std::size_t(20));  // 8 byte prefix + 12 byte ngẫu nhiên
     CHECK_EQ(peerId.substr(0, 8), std::string("-PB0001-"));
+}
+
+void testTrackerClientExtractsUdpRendezvousEndpoint() {
+    const auto endpoint = TrackerClient::udpRendezvousEndpoint(
+        "http://tracker.example:8080/announce");
+    CHECK_EQ(endpoint.first, std::string("tracker.example"));
+    CHECK_EQ(endpoint.second, std::uint16_t(8080));
 }
 
 void testTrackerClientRetriesTransientHttpFailures() {
@@ -218,6 +282,32 @@ void testPeerRegistryRejectsNewSwarmWhenFull() {
     CHECK(registry.upsert(std::string(20, 'a'), {"peerC", "10.0.0.3", 3, 0, 0, 0}));
 }
 
+void testPeerRegistryRendezvousUsesFreshObservedUdpEndpoints() {
+    PeerRegistry registry(/*expirySeconds=*/3600, /*maxPeersPerTorrent=*/50);
+    const std::string infoHash(20, 'h');
+    const auto now = PeerRegistry::Clock::now();
+
+    registry.upsert(infoHash, {"peerA", "203.0.113.10", 6881, 0, 0, 0}, now);
+    registry.upsert(infoHash, {"peerB", "198.51.100.20", 6882, 0, 0, 0}, now);
+    CHECK(registry.updateUdpEndpoint(infoHash, "peerA", "203.0.113.10", 41000, 6881, now));
+    CHECK(registry.updateUdpEndpoint(infoHash, "peerB", "198.51.100.20", 52000, 6882, now));
+
+    const auto endpoint = registry.getUdpEndpointByTcpEndpoint(
+        infoHash, "peerA", "203.0.113.10", "198.51.100.20", 6882, now);
+    CHECK(endpoint.has_value());
+    if (endpoint) {
+        CHECK_EQ(endpoint->ip, std::string("198.51.100.20"));
+        CHECK_EQ(endpoint->port, std::uint16_t(52000));
+    }
+
+    CHECK(!registry.updateUdpEndpoint(infoHash, "peerA", "192.0.2.55", 41000, 6881, now));
+    CHECK(!registry.getUdpEndpointByTcpEndpoint(
+        infoHash, "unknown", "203.0.113.10", "198.51.100.20", 6882, now));
+    CHECK(!registry.getUdpEndpointByTcpEndpoint(
+        infoHash, "peerA", "203.0.113.10", "198.51.100.20", 6882,
+        now + std::chrono::seconds(121)));
+}
+
 void testTrackerServerRejectsIpv6Peer() {
     TrackerServer server(1800, 50);
     TrackerRequest request;
@@ -232,6 +322,9 @@ void testTrackerServerRejectsIpv6Peer() {
 
 int main() {
     RUN(testPeerRegistryRejectsNewSwarmWhenFull);
+    RUN(testPeerRegistryRendezvousUsesFreshObservedUdpEndpoints);
+    RUN(testUdpRendezvousRegisterAndPunchRequestCodec);
+    RUN(testUdpRendezvousResultsAreBoundedAndRoundTrip);
     RUN(testTrackerServerRejectsIpv6Peer);
     RUN(testEncodeRequestQueryPercentEncodesBinaryBytes);
     RUN(testCompactPeersRoundTrip);
@@ -239,6 +332,7 @@ int main() {
     RUN(testSuccessResponseRoundTrip);
     RUN(testFailureResponseRoundTrip);
     RUN(testTrackerClientMakePeerIdHasPrefixAndLength);
+    RUN(testTrackerClientExtractsUdpRendezvousEndpoint);
     RUN(testTrackerClientRetriesTransientHttpFailures);
     RUN(testPeerRegistryUpsertAndGetPeersExcludesSelf);
     RUN(testPeerRegistryExpiresOldPeers);

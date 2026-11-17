@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace p2p {
 
@@ -19,6 +20,8 @@ public:
     // UDP tracker, không HTTPS - nằm ngoài phạm vi kế hoạch mục 2).
     // Ném std::runtime_error nếu không kết nối được hoặc HTTP status != 200.
     static TrackerResponse announceHttp(const std::string& announceUrl, const TrackerRequest& request);
+    static std::pair<std::string, std::uint16_t> udpRendezvousEndpoint(
+        const std::string& announceUrl);
 };
 
 }  // namespace p2p

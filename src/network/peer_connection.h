@@ -13,6 +13,9 @@
 
 namespace pbl4::network {
 
+class UtpEngine;
+class UtpStream;
+
 class PeerConnectionClosedError : public std::runtime_error {
 public:
 	using std::runtime_error::runtime_error;
@@ -32,6 +35,9 @@ public:
 	explicit PeerConnection(
 		asio::ip::tcp::socket socket,
 		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
+	explicit PeerConnection(
+		std::shared_ptr<UtpStream> stream,
+		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
 
 	~PeerConnection();
 
@@ -45,6 +51,10 @@ public:
 	static PeerConnection connect_to(
 		const std::string& host,
 		std::uint16_t port,
+		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
+	static PeerConnection connect_utp_to(
+		const std::shared_ptr<UtpEngine>& engine,
+		const asio::ip::udp::endpoint& endpoint,
 		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
 
 	// Wire operations
@@ -123,6 +133,7 @@ public:
 private:
 	std::unique_ptr<asio::io_context> owned_ioc_;
 	asio::ip::tcp::socket socket_;
+	std::shared_ptr<UtpStream> utp_stream_;
 	std::chrono::milliseconds io_timeout_{30000};
 
 	// State

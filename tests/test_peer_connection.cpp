@@ -1,8 +1,10 @@
 #include "../src/network/peer_connection.h"
+#include "../src/network/utp_engine.h"
 
 #include <cassert>
 #include <chrono>
 #include <iostream>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -261,6 +263,53 @@ void test_network_timeout() {
 	std::cout << "PASSED\n";
 }
 
+void test_utp_peer_connection_exchange() {
+	std::cout << "[TEST] uTP peer handshake and message exchange over loopback... ";
+
+	auto clientEngine = std::make_shared<UtpEngine>();
+	auto serverEngine = std::make_shared<UtpEngine>();
+	std::promise<std::shared_ptr<UtpStream>> acceptedPromise;
+	auto acceptedFuture = acceptedPromise.get_future();
+	serverEngine->set_accept_handler([&](std::shared_ptr<UtpStream> stream) {
+		acceptedPromise.set_value(std::move(stream));
+	});
+	clientEngine->start();
+	serverEngine->start();
+	serverEngine->allow_peer(asio::ip::udp::endpoint(
+		asio::ip::address_v4::loopback(), clientEngine->local_port()));
+
+	auto client = PeerConnection::connect_utp_to(
+		clientEngine,
+		asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), serverEngine->local_port()),
+		std::chrono::seconds(3));
+	PeerConnection server(acceptedFuture.get(), std::chrono::seconds(3));
+
+	PeerHandshake clientHandshake;
+	clientHandshake.info_hash.fill(0x31);
+	clientHandshake.peer_id.fill(0x41);
+	PeerHandshake serverHandshake;
+	serverHandshake.info_hash.fill(0x31);
+	serverHandshake.peer_id.fill(0x42);
+
+	client.send_handshake(clientHandshake);
+	const auto receivedClient = server.receive_handshake();
+	assert(receivedClient.info_hash == clientHandshake.info_hash);
+	assert(receivedClient.peer_id == clientHandshake.peer_id);
+	server.send_handshake(serverHandshake);
+	const auto receivedServer = client.receive_handshake();
+	assert(receivedServer.info_hash == serverHandshake.info_hash);
+	assert(receivedServer.peer_id == serverHandshake.peer_id);
+
+	client.send_interested();
+	const auto interested = server.receive_message();
+	assert(interested.id == static_cast<Byte>(PeerMessageId::Interested));
+	client.close();
+	server.close();
+	clientEngine->stop();
+	serverEngine->stop();
+	std::cout << "PASSED\n";
+}
+
 int main() {
 	std::cout << "========================================\n";
 	std::cout << " RUNNING PEER CONNECTION INTEGRATION TESTS\n";
@@ -270,6 +319,7 @@ int main() {
 	test_peer_abrupt_disconnect();
 	test_oversized_and_malformed_messages_over_network();
 	test_network_timeout();
+	test_utp_peer_connection_exchange();
 
 	std::cout << "========================================\n";
 	std::cout << " ALL PEER CONNECTION TESTS PASSED!\n";
