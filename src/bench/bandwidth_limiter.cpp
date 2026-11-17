@@ -34,17 +34,18 @@ std::uint64_t BandwidthLimiter::rate() const {
 }
 
 // ---------------------------------------------------------------------------
-// Nạp token theo thời gian thực tế đã trôi qua (phải giữ lock trước khi gọi).
+// refill() — public, thread-safe.
+// Nạp token theo thời gian đã trôi qua. Thường không cần gọi tay vì
+// consume() tự nạp trước khi kiểm tra; dùng khi muốn "warm up" bucket
+// sau thời gian dài idle.
 // ---------------------------------------------------------------------------
 void BandwidthLimiter::refill() {
-    // Hàm này được gọi NỘI BỘ từ consume() — lock đã được giữ bởi caller.
-    // Nếu gọi từ bên ngoài, tự lock:
-    // (Phiên bản public bên dưới sẽ tự lock.)
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (rate_ == 0) return;
+
     auto now     = std::chrono::steady_clock::now();
     double delta = std::chrono::duration<double>(now - last_refill_).count();
     last_refill_ = now;
-
-    if (rate_ == 0) return;  // unlimited — không cần nạp
 
     double added = static_cast<double>(rate_) * delta;
     tokens_ = std::min(tokens_ + added, static_cast<double>(bucket_max_));
