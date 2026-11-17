@@ -370,6 +370,10 @@ uint64 UtpEngine::on_firewall(utp_callback_arguments* args) {
         args->address->sa_family != AF_INET || args->address_len < sizeof(sockaddr_in)) {
         return 1;
     }
+    // Nếu engine đã đăng ký accept_handler, cho phép nhận stream từ peer
+    if (engine->accept_handler_) {
+        return 0;
+    }
     const auto* remote = reinterpret_cast<const sockaddr_in*>(args->address);
     asio::ip::address_v4::bytes_type addressBytes{};
     std::memcpy(addressBytes.data(), &remote->sin_addr, addressBytes.size());

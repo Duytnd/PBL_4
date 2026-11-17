@@ -665,6 +665,10 @@ bool TorrentSession::handle_rendezvous_datagram(
             colon != std::string::npos &&
             result.ip == expected_tcp_endpoint.substr(0, colon)) {
             const std::string endpoint = result.ip + ":" + std::to_string(result.port);
+            if (utp_engine_) {
+                utp_engine_->allow_peer(asio::ip::udp::endpoint(
+                    asio::ip::make_address_v4(result.ip), result.port));
+            }
             if (queued_utp_peer_endpoints_.insert(endpoint).second &&
                 utp_peer_candidates_.size() < config_.max_connections * 2) {
                 utp_peer_candidates_.push_back(endpoint);
@@ -680,6 +684,10 @@ bool TorrentSession::handle_rendezvous_datagram(
         }
         const std::string tcp_endpoint = notification.tcp_ip + ":" + std::to_string(notification.tcp_port);
         const std::string endpoint = notification.ip + ":" + std::to_string(notification.port);
+        if (utp_engine_) {
+            utp_engine_->allow_peer(asio::ip::udp::endpoint(
+                asio::ip::make_address_v4(notification.ip), notification.port));
+        }
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (discovered_tcp_peer_endpoints_.find(tcp_endpoint) != discovered_tcp_peer_endpoints_.end() &&
             queued_utp_peer_endpoints_.insert(endpoint).second &&
@@ -1070,7 +1078,7 @@ void TorrentSession::connect_utp_candidates() {
         try {
             const auto address = asio::ip::make_address_v4(ip);
             auto connection = pbl4::network::PeerConnection::connect_utp_to(
-                utp_engine_, asio::ip::udp::endpoint(address, port), std::chrono::seconds(3));
+                utp_engine_, asio::ip::udp::endpoint(address, port), std::chrono::seconds(8));
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
