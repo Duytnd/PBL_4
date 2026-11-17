@@ -67,9 +67,14 @@ SessionMetrics Metrics::snapshot() const {
     // Dọn sample cũ hơn cửa sổ (tránh vector phình mãi).
     auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                             std::chrono::duration<double>(kWindowSeconds));
-
-    // Không thể xóa trong const method — nên cast away const cho internal cache.
-    // Dùng mutable nếu muốn, ở đây ta chỉ đọc (không xóa) để giữ const.
+    dl_samples_.erase(
+        std::remove_if(dl_samples_.begin(), dl_samples_.end(),
+                       [cutoff](const Sample& s) { return s.ts < cutoff; }),
+        dl_samples_.end());
+    ul_samples_.erase(
+        std::remove_if(ul_samples_.begin(), ul_samples_.end(),
+                       [cutoff](const Sample& s) { return s.ts < cutoff; }),
+        ul_samples_.end());
 
     SessionMetrics snap;
     snap.bytes_downloaded = total_downloaded_;

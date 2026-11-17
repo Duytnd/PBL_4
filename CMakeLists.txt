@@ -44,6 +44,14 @@ add_executable(test_bandwidth_limiter
 target_include_directories(test_bandwidth_limiter PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_bandwidth_limiter COMMAND test_bandwidth_limiter)
 
+# Metrics (Nguoi 3): do luong, so sanh chien luoc
+add_executable(test_metrics
+    tests/test_metrics.cpp
+    src/bench/metrics.cpp
+)
+target_include_directories(test_metrics PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_metrics COMMAND test_metrics)
+
 # DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
 add_executable(test_kademlia
     tests/test_kademlia.cpp
@@ -247,6 +255,9 @@ add_executable(test_torrent_session
     src/network/tracker_protocol.cpp
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
+    src/strategy/peer_policy.cpp
+    src/bench/bandwidth_limiter.cpp
+    src/bench/metrics.cpp
     src/network/lsd.cpp
     src/network/dht/node_id.cpp
     src/network/dht/routing_table.cpp
@@ -326,6 +337,9 @@ set(P2P_CLIENT_SOURCES
     src/network/tracker_protocol.cpp
     src/strategy/piece_picker.cpp
     src/strategy/choker.cpp
+    src/strategy/peer_policy.cpp
+    src/bench/bandwidth_limiter.cpp
+    src/bench/metrics.cpp
     src/network/lsd.cpp
     src/network/dht/node_id.cpp
     src/network/dht/routing_table.cpp

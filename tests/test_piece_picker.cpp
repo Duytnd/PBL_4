@@ -273,6 +273,51 @@ void testUsableThroughBasePointer() {
     CHECK_EQ(picker->pick_next_piece(Bits{false, false}, Swarm{{false, true}}), 1);
 }
 
+// ---------- SequentialPicker (Người 3) ----------
+
+void testSequentialPicksLowestIndexFirst() {
+    SequentialPicker picker;
+    Bits mine = {false, false, false, false};
+    Swarm peers = {
+        {false, true, true, false},
+        {false, false, true, true}
+    };
+    // Piece 0: không peer nào có
+    // Piece 1: peer 1 có
+    // Piece 2: peer 1 & 2 có
+    // Sequential chọn index nhỏ nhất khả dụng -> 1
+    CHECK_EQ(picker.pick_next_piece(mine, peers), 1);
+}
+
+void testSequentialSkipsOwnedPieces() {
+    SequentialPicker picker;
+    Bits mine = {true, true, false, false};
+    Swarm peers = {
+        {true, true, true, true}
+    };
+    // Piece 0, 1 đã có -> chọn 2
+    CHECK_EQ(picker.pick_next_piece(mine, peers), 2);
+}
+
+void testSequentialReturnsMinusOneWhenNoPiecesToPick() {
+    SequentialPicker picker;
+    Bits mine = {true, true};
+    Swarm peers = {{true, true}};
+    CHECK_EQ(picker.pick_next_piece(mine, peers), -1);
+
+    Bits mine2 = {false, false};
+    Swarm no_peers = {{false, false}};
+    CHECK_EQ(picker.pick_next_piece(mine2, no_peers), -1);
+}
+
+void testSequentialPipelineDepthAndEndgame() {
+    SequentialConfig cfg;
+    cfg.pipeline_depth = 8;
+    SequentialPicker picker(cfg);
+    CHECK_EQ(picker.pipeline_depth(), std::size_t(8));
+    CHECK(!picker.in_endgame(ctxOf(10, 5, 5)));
+}
+
 int main() {
     RUN(testRarestFirstPicksRarestPiece);
     RUN(testPickNeverReturnsOwnedOrUnavailablePiece);
@@ -293,5 +338,9 @@ int main() {
     RUN(testDefaultsMatchPlan);
     RUN(testBaseClassDefaultsForOldStylePickers);
     RUN(testUsableThroughBasePointer);
+    RUN(testSequentialPicksLowestIndexFirst);
+    RUN(testSequentialSkipsOwnedPieces);
+    RUN(testSequentialReturnsMinusOneWhenNoPiecesToPick);
+    RUN(testSequentialPipelineDepthAndEndgame);
     return TEST_REPORT();
 }

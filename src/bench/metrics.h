@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace p2p {
 namespace bench {
@@ -77,8 +78,8 @@ private:
     std::uint64_t bad_pieces_        = 0;
     std::uint64_t peer_connections_  = 0;
 
-    std::vector<Sample> dl_samples_;   // sliding window download
-    std::vector<Sample> ul_samples_;   // sliding window upload
+    mutable std::vector<Sample> dl_samples_;   // sliding window download
+    mutable std::vector<Sample> ul_samples_;   // sliding window upload
 
     std::chrono::steady_clock::time_point start_time_;
 
