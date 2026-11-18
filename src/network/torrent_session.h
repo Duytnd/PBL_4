@@ -4,6 +4,7 @@
 #include "core/torrent_file.h"
 #include "network/peer_connection.h"
 #include "network/peer_protocol.h"
+#include "bench/bandwidth_limiter.h"
 #include "network/tracker_client.h"
 #include "network/tracker_protocol.h"
 #include "strategy/choker.h"
@@ -82,7 +83,8 @@ struct TorrentSessionStats {
     std::uint64_t downloaded_bytes = 0;
     std::uint64_t uploaded_bytes = 0;
     std::uint64_t left_bytes = 0;
-    double progress_percent = 0.0;
+    std::uint64_t wanted_bytes = 0;  // tổng byte của các piece được chọn tải (= total_bytes nếu tải hết)
+    double progress_percent = 0.0;   // tính trên phần được chọn
     double download_rate = 0.0;    // bytes/s
     double upload_rate = 0.0;      // bytes/s
     std::size_t total_pieces = 0;
@@ -93,17 +95,34 @@ struct TorrentSessionStats {
     std::string error_message;
 };
 
+// Trạng thái 1 file trong torrent (torrent 1 file có đúng 1 mục).
+struct FileStatus {
+    std::string path;
+    std::uint64_t length = 0;
+    bool wanted = true;                  // false = bỏ qua, không tải
+    std::uint64_t completed_bytes = 0;   // byte thuộc các piece đã verify
+};
+
 // Cấu hình khởi tạo cho TorrentSession
 struct TorrentSessionConfig {
     std::filesystem::path download_dir = "./downloads";
     std::uint16_t listen_port = 6881;
     std::size_t max_connections = 30;
+    // Kết nối VÀO (do peer lạ mở): mỗi IP tối đa bấy nhiêu kết nối vào cùng lúc (0 = không giới hạn). Nếu không, một máy
+    // mở 30 kết nối rồi im lặng sẽ lấp đầy mọi chỗ trong lúc peer thật bị đóng cửa (slowloris).
+    std::size_t max_inbound_per_ip = 4;
+    // Kết nối vào chỉ được dùng tối đa 80% số chỗ; 20% chừa cho kết nối RA do mình chủ động mở tới peer đã biết.
+    // Kết nối vào phải bắt tay xong trong thời gian này, quá hạn bị đóng (sau bắt tay mới dùng peer_timeout).
+    std::chrono::seconds handshake_timeout{10};
     std::chrono::seconds tracker_interval{60};
     std::chrono::seconds choker_interval{10};
     std::chrono::seconds peer_timeout{30};
     bool enable_tracker = true;                 // Cho phép announce tới tracker nếu có URL
     bool enable_lsd = true;                     // Tự tìm kiếm peer qua LSD (BEP 14)
     bool enable_dht = true;                     // Tự tìm kiếm peer qua DHT (BEP 5)
+    // Mặc định bộ lọc LAN từ chối peer public khi máy ở mạng private (hoặc không biết). Bật cờ này
+    // (hoặc đặt biến môi trường P2P_ALLOW_PUBLIC_PEERS=1) cho mạng cấp IP public / muốn nối Internet.
+    bool allow_public_peers = false;
     bool enable_port_mapping = true;            // Tự mở cổng peer qua UPnP/NAT-PMP nếu router hỗ trợ
     bool enable_utp = true;                     // uTP + UDP hole-punch fallback qua tracker
     std::uint16_t dht_port = 0;                 // Port UDP cho DHT (0 = dùng listen_port)
@@ -111,6 +130,11 @@ struct TorrentSessionConfig {
     std::uint16_t dht_bootstrap_port = 0;       // Cổng node DHT bootstrap
     std::shared_ptr<KademliaNode> shared_dht;   // Node DHT dùng chung giữa các session (nếu có)
     std::string client_peer_id;                 // Tự sinh nếu để rỗng (-PB0001-...)
+    // Số request block chạy song song trên mỗi peer. Mỗi block 16 KiB nên tốc độ tối đa mỗi peer
+    // ~ pipeline_depth x 16 KiB / RTT: 4 chỉ đủ ~1.3 MB/s ở RTT 50 ms, 16 đủ ~5 MB/s.
+    std::size_t pipeline_depth = 16;
+    std::uint64_t max_download_rate = 0;        // byte/s, 0 = không giới hạn
+    std::uint64_t max_upload_rate = 0;          // byte/s, 0 = không giới hạn
 };
 
 // Callbacks
@@ -139,7 +163,21 @@ public:
     // Điều khiển vòng đời
     bool start();
     void stop();
+    // Chọn file cần tải (chỉ ý nghĩa với torrent nhiều file; torrent 1 file luôn tải file đó).
+    // wanted.size() phải bằng số file và ít nhất 1 file được chọn, nếu không trả false và giữ nguyên.
+    // Đổi được khi đang chạy: piece chỉ thuộc file bị bỏ sẽ không được xin nữa.
+    bool set_file_selection(const std::vector<bool>& wanted);
+    [[nodiscard]] std::vector<bool> file_selection() const;
+    [[nodiscard]] std::vector<FileStatus> files_status() const;
+
     void pause();
+    [[nodiscard]] bool is_paused() const noexcept { return paused_.load(); }
+
+    // Giới hạn tốc độ (byte/s, 0 = không giới hạn); đổi được khi đang chạy.
+    void set_download_limit(std::uint64_t bytes_per_sec) { download_limiter_.set_rate(bytes_per_sec); }
+    void set_upload_limit(std::uint64_t bytes_per_sec) { upload_limiter_.set_rate(bytes_per_sec); }
+    [[nodiscard]] std::uint64_t download_limit() const { return download_limiter_.rate(); }
+    [[nodiscard]] std::uint64_t upload_limit() const { return upload_limiter_.rate(); }
     void resume();
 
     [[nodiscard]] bool is_running() const noexcept;
@@ -185,6 +223,17 @@ private:
     mutable std::mutex session_mutex_;
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
+    // Chọn file: piece_wanted_[i] = piece i chạm ít nhất 1 file được chọn. Mặc định tải hết.
+    std::vector<bool> piece_wanted_;
+    std::vector<bool> file_wanted_;
+    std::size_t wanted_remaining_ = 0;   // số piece được chọn mà chưa có
+    std::uint64_t wanted_bytes_ = 0;
+    void recompute_wanted_locked();      // tính lại wanted_remaining_/wanted_bytes_/left_bytes_
+    [[nodiscard]] bool all_wanted_done_locked() const {
+        return !metadata_.pieces.empty() && wanted_remaining_ == 0;
+    }
+    bench::BandwidthLimiter download_limiter_;
+    bench::BandwidthLimiter upload_limiter_;
     // Số luồng announce tracker đang chạy nền (detached): destructor phải chờ về 0
     // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
     std::atomic<int> announce_inflight_{0};
@@ -194,8 +243,15 @@ private:
     std::shared_ptr<pbl4::network::UtpEngine> utp_engine_;
     asio::ip::udp::endpoint tracker_udp_endpoint_;
     std::chrono::steady_clock::time_point next_udp_registration_;
-    std::atomic<std::uint32_t> next_rendezvous_transaction_{1};
-    std::unordered_map<std::uint32_t, std::string> pending_rendezvous_targets_;
+    // Khoá phiên ngẫu nhiên của session này: gửi tracker (HTTP `key`, hex) và kèm trong gói UDP rendezvous (8 byte thô).
+    std::string announce_key_raw_;
+    std::string announce_key_hex_;
+    // transaction_id ngẫu nhiên 32 bit (không tuần tự): kẻ giả phản hồi của tracker phải đoán đúng cả giá trị này.
+    struct PendingRendezvous {
+        std::string tcp_endpoint;
+        std::chrono::steady_clock::time_point requested_at;
+    };
+    std::unordered_map<std::uint32_t, PendingRendezvous> pending_rendezvous_targets_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_rendezvous_request_;
     SessionState state_{SessionState::Stopped};
     std::string error_message_;
@@ -228,6 +284,9 @@ private:
     TorrentFinishedCallback finished_cb_;
 
     // Quản lý mạng & Peer Swarm
+    // Có nhận thêm kết nối VÀO từ `ip` không. Gọi khi đang giữ session_mutex_.
+    [[nodiscard]] bool inbound_allowed_locked(const std::string& ip) const;
+
     struct ActivePeer {
         std::string endpoint_str;
         std::string ip;
@@ -244,6 +303,15 @@ private:
         std::uint64_t uploaded_bytes = 0;
         std::uint64_t remote_downloaded_bytes = 0;
         std::uint64_t remote_uploaded_bytes = 0;
+        // BEP 6 Fast Extension: chỉ bật khi CẢ HAI bên đặt bit trong handshake.
+        bool fast = false;
+        std::unordered_set<std::uint32_t> allowed_fast_to_us;     // peer cho ta xin dù đang choke ta (ghi dưới session_mutex_)
+        std::unordered_set<std::uint32_t> allowed_fast_for_peer;  // ta cho peer xin dù đang choke họ (chỉ luồng worker của peer)
+        std::unordered_set<std::uint32_t> rejected_pieces;        // peer đã Reject: không xin lại piece này từ họ (dưới session_mutex_)
+        // Có thể gửi request cho peer này không (mở khoá bình thường, hoặc còn piece "allowed fast" khi bị choke).
+        [[nodiscard]] bool can_request() const {
+            return am_interested && (!peer_choking || (fast && !allowed_fast_to_us.empty()));
+        }
         std::map<std::string, pbl4::network::Byte> remote_extensions;
         std::unordered_set<std::string> pex_advertised;
         double download_rate = 0.0;
@@ -330,7 +398,19 @@ private:
     void send_peer_stats(const std::shared_ptr<ActivePeer>& peer);
     void send_peer_exchange(const std::shared_ptr<ActivePeer>& peer);
 
+    // Gửi qua socket có thể chặn tới io_timeout (30 giây) khi peer ngừng đọc (pause, mạng nghẽn). Tuyệt đối không gọi
+    // khi đang giữ session_mutex_: mọi thứ cần khoá đó (stats() của Web UI, GET /api/torrents, announce...) sẽ treo theo.
+    // Phần tính toán chạy trong khoá và chỉ ghi lại việc cần gửi; việc gửi thật chạy sau khi nhả khoá.
+    struct BlockRequest {
+        bool valid = false;
+        std::uint32_t piece = 0;
+        std::uint32_t begin = 0;
+        std::uint32_t length = 0;
+    };
     bool request_next_blocks(std::shared_ptr<ActivePeer> peer);
+    // Áp bitfield của peer (Bitfield / HaveAll / HaveNone), bật "interested" nếu họ có piece ta cần.
+    void apply_peer_bitfield(const std::shared_ptr<ActivePeer>& peer, const std::vector<bool>& bits);
+    bool request_next_blocks_locked(std::shared_ptr<ActivePeer> peer, BlockRequest& out);
     void broadcast_have(std::uint32_t piece_index);
     bool check_and_finalize_completion();
 };

@@ -102,6 +102,7 @@
     if (value === 'waiting') return { label: 'WAITING', kind: 'waiting' };
     if (value === 'checking') return { label: 'CHECKING', kind: 'checking' };
     if (value === 'paused') return { label: 'PAUSED', kind: 'paused' };
+    if (value === 'queued') return { label: 'QUEUED', kind: 'queued' };
     if (value === 'error') return { label: 'ERROR', kind: 'error' };
     return { label: 'STOPPED', kind: 'stopped' };
   }
@@ -154,6 +155,7 @@
     downloading: 'background: #dbeafe; color: #1e40af; font-weight: 600;',
     waiting: 'background: #fef3c7; color: #92400e; font-weight: 600;',
     checking: 'background: #fef9c3; color: #854d0e;',
+    queued: 'background: #ede9fe; color: #5b21b6; font-weight: 600;',
     error: 'background: #fee2e2; color: #991b1b; font-weight: 600;',
   };
   const BADGE_BASE = 'display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #e5e7eb; color: #374151; ';
@@ -178,7 +180,7 @@
 
   function matchesFilter(torrent) {
     const kind = normalizeTorrentState(torrent.state).kind;
-    if (viewFilter === 'downloading' && !['downloading', 'waiting', 'checking'].includes(kind)) return false;
+    if (viewFilter === 'downloading' && !['downloading', 'waiting', 'checking', 'queued'].includes(kind)) return false;
     if (viewFilter === 'seeding' && kind !== 'seeding') return false;
     if (viewFilter === 'paused' && !['paused', 'stopped'].includes(kind)) return false;
     if (searchText && !String(torrent.name || '').toLowerCase().includes(searchText)) return false;
@@ -215,6 +217,9 @@
         </div>
         <div style="display: flex; align-items: center; flex-shrink: 0;">
           <button type="button" class="torrent-copy-magnet btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>
+          <button type="button" class="torrent-pause btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Pause</button>
+          <button type="button" class="torrent-files btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Files</button>
+          <button type="button" class="torrent-limit btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Limit</button>
           <button type="button" class="torrent-remove btn" style="padding: 4px 8px; font-size: 12px; color: #dc2626;">Remove</button>
         </div>
       </div>
@@ -222,12 +227,85 @@
         <div data-f="bar" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.4s ease;"></div>
       </div>
       <div data-f="error" hidden style="font-size: 12px; color: #92400e; margin-bottom: 6px;"></div>
+      <div data-f="filepanel" hidden style="margin-bottom: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;"></div>
       <div style="display: flex; gap: 24px; font-size: 12px; color: var(--muted); flex-wrap: wrap;">
         <div>Down: <strong data-f="dl" style="color: var(--text);"></strong></div>
         <div>Up: <strong data-f="ul" style="color: var(--text);"></strong></div>
         <div>Pieces: <strong data-f="pieces" style="color: var(--text);"></strong></div>
       </div>`;
     return card;
+  }
+
+  // Panel chọn file: dựng bằng DOM + textContent (tên file do torrent quyết định, không được chèn như HTML).
+  async function toggleFilePanel(card, hash) {
+    const panel = card.querySelector('[data-f="filepanel"]');
+    if (!panel.hidden) {
+      panel.hidden = true;
+      return;
+    }
+    try {
+      const res = await fetch(`/api/torrents/files?hash=${encodeURIComponent(hash)}`);
+      if (!res.ok) {
+        setStatus(`Failed to load files: server responded ${res.status}`, 'error');
+        return;
+      }
+      renderFilePanel(panel, await res.json());
+      panel.hidden = false;
+    } catch (_) {
+      setStatus('Failed to load files: server unreachable.', 'error');
+    }
+  }
+
+  function renderFilePanel(panel, files) {
+    panel.replaceChildren();
+    const single = files.length <= 1;
+    files.forEach((file) => {
+      const row = document.createElement('label');
+      row.style.cssText = 'display: flex; align-items: center; gap: 8px; padding: 2px 0;';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = !!file.wanted;
+      box.disabled = single;
+      box.dataset.index = String(file.index);
+      const name = document.createElement('span');
+      name.style.cssText = 'flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
+      name.textContent = file.path;
+      name.title = file.path;
+      const info = document.createElement('span');
+      info.style.color = 'var(--muted)';
+      const pct = file.length > 0 ? Math.min(100, (file.completed_bytes / file.length) * 100) : 100;
+      info.textContent = `${formatBytes(file.length)} • ${pct.toFixed(0)}%`;
+      row.append(box, name, info);
+      panel.appendChild(row);
+    });
+    if (!single) {
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.className = 'torrent-files-apply btn';
+      apply.style.cssText = 'margin-top: 6px; padding: 4px 10px; font-size: 12px;';
+      apply.textContent = 'Apply selection';
+      panel.appendChild(apply);
+    }
+  }
+
+  async function applyFileSelection(card, hash) {
+    const panel = card.querySelector('[data-f="filepanel"]');
+    const skipped = Array.from(panel.querySelectorAll('input[type="checkbox"]'))
+      .filter((box) => !box.checked)
+      .map((box) => box.dataset.index);
+    try {
+      const res = await fetch(
+        `/api/torrents/files?hash=${encodeURIComponent(hash)}&skip=${encodeURIComponent(skipped.join(','))}`,
+        { method: 'POST' });
+      if (!res.ok) {
+        setStatus(`Failed to update file selection: ${await res.text()}`, 'error');
+        return;
+      }
+      setStatus('File selection updated.', 'info');
+      panel.hidden = true;
+    } catch (_) {
+      setStatus('Failed to update file selection: server unreachable.', 'error');
+    }
   }
 
   function updateCard(card, torrent) {
@@ -261,6 +339,14 @@
     f('dl').textContent = formatSpeed(torrent.downloadRate || 0);
     f('ul').textContent = formatSpeed(torrent.uploadRate || 0);
     f('pieces').textContent = `${torrent.completedPieces || 0}/${torrent.pieceCount || 0}`;
+
+    const pauseButton = card.querySelector('.torrent-pause');
+    const pauseLabel = torrent.queued ? 'Start now' : (torrent.paused ? 'Resume' : 'Pause');
+    pauseButton.textContent = pauseLabel;
+    pauseButton.setAttribute('aria-label', `${pauseLabel} ${torrent.name}`);
+    const kib = (bytes) => (bytes ? `${Math.round(bytes / 1024)} KiB/s` : 'unlimited');
+    const limitButton = card.querySelector('.torrent-limit');
+    limitButton.title = `Download: ${kib(torrent.downloadLimit)} • Upload: ${kib(torrent.uploadLimit)}`;
 
     card.querySelector('.torrent-copy-magnet').hidden = !torrent.magnetUri;
     card.querySelector('.torrent-remove').setAttribute('aria-label', `Remove ${torrent.name}`);
@@ -590,7 +676,45 @@
       const hash = card.dataset.hash;
       const torrent = torrentList.find((item) => item.infoHash === hash);
 
-      if (button.classList.contains('torrent-remove')) {
+      if (button.classList.contains('torrent-pause') && torrent) {
+        const action = (torrent.paused || torrent.queued) ? 'resume' : 'pause';  // torrent đang xếp hàng: bấm = chạy ngay
+        try {
+          const res = await fetch(`/api/torrents/${action}?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
+          if (!res.ok) {
+            setStatus(`Failed to ${action} torrent: server responded ${res.status}`, 'error');
+            return;
+          }
+          torrent.paused = action === 'pause';
+          torrent.queued = false;
+          setStatus(torrent.paused ? 'Torrent paused.' : 'Torrent resumed.', 'info');
+        } catch (_) {
+          setStatus(`Failed to ${action} torrent: server unreachable.`, 'error');
+        }
+      } else if (button.classList.contains('torrent-files') && torrent) {
+        await toggleFilePanel(card, hash);
+      } else if (button.classList.contains('torrent-files-apply')) {
+        await applyFileSelection(card, hash);
+      } else if (button.classList.contains('torrent-limit') && torrent) {
+        const toKib = (bytes) => (bytes ? Math.round(bytes / 1024) : 0);
+        const down = window.prompt('Download limit in KiB/s (0 = unlimited):', String(toKib(torrent.downloadLimit)));
+        if (down === null) return;
+        const up = window.prompt('Upload limit in KiB/s (0 = unlimited):', String(toKib(torrent.uploadLimit)));
+        if (up === null) return;
+        try {
+          const res = await fetch(
+            `/api/torrents/limit?hash=${encodeURIComponent(hash)}&down=${encodeURIComponent(down.trim())}&up=${encodeURIComponent(up.trim())}`,
+            { method: 'POST' });
+          if (!res.ok) {
+            setStatus(`Failed to set limits: ${await res.text()}`, 'error');
+            return;
+          }
+          torrent.downloadLimit = Number(down) * 1024;
+          torrent.uploadLimit = Number(up) * 1024;
+          setStatus('Speed limits updated.', 'info');
+        } catch (_) {
+          setStatus('Failed to set limits: server unreachable.', 'error');
+        }
+      } else if (button.classList.contains('torrent-remove')) {
         try {
           const res = await fetch(`/api/torrents/remove?hash=${encodeURIComponent(hash)}`, { method: 'POST' });
           if (!res.ok && res.status !== 404) {
@@ -684,6 +808,10 @@
             uploaded: item.uploaded_bytes,
             progress: item.progress_percent,
             downloadRate: item.download_rate,
+            paused: !!item.paused,
+            queued: !!item.queued,
+            downloadLimit: item.download_limit || 0,
+            uploadLimit: item.upload_limit || 0,
             uploadRate: item.upload_rate,
             pieceCount: item.total_pieces,
             completedPieces: item.completed_pieces,
@@ -849,11 +977,41 @@
     const input = document.getElementById('torrent-source');
     const createTorrentButton = document.getElementById('create-torrent-btn');
     const addTorrentButton = document.getElementById('add-torrent-btn');
+    const queueButton = document.getElementById('queue-settings-btn');
     const addMagnetButton = document.getElementById('add-magnet-btn');
     const magnetAddInput = document.getElementById('magnet-add-input');
     const dropzone = document.getElementById('torrent-dropzone');
     const dashboardDropzone = document.getElementById('dashboard-dropzone');
     const copyMagnetBtn = document.getElementById('copy-magnet-btn');
+
+    if (queueButton) {
+      const refreshQueueLabel = async () => {
+        try {
+          const res = await fetch('/api/settings/queue');
+          if (!res.ok) return;
+          const data = await res.json();
+          queueButton.textContent = data.max_active ? `Queue: ${data.max_active} at a time` : 'Queue: off';
+          queueButton.dataset.max = String(data.max_active || 0);
+        } catch (_) { /* server chưa sẵn sàng */ }
+      };
+      queueButton.addEventListener('click', async () => {
+        const answer = window.prompt('How many torrents may download at the same time? (0 = no limit, max 64)', queueButton.dataset.max || '0');
+        if (answer === null) return;
+        const value = answer.trim();
+        if (!/^\d{1,2}$/.test(value) || Number(value) > 64) {
+          setStatus('Queue size must be a whole number from 0 to 64.', 'error');
+          return;
+        }
+        try {
+          const res = await fetch(`/api/settings/queue?max_active=${value}`, { method: 'POST' });
+          setStatus(res.ok ? 'Queue setting saved.' : `Could not save queue setting: server responded ${res.status}`, res.ok ? 'success' : 'error');
+          await refreshQueueLabel();
+        } catch (_) {
+          setStatus('Could not save queue setting: server unreachable.', 'error');
+        }
+      });
+      refreshQueueLabel();
+    }
 
     if (copyMagnetBtn) {
       copyMagnetBtn.addEventListener('click', async () => {

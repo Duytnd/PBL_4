@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/bencode.h"
+#include "core/file_entry.h"
 
 #include <cstdint>
 #include <string>
@@ -17,7 +18,12 @@ struct TorrentFileMetadata {
     std::vector<std::string> pieces;   // SHA-1 hash của từng piece, mỗi hash dài 20 byte
     std::uint64_t length = 0;          // Tổng kích thước file nếu single-file
     std::vector<std::string> filePaths; // Danh sách đường dẫn file nếu multi-file
+    std::vector<FileEntry> files;       // Đường dẫn + độ dài từng file (multi-file); length = tổng
     std::string infoRaw;               // Raw Bencode của phần "info" để tính info hash
+
+    [[nodiscard]] bool isMultiFile() const {
+        return !files.empty();
+    }
 
     [[nodiscard]] bool hasInfo() const {
         return !infoRaw.empty();

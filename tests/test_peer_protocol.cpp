@@ -1,7 +1,11 @@
+// Các test dùng assert(): bật lại cả khi build Release (-DNDEBUG), nếu không chúng không kiểm tra gì.
+#undef NDEBUG
+
 #include "../src/network/peer_protocol.h"
 
 #include <cassert>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using namespace pbl4::network;
@@ -281,6 +285,71 @@ void test_defensive_message_validation() {
 	std::cout << "PASSED\n";
 }
 
+void test_fast_extension_messages() {
+	std::cout << "[TEST] BEP 6 Fast Extension messages... ";
+
+	// Bit trong handshake: byte 7, mask 0x04, độc lập với DHT (0x01) và Extension Protocol (byte 5, 0x10).
+	PeerHandshake handshake;
+	assert(!handshake.supports_fast());
+	handshake.set_supports_fast();
+	handshake.set_supports_dht();
+	handshake.set_supports_extension();
+	assert(handshake.supports_fast() && handshake.supports_dht() && handshake.supports_extension());
+	assert(handshake.reserved[7] == 0x05);
+	const auto decoded_handshake = peer_protocol::decode_handshake(peer_protocol::encode_handshake(handshake));
+	assert(decoded_handshake.supports_fast());
+	handshake.set_supports_fast(false);
+	assert(!handshake.supports_fast() && handshake.supports_dht());
+
+	// Mã hoá / giải mã khứ hồi, đúng id theo BEP 6.
+	const auto have_all = peer_protocol::decode_message(peer_protocol::encode_message(peer_protocol::make_have_all()));
+	assert(have_all.id == 14 && have_all.payload.empty());
+	const auto have_none = peer_protocol::decode_message(peer_protocol::encode_message(peer_protocol::make_have_none()));
+	assert(have_none.id == 15 && have_none.payload.empty());
+	const auto suggest = peer_protocol::decode_message(peer_protocol::encode_message(peer_protocol::make_suggest_piece(42)));
+	assert(suggest.id == 13 && peer_protocol::parse_suggest_piece(suggest) == 42);
+	const auto allowed = peer_protocol::decode_message(peer_protocol::encode_message(peer_protocol::make_allowed_fast(7)));
+	assert(allowed.id == 17 && peer_protocol::parse_allowed_fast(allowed) == 7);
+	const auto reject = peer_protocol::decode_message(peer_protocol::encode_message(peer_protocol::make_reject_request(3, 16384, 16384)));
+	assert(reject.id == 16);
+	const auto rejected = peer_protocol::parse_reject_request(reject);
+	assert(rejected == (RequestPayload{3, 16384, 16384}));
+	assert(std::string(peer_protocol::message_id_to_string(14)) == "have all");
+	assert(std::string(peer_protocol::message_id_to_string(16)) == "reject request");
+
+	// Payload sai kích thước bị từ chối khi giải mã (không crash, không đọc tràn).
+	const auto expect_rejected = [](Byte id, std::size_t payload_size) {
+		PeerMessage message;
+		message.id = id;
+		message.payload.assign(payload_size, 0);
+		bool caught = false;
+		try {
+			(void)peer_protocol::decode_message(peer_protocol::encode_message(message));
+		} catch (const PeerProtocolError&) {
+			caught = true;
+		}
+		return caught;
+	};
+	assert(expect_rejected(14, 1));   // HaveAll không có payload
+	assert(expect_rejected(15, 4));   // HaveNone không có payload
+	assert(expect_rejected(13, 3));   // Suggest: 4 byte
+	assert(expect_rejected(17, 8));   // AllowedFast: 4 byte
+	assert(expect_rejected(16, 4));   // Reject: 12 byte
+	assert(expect_rejected(16, 13));
+	assert(!expect_rejected(16, 12));
+
+	// Parser từ chối message sai loại.
+	bool caught = false;
+	try {
+		(void)peer_protocol::parse_allowed_fast(peer_protocol::make_suggest_piece(1));
+	} catch (const PeerProtocolError&) {
+		caught = true;
+	}
+	assert(caught);
+
+	std::cout << "PASSED\n";
+}
+
 int main() {
 	std::cout << "========================================\n";
 	std::cout << " RUNNING PEER PROTOCOL UNIT TESTS\n";
@@ -292,6 +361,7 @@ int main() {
 	test_have_and_bitfield_messages();
 	test_request_piece_cancel_messages();
 	test_defensive_message_validation();
+	test_fast_extension_messages();
 
 	std::cout << "========================================\n";
 	std::cout << " ALL PEER PROTOCOL TESTS PASSED!\n";

@@ -1,6 +1,10 @@
+// Các test dùng assert(): bật lại cả khi build Release (-DNDEBUG), nếu không chúng không kiểm tra gì.
+#undef NDEBUG
+
 #include "../src/network/peer_connection.h"
 #include "../src/network/utp_engine.h"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -310,6 +314,86 @@ void test_utp_peer_connection_exchange() {
 	std::cout << "PASSED\n";
 }
 
+void test_utp_firewall_rejects_unlisted_endpoints() {
+	std::cout << "[TEST] uTP firewall: unlisted endpoint cannot open a connection, allowed one can... ";
+
+	auto clientEngine = std::make_shared<UtpEngine>();
+	auto serverEngine = std::make_shared<UtpEngine>();
+	std::atomic<int> acceptedCount{0};
+	std::promise<std::shared_ptr<UtpStream>> acceptedPromise;
+	auto acceptedFuture = acceptedPromise.get_future();
+	serverEngine->set_accept_handler([&](std::shared_ptr<UtpStream> stream) {
+		if (acceptedCount.fetch_add(1) == 0) {
+			acceptedPromise.set_value(std::move(stream));
+		}
+	});
+	clientEngine->start();
+	serverEngine->start();
+	const asio::ip::udp::endpoint serverEndpoint(asio::ip::address_v4::loopback(), serverEngine->local_port());
+
+	// 1) Server chưa cho phép client: trước đây có accept_handler là cho qua mọi endpoint.
+	bool refused = false;
+	try {
+		auto rejected = PeerConnection::connect_utp_to(clientEngine, serverEndpoint, std::chrono::milliseconds(1500));
+		PeerHandshake handshake;
+		handshake.info_hash.fill(0x31);
+		handshake.peer_id.fill(0x41);
+		rejected.send_handshake(handshake);
+		(void)acceptedFuture.wait_for(std::chrono::milliseconds(800));
+	} catch (const std::exception&) {
+		refused = true;
+	}
+	assert(acceptedCount.load() == 0);  // handler không bao giờ được gọi cho endpoint lạ
+	(void)refused;
+
+	// 2) Sau khi tracker/rendezvous xác nhận (allow_peer) thì kết nối vào được.
+	serverEngine->allow_peer(asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), clientEngine->local_port()));
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	auto client = PeerConnection::connect_utp_to(clientEngine, serverEndpoint, std::chrono::seconds(4));
+	PeerHandshake handshake;
+	handshake.info_hash.fill(0x31);
+	handshake.peer_id.fill(0x41);
+	client.send_handshake(handshake);
+	assert(acceptedFuture.wait_for(std::chrono::seconds(4)) == std::future_status::ready);
+	assert(acceptedCount.load() >= 1);
+
+	client.close();
+	clientEngine->stop();
+	serverEngine->stop();
+	std::cout << "PASSED\n";
+}
+
+void test_utp_allowlist_entry_expires() {
+	std::cout << "[TEST] uTP firewall: allowed endpoint stops being accepted after the TTL... ";
+
+	auto clientEngine = std::make_shared<UtpEngine>();
+	auto serverEngine = std::make_shared<UtpEngine>();
+	std::atomic<int> acceptedCount{0};
+	serverEngine->set_accept_handler([&](std::shared_ptr<UtpStream>) { acceptedCount.fetch_add(1); });
+	serverEngine->set_allow_ttl(std::chrono::milliseconds(300));
+	clientEngine->start();
+	serverEngine->start();
+	const asio::ip::udp::endpoint serverEndpoint(asio::ip::address_v4::loopback(), serverEngine->local_port());
+
+	serverEngine->allow_peer(asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), clientEngine->local_port()));
+	std::this_thread::sleep_for(std::chrono::milliseconds(900));  // vượt TTL 300 ms
+
+	try {
+		auto late = PeerConnection::connect_utp_to(clientEngine, serverEndpoint, std::chrono::milliseconds(1200));
+		PeerHandshake handshake;
+		handshake.info_hash.fill(0x31);
+		handshake.peer_id.fill(0x41);
+		late.send_handshake(handshake);
+		std::this_thread::sleep_for(std::chrono::milliseconds(800));
+	} catch (const std::exception&) {
+	}
+	assert(acceptedCount.load() == 0);  // mục đã hết hạn: không còn được mở kết nối
+
+	clientEngine->stop();
+	serverEngine->stop();
+	std::cout << "PASSED\n";
+}
+
 int main() {
 	std::cout << "========================================\n";
 	std::cout << " RUNNING PEER CONNECTION INTEGRATION TESTS\n";
@@ -320,6 +404,8 @@ int main() {
 	test_oversized_and_malformed_messages_over_network();
 	test_network_timeout();
 	test_utp_peer_connection_exchange();
+	test_utp_firewall_rejects_unlisted_endpoints();
+	test_utp_allowlist_entry_expires();
 
 	std::cout << "========================================\n";
 	std::cout << " ALL PEER CONNECTION TESTS PASSED!\n";

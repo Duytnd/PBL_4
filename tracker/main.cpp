@@ -1,6 +1,8 @@
 #include "httplib.h"
 
 #include "asio/asio.hpp"
+#include "network/lan_address.h"
+#include "tracker/endpoint_rate_limiter.h"
 #include "network/udp_rendezvous.h"
 #include "tracker/tracker_server.h"
 
@@ -41,6 +43,8 @@ int main(int argc, char** argv) {
     }
 
     p2p::TrackerServer tracker(interval, /*maxPeers=*/50);
+    const std::string trackerLanIp = p2p::network::detect_lan_ip();
+    std::cout << "Tracker LAN IP (dùng thay cho peer nối từ loopback): " << trackerLanIp << std::endl;
 
     httplib::Server server;
 
@@ -53,7 +57,7 @@ int main(int argc, char** argv) {
     });
     cleanupThread.detach();
 
-    server.Get("/announce", [&tracker](const httplib::Request& req, httplib::Response& res) {
+    server.Get("/announce", [&tracker, &trackerLanIp](const httplib::Request& req, httplib::Response& res) {
         // info_hash / peer_id là byte nhị phân; httplib tự percent-decode
         // query string nên get_param_value trả đúng 20 byte gốc (mục 5.2).
         p2p::TrackerRequest request;
@@ -69,11 +73,14 @@ int main(int argc, char** argv) {
         request.downloaded = paramU64(req, "downloaded");
         request.left = paramU64(req, "left");
         request.event = req.get_param_value("event");
+        request.key = req.has_param("key") ? req.get_param_value("key") : std::string();
         request.numwant = req.has_param("numwant") ? static_cast<int>(paramU64(req, "numwant", 50)) : 50;
         request.compact = true;
         // Không dùng "ip" người gửi tự khai: lấy IP thật của kết nối TCP để
         // tránh client giả mạo địa chỉ peer khác (tránh bị lợi dụng làm DDoS).
-        request.ip = req.remote_addr;
+        // Peer nối từ loopback (cùng máy với tracker) thì máy khác không với tới "127.0.0.1":
+        // ghi IP LAN của tracker thay vào.
+        request.ip = p2p::network::resolve_peer_ip(req.remote_addr, trackerLanIp);
 
         // event do client tự khai: chỉ log giá trị hợp lệ để không chèn dòng giả vào log.
         const bool knownEvent = request.event == "started" || request.event == "completed" ||
@@ -91,7 +98,8 @@ int main(int argc, char** argv) {
     asio::ip::udp::socket udpSocket(udpIoc);
     std::array<char, 128> udpBuffer{};
     asio::ip::udp::endpoint udpRemote;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastPunchByEndpoint;
+    // Giới hạn 1 yêu cầu punch / 25ms cho mỗi nguồn, bộ nhớ chặn ở 16384 nguồn (bản cũ phình vô hạn).
+    p2p::EndpointRateLimiter punchLimiter(std::chrono::milliseconds(25), 16384, std::chrono::milliseconds(2000));
     std::function<void()> receiveUdp;
     std::thread udpThread;
     bool udpEnabled = false;
@@ -119,28 +127,24 @@ int main(int argc, char** argv) {
                                 if (request.opcode == p2p::network::udp_rendezvous::Opcode::Register) {
                                     const bool registered = tracker.registerUdpEndpoint(
                                         request.info_hash, request.peer_id, sourceIp, sourcePort,
-                                        request.peer_tcp_port);
+                                        request.peer_tcp_port, request.key);
                                     reply = p2p::network::udp_rendezvous::encode_register_result(
                                         registered ? p2p::network::udp_rendezvous::Status::Ok
                                                    : p2p::network::udp_rendezvous::Status::Invalid);
                                 } else {
                                     const std::string rateKey = sourceIp + ":" + std::to_string(sourcePort);
-                                    const auto now = std::chrono::steady_clock::now();
-                                    const auto previous = lastPunchByEndpoint.find(rateKey);
-                                    if (previous != lastPunchByEndpoint.end() &&
-                                        now - previous->second < std::chrono::milliseconds(25)) {
+                                    if (!punchLimiter.allow(rateKey)) {
                                         receiveUdp();
                                         return;
                                     }
-                                    lastPunchByEndpoint[rateKey] = now;
 
                                     const bool registered = tracker.registerUdpEndpoint(
                                         request.info_hash, request.peer_id, sourceIp, sourcePort,
-                                        request.peer_tcp_port);
+                                        request.peer_tcp_port, request.key);
                                     const auto target = registered
                                         ? tracker.rendezvousEndpoint(
                                               request.info_hash, request.peer_id, sourceIp,
-                                              request.target_ip, request.target_tcp_port)
+                                              request.target_ip, request.target_tcp_port, request.key)
                                         : std::nullopt;
                                     if (target) {
                                         reply = p2p::network::udp_rendezvous::encode_punch_result(

@@ -24,6 +24,10 @@ struct TrackerRequest {
     std::string event;
     int numwant = 50;
     bool compact = true;
+    // Khoá phiên (hex, đúng 16 ký tự) do client tự sinh. Tracker gắn peer_id với khoá này: sau lần announce đầu, không ai
+    // dùng peer_id đó (announce, "stopped", đăng ký UDP) được nếu không có đúng khoá, nên người cùng IP/NAT không thể
+    // giành chỗ của peer khác chỉ vì biết peer_id. Rỗng = client cũ, không được bảo vệ.
+    std::string key;
 };
 
 struct TrackerResponse {

@@ -39,6 +39,12 @@ enum class PeerMessageId : Byte {
 	Piece = 7,
 	Cancel = 8,
 	Port = 9,
+	// BEP 6 Fast Extension
+	SuggestPiece = 13,
+	HaveAll = 14,
+	HaveNone = 15,
+	RejectRequest = 16,
+	AllowedFast = 17,
 	Extended = 20
 };
 
@@ -57,6 +63,19 @@ struct PeerHandshake {
 			reserved[5] |= 0x10;
 		} else {
 			reserved[5] &= static_cast<Byte>(~0x10);
+		}
+	}
+
+	// BEP 6 Fast Extension: bit 0x04 at byte index 7
+	bool supports_fast() const noexcept {
+		return (reserved[7] & 0x04) != 0;
+	}
+
+	void set_supports_fast(bool enable = true) noexcept {
+		if (enable) {
+			reserved[7] |= 0x04;
+		} else {
+			reserved[7] &= static_cast<Byte>(~0x04);
 		}
 	}
 
@@ -157,11 +176,22 @@ PeerMessage make_cancel(std::uint32_t index, std::uint32_t begin, std::uint32_t 
 PeerMessage make_port(std::uint16_t port);
 PeerMessage make_extended(Byte ext_id, const Bytes& payload);
 
+// BEP 6 Fast Extension
+PeerMessage make_suggest_piece(std::uint32_t piece_index);
+PeerMessage make_have_all();
+PeerMessage make_have_none();
+PeerMessage make_reject_request(std::uint32_t index, std::uint32_t begin, std::uint32_t length);
+PeerMessage make_allowed_fast(std::uint32_t piece_index);
+
 // Payload parsers
 HavePayload parse_have(const PeerMessage& message);
 RequestPayload parse_request(const PeerMessage& message);
 PiecePayload parse_piece(const PeerMessage& message);
 CancelPayload parse_cancel(const PeerMessage& message);
+// BEP 6: Suggest Piece / Allowed Fast mang 1 chỉ số piece (4 byte); Reject Request cùng dạng với Request.
+std::uint32_t parse_suggest_piece(const PeerMessage& message);
+std::uint32_t parse_allowed_fast(const PeerMessage& message);
+RequestPayload parse_reject_request(const PeerMessage& message);
 std::uint16_t parse_port(const PeerMessage& message);
 std::vector<bool> parse_bitfield(const PeerMessage& message, std::size_t num_pieces = 0);
 

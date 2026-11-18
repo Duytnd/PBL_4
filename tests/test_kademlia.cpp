@@ -9,6 +9,7 @@
 #include "network/dht/node_id.h"
 #include "network/dht/routing_table.h"
 #include "network/dht/kademlia_node.h"
+#include "network/lan_address.h"
 
 #include <chrono>
 #include <thread>
@@ -377,6 +378,33 @@ void testKademliaNodeGetPeersAndAnnounce() {
     nodeB.stop();
 }
 
+void testAnnouncePeerRefreshesPortWhenTorrentIsReAdded() {
+    // Torrent bị xóa rồi thêm lại nghe ở cổng TCP mới: DHT phải trả cổng mới, không kẹt ở cổng cũ đã đóng.
+    const std::string infoHash(20, 'f');
+    KademliaNode seeder(NodeId::fromString(std::string(20, '1')), 17712);
+    KademliaNode asker(NodeId::fromString(std::string(20, '2')), 17713);
+    CHECK(seeder.start());
+    CHECK(asker.start());
+    CHECK(asker.bootstrap("127.0.0.1", 17712));
+
+    seeder.announcePeer(infoHash, 18001);
+    auto first = asker.getPeers(infoHash);
+    CHECK_EQ(first.size(), std::size_t(1));
+    if (first.size() == 1) {
+        CHECK_EQ(first[0].port, std::uint16_t(18001));
+    }
+
+    seeder.announcePeer(infoHash, 18002);  // thêm lại torrent -> cổng mới
+    auto second = asker.getPeers(infoHash);
+    CHECK_EQ(second.size(), std::size_t(1));  // vẫn đúng 1 mục, không nhân đôi
+    if (second.size() == 1) {
+        CHECK_EQ(second[0].port, std::uint16_t(18002));
+    }
+
+    seeder.stop();
+    asker.stop();
+}
+
 void testKademliaSwarmSimulation16Nodes() {
     std::cout << "[TEST] DHT Kademlia 16-node swarm simulation (Stage 4 requirement)...\n";
     constexpr std::size_t kNodeCount = 16;
@@ -420,8 +448,57 @@ void testKademliaSwarmSimulation16Nodes() {
 // main
 // ============================================================
 
+// ============================================================
+// Chọn IP LAN / thay IP loopback (lan_address)
+// ============================================================
+
+void testPickLanIpPrefersPrivateRouteAddress() {
+    using network::pick_lan_ip;
+    CHECK_EQ(pick_lan_ip({"192.168.1.20", "10.0.0.9"}, "10.0.0.9"), std::string("10.0.0.9"));
+}
+
+void testPickLanIpWorksWithoutInternetRoute() {
+    using network::pick_lan_ip;
+    // Mạng LAN không có Internet: route rỗng, vẫn phải ra IP private của card mạng thay vì 127.0.0.1.
+    CHECK_EQ(pick_lan_ip({"192.168.1.20"}, ""), std::string("192.168.1.20"));
+    CHECK_EQ(pick_lan_ip({"169.254.3.4", "192.168.1.20"}, ""), std::string("192.168.1.20"));
+}
+
+void testPickLanIpSkipsVirtualAdaptersWhenRealOneExists() {
+    using network::pick_lan_ip;
+    CHECK_EQ(pick_lan_ip({"192.168.56.1", "172.17.0.1", "192.168.1.20"}, ""), std::string("192.168.1.20"));
+    // Chỉ có card ảo thì vẫn dùng còn hơn loopback.
+    CHECK_EQ(pick_lan_ip({"192.168.56.1"}, ""), std::string("192.168.56.1"));
+}
+
+void testPickLanIpFallsBackToNonPrivateThenLoopback() {
+    using network::pick_lan_ip;
+    // LAN cấp IP không thuộc RFC1918 (vd. Tailscale 100.x): dùng IP route.
+    CHECK_EQ(pick_lan_ip({"100.101.102.103"}, "100.101.102.103"), std::string("100.101.102.103"));
+    CHECK_EQ(pick_lan_ip({"100.101.102.103"}, ""), std::string("100.101.102.103"));
+    CHECK_EQ(pick_lan_ip({}, ""), std::string("127.0.0.1"));
+    CHECK_EQ(pick_lan_ip({"127.0.0.1", "169.254.1.1", "not-an-ip"}, ""), std::string("127.0.0.1"));
+}
+
+void testResolvePeerIpReplacesLoopbackWithTrackerLanIp() {
+    using network::resolve_peer_ip;
+    CHECK_EQ(resolve_peer_ip("127.0.0.1", "192.168.1.5"), std::string("192.168.1.5"));
+    CHECK_EQ(resolve_peer_ip("::1", "192.168.1.5"), std::string("192.168.1.5"));
+    CHECK_EQ(resolve_peer_ip("::ffff:127.0.0.1", "192.168.1.5"), std::string("192.168.1.5"));
+    // Peer thật từ máy khác giữ nguyên.
+    CHECK_EQ(resolve_peer_ip("192.168.1.77", "192.168.1.5"), std::string("192.168.1.77"));
+    // Tracker cũng không biết IP LAN: giữ loopback (chạy 1 máy vẫn hoạt động).
+    CHECK_EQ(resolve_peer_ip("127.0.0.1", "127.0.0.1"), std::string("127.0.0.1"));
+    CHECK_EQ(resolve_peer_ip("127.0.0.1", ""), std::string("127.0.0.1"));
+}
+
 int main() {
     // NodeId
+    RUN(testPickLanIpPrefersPrivateRouteAddress);
+    RUN(testPickLanIpWorksWithoutInternetRoute);
+    RUN(testPickLanIpSkipsVirtualAdaptersWhenRealOneExists);
+    RUN(testPickLanIpFallsBackToNonPrivateThenLoopback);
+    RUN(testResolvePeerIpReplacesLoopbackWithTrackerLanIp);
     RUN(testNodeIdDefaultIsZero);
     RUN(testNodeIdFromStringAndToString);
     RUN(testNodeIdFromHexRoundTrip);
@@ -454,6 +531,7 @@ int main() {
     // KademliaNode (I/O thật)
     RUN(testKademliaNodePingBootstrap);
     RUN(testKademliaNodeGetPeersAndAnnounce);
+    RUN(testAnnouncePeerRefreshesPortWhenTorrentIsReAdded);
     RUN(testKademliaSwarmSimulation16Nodes);
 
     return TEST_REPORT();

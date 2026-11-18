@@ -59,6 +59,16 @@ const char* message_id_to_string(Byte id, bool keep_alive) noexcept {
 			return "cancel";
 		case PeerMessageId::Port:
 			return "port";
+		case PeerMessageId::SuggestPiece:
+			return "suggest piece";
+		case PeerMessageId::HaveAll:
+			return "have all";
+		case PeerMessageId::HaveNone:
+			return "have none";
+		case PeerMessageId::RejectRequest:
+			return "reject request";
+		case PeerMessageId::AllowedFast:
+			return "allowed fast";
 		case PeerMessageId::Extended:
 			return "extended";
 		default:
@@ -88,8 +98,21 @@ void validate_message_payload(Byte id, std::size_t payload_size, std::uint32_t m
 			break;
 		case PeerMessageId::Request:
 		case PeerMessageId::Cancel:
+		case PeerMessageId::RejectRequest:
 			if (payload_size != 12) {
-				throw PeerProtocolError("request/cancel message payload must be 12 bytes");
+				throw PeerProtocolError("request/cancel/reject message payload must be 12 bytes");
+			}
+			break;
+		case PeerMessageId::SuggestPiece:
+		case PeerMessageId::AllowedFast:
+			if (payload_size != 4) {
+				throw PeerProtocolError("suggest piece / allowed fast payload must be 4 bytes");
+			}
+			break;
+		case PeerMessageId::HaveAll:
+		case PeerMessageId::HaveNone:
+			if (payload_size != 0) {
+				throw PeerProtocolError("have all / have none must not have a payload");
 			}
 			break;
 		case PeerMessageId::Piece:
@@ -307,6 +330,35 @@ PeerMessage make_port(std::uint16_t port) {
 	return PeerMessage{false, static_cast<Byte>(PeerMessageId::Port), std::move(payload)};
 }
 
+PeerMessage make_suggest_piece(std::uint32_t piece_index) {
+	Bytes payload;
+	append_u32(payload, piece_index);
+	return PeerMessage{false, static_cast<Byte>(PeerMessageId::SuggestPiece), std::move(payload)};
+}
+
+PeerMessage make_have_all() {
+	return PeerMessage{false, static_cast<Byte>(PeerMessageId::HaveAll), {}};
+}
+
+PeerMessage make_have_none() {
+	return PeerMessage{false, static_cast<Byte>(PeerMessageId::HaveNone), {}};
+}
+
+PeerMessage make_reject_request(std::uint32_t index, std::uint32_t begin, std::uint32_t length) {
+	Bytes payload;
+	payload.reserve(12);
+	append_u32(payload, index);
+	append_u32(payload, begin);
+	append_u32(payload, length);
+	return PeerMessage{false, static_cast<Byte>(PeerMessageId::RejectRequest), std::move(payload)};
+}
+
+PeerMessage make_allowed_fast(std::uint32_t piece_index) {
+	Bytes payload;
+	append_u32(payload, piece_index);
+	return PeerMessage{false, static_cast<Byte>(PeerMessageId::AllowedFast), std::move(payload)};
+}
+
 PeerMessage make_extended(Byte ext_id, const Bytes& payload) {
 	Bytes full_payload;
 	full_payload.reserve(1 + payload.size());
@@ -322,6 +374,28 @@ HavePayload parse_have(const PeerMessage& message) {
 		throw PeerProtocolError("invalid have message payload");
 	}
 	return HavePayload{read_u32(message.payload.data(), 0)};
+}
+
+std::uint32_t parse_suggest_piece(const PeerMessage& message) {
+	if (message.id != static_cast<Byte>(PeerMessageId::SuggestPiece) || message.payload.size() != 4) {
+		throw PeerProtocolError("invalid suggest piece message payload");
+	}
+	return read_u32(message.payload.data(), 0);
+}
+
+std::uint32_t parse_allowed_fast(const PeerMessage& message) {
+	if (message.id != static_cast<Byte>(PeerMessageId::AllowedFast) || message.payload.size() != 4) {
+		throw PeerProtocolError("invalid allowed fast message payload");
+	}
+	return read_u32(message.payload.data(), 0);
+}
+
+RequestPayload parse_reject_request(const PeerMessage& message) {
+	if (message.id != static_cast<Byte>(PeerMessageId::RejectRequest) || message.payload.size() != 12) {
+		throw PeerProtocolError("invalid reject request message payload");
+	}
+	return RequestPayload{read_u32(message.payload.data(), 0), read_u32(message.payload.data(), 4),
+						  read_u32(message.payload.data(), 8)};
 }
 
 RequestPayload parse_request(const PeerMessage& message) {

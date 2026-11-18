@@ -80,6 +80,12 @@ public:
 					std::size_t size);
 	void send_cancel(std::uint32_t index, std::uint32_t begin, std::uint32_t length);
 	void send_port(std::uint16_t port);
+	// BEP 6 Fast Extension (chỉ gửi khi hai bên đều bật bit trong handshake)
+	void send_suggest_piece(std::uint32_t piece_index);
+	void send_have_all();
+	void send_have_none();
+	void send_reject_request(std::uint32_t index, std::uint32_t begin, std::uint32_t length);
+	void send_allowed_fast(std::uint32_t piece_index);
 
 	// Lifecycle & native access
 	void close() noexcept;

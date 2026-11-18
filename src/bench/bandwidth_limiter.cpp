@@ -70,8 +70,12 @@ bool BandwidthLimiter::consume(std::uint64_t bytes) {
 
     refill_internal();
 
-    double needed = static_cast<double>(bytes);
-    if (tokens_ >= needed) {
+    // Gói lớn hơn cả bucket (vd. block 16 KiB với giới hạn 10 KB/s) sẽ không bao giờ đủ token nếu
+    // đòi đủ `bytes`. Chỉ cần bucket đầy là cho qua và ghi nợ (tokens_ âm): các lần sau phải chờ
+    // trả hết nợ, nên tốc độ trung bình vẫn đúng bằng rate_.
+    const double needed = static_cast<double>(bytes);
+    const double threshold = std::min(needed, static_cast<double>(bucket_max_));
+    if (tokens_ >= threshold) {
         tokens_ -= needed;
         return true;
     }

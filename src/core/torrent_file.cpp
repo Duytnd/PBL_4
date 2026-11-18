@@ -127,6 +127,7 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
         if (filesList == nullptr) {
             throw std::invalid_argument("Torrent metadata: info.files must be a list");
         }
+        std::uint64_t totalLength = 0;
         for (const auto& fileEntry : *filesList) {
             const auto* fileDict = asDict(fileEntry);
             if (fileDict == nullptr) {
@@ -134,7 +135,7 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
             }
             const auto pathIt = fileDict->find("path");
             if (pathIt == fileDict->end()) {
-                continue;
+                throw std::invalid_argument("Torrent metadata: file entry is missing path");
             }
             const auto* pathList = pathIt->second.get_if<BencodeList>();
             if (pathList == nullptr) {
@@ -151,12 +152,27 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
                 }
                 pathValue += *partString;
             }
-            if (!pathValue.empty()) {
-                if (!PathSanitizer::isSafeRelativePath(pathValue)) {
-                    throw std::invalid_argument("Torrent metadata: unsafe file path");
-                }
-                metadata.filePaths.push_back(pathValue);
+            if (pathValue.empty() || !PathSanitizer::isSafeRelativePath(pathValue)) {
+                throw std::invalid_argument("Torrent metadata: unsafe file path");
             }
+            const auto fileLengthIt = fileDict->find("length");
+            if (fileLengthIt == fileDict->end()) {
+                throw std::invalid_argument("Torrent metadata: file entry is missing length");
+            }
+            const auto* fileLength = asInt64(fileLengthIt->second);
+            if (fileLength == nullptr || *fileLength < 0) {
+                throw std::invalid_argument("Torrent metadata: file length must be a non-negative integer");
+            }
+            const auto len = static_cast<std::uint64_t>(*fileLength);
+            if (totalLength > UINT64_MAX - len) {
+                throw std::invalid_argument("Torrent metadata: total length overflow");
+            }
+            totalLength += len;
+            metadata.filePaths.push_back(pathValue);
+            metadata.files.push_back(FileEntry{pathValue, len});
+        }
+        if (!metadata.files.empty()) {
+            metadata.length = totalLength;
         }
     }
 

@@ -44,6 +44,8 @@ public:
     void set_accept_handler(AcceptHandler handler);
     void set_datagram_handler(DatagramHandler handler);
     void allow_peer(const asio::ip::udp::endpoint& endpoint);
+    // Thời gian một endpoint được phép mở kết nối sau khi được xác nhận (mặc định 120 giây).
+    void set_allow_ttl(std::chrono::milliseconds ttl);
     void send_datagram(const asio::ip::udp::endpoint& endpoint, std::string payload);
 
     std::shared_ptr<UtpStream> connect_to(
@@ -65,7 +67,13 @@ private:
     AcceptHandler accept_handler_;
     DatagramHandler datagram_handler_;
     std::unordered_map<utp_socket*, std::shared_ptr<UtpStream>> streams_;
-    std::unordered_set<std::string> allowed_peer_endpoints_;
+    // Endpoint UDP được phép MỞ kết nối uTP vào, kèm hạn dùng. Chỉ thêm khi tracker/rendezvous xác nhận hoặc khi
+    // chính mình chủ động nối ra; hết hạn sau kAllowTtl và bị chặn kích thước (trước đây không bao giờ xoá).
+    // Chỉ truy cập trên luồng ioc_ của engine.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> allowed_peer_endpoints_;
+    std::atomic<long long> allow_ttl_ms_{120000};
+    void remember_allowed(const std::string& key);
+    [[nodiscard]] bool is_allowed(const std::string& key);
 
     void receive_datagram();
     void check_timeouts();

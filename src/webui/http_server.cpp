@@ -2,41 +2,22 @@
 
 #include "httplib.h"
 
+#include "webui/request_guard.h"
+
 #include <iostream>
 
 namespace p2p {
-namespace {
-
-// Tách hostname khỏi "host[:port]" hoặc "scheme://host[:port]"; cho phép gọi qua LAN IP
-// khi phát triển/test DHT bootstrap trên cùng mạng nội bộ.
-bool isAllowedHost(std::string value) {
-    const std::size_t scheme = value.find("://");
-    if (scheme != std::string::npos) {
-        value.erase(0, scheme + 3);
-    }
-    const std::size_t slash = value.find('/');
-    if (slash != std::string::npos) {
-        value.erase(slash);
-    }
-    const std::size_t colon = value.rfind(':');
-    if (colon != std::string::npos) {
-        value.erase(colon);
-    }
-    return value == "127.0.0.1" || value == "localhost" || value == "0.0.0.0" ||
-           value.rfind("10.", 0) == 0 || value.rfind("192.168.", 0) == 0 ||
-           value.rfind("172.", 0) == 0;
-}
-
-}  // namespace
 
 HttpServer::HttpServer(std::filesystem::path staticRoot)
     : staticRoot_(std::move(staticRoot)), server_(new httplib::Server()) {
     // Chỉ phục vụ file tĩnh; API được api_routes.cpp đăng ký thêm vào raw().
     server_->set_mount_point("/", staticRoot_.string());
 
-    // Chấp nhận cả localhost và các IP nội bộ trên cùng LAN để test bootstrap DHT.
+    // Chấp nhận localhost và IP nội bộ (loopback, RFC1918, 100.64/10) dạng IP literal. Không chấp nhận tên miền:
+    // trước đây so tiền tố chuỗi nên "10.evil.com" qua được kiểm tra (DNS rebinding).
     server_->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (!isAllowedHost(req.get_header_value("Host"))) {
+        const std::string host = req.get_header_value("Host");
+        if (!webui::isAllowedHost(host)) {
             res.status = 403;
             res.set_content("Forbidden: invalid Host header", "text/plain");
             return httplib::Server::HandlerResponse::Handled;
@@ -45,7 +26,9 @@ HttpServer::HttpServer(std::filesystem::path staticRoot)
         if (req.method != "GET" && req.method != "HEAD") {
             const std::string origin = req.get_header_value("Origin");
             const bool crossSite = req.get_header_value("Sec-Fetch-Site") == "cross-site";
-            if (crossSite || (!origin.empty() && !isAllowedHost(origin))) {
+            // Origin (nếu có) phải đúng là chính WebUI này, không chỉ "một IP nội bộ nào đó" như trang web
+            // của máy khác trong LAN.
+            if (crossSite || !webui::isSameOrigin(origin, host)) {
                 res.status = 403;
                 res.set_content("Forbidden: cross-origin request", "text/plain");
                 return httplib::Server::HandlerResponse::Handled;

@@ -68,7 +68,8 @@ public:
     static bool should_connect_peer(
         const std::string& local_ip,
         const std::string& candidate_ip,
-        bool has_private_peer_alternative = false);
+        bool has_private_peer_alternative = false,
+        bool allow_public_peers = false);
 
 private:
     struct PendingCall {

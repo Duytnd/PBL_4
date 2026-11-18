@@ -276,6 +276,27 @@ void PeerConnection::send_port(std::uint16_t port) {
 	send_message(peer_protocol::make_port(port));
 }
 
+void PeerConnection::send_suggest_piece(std::uint32_t piece_index) {
+	send_message(peer_protocol::make_suggest_piece(piece_index));
+}
+
+void PeerConnection::send_have_all() {
+	send_message(peer_protocol::make_have_all());
+}
+
+void PeerConnection::send_have_none() {
+	send_message(peer_protocol::make_have_none());
+}
+
+void PeerConnection::send_reject_request(std::uint32_t index, std::uint32_t begin,
+										 std::uint32_t length) {
+	send_message(peer_protocol::make_reject_request(index, begin, length));
+}
+
+void PeerConnection::send_allowed_fast(std::uint32_t piece_index) {
+	send_message(peer_protocol::make_allowed_fast(piece_index));
+}
+
 void PeerConnection::close() noexcept {
 	if (utp_stream_) {
 		utp_stream_->close();

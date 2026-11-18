@@ -1,6 +1,7 @@
 #include "network/dht/kademlia_node.h"
 
 #include "core/hash_utils.h"
+#include "network/lan_address.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -78,46 +79,7 @@ bool is_loopback_or_invalid_ip(const std::string& ip) {
 }
 
 std::string detectLocalLanIp() {
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock != INVALID_SOCKET) {
-        sockaddr_in loopback{};
-        loopback.sin_family = AF_INET;
-        loopback.sin_addr.s_addr = inet_addr("8.8.8.8");
-        loopback.sin_port = htons(53);
-        if (connect(sock, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)) == 0) {
-            sockaddr_in local{};
-            int len = sizeof(local);
-            if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
-                char ipStr[INET_ADDRSTRLEN];
-                if (inet_ntop(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr))) {
-                    closesocket(sock);
-                    return std::string(ipStr);
-                }
-            }
-        }
-        closesocket(sock);
-    }
-#else
-    struct ifaddrs* ifap = nullptr;
-    if (getifaddrs(&ifap) == 0) {
-        for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
-            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
-                auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-                char ipStr[INET_ADDRSTRLEN];
-                if (inet_ntop(AF_INET, &sin->sin_addr, ipStr, sizeof(ipStr))) {
-                    std::string ip(ipStr);
-                    if (ip != "127.0.0.1" && ip.rfind("127.", 0) != 0 && ip.rfind("169.254.", 0) != 0) {
-                        freeifaddrs(ifap);
-                        return ip;
-                    }
-                }
-            }
-        }
-        freeifaddrs(ifap);
-    }
-#endif
-    return "127.0.0.1";
+    return network::detect_lan_ip();
 }
 
 }  // namespace
@@ -135,9 +97,11 @@ bool KademliaNode::is_private_ipv4(const std::string& ip) {
         return false;
     }
 
+    // RFC 1918 + 100.64.0.0/10 (CGNAT / Tailscale): coi là mạng nội bộ, không phải Internet công khai.
     return (octet1 == 10) ||
            (octet1 == 172 && octet2 >= 16 && octet2 <= 31) ||
-           (octet1 == 192 && octet2 == 168);
+           (octet1 == 192 && octet2 == 168) ||
+           (octet1 == 100 && octet2 >= 64 && octet2 <= 127);
 }
 
 bool KademliaNode::is_public_ipv4(const std::string& ip) {
@@ -147,7 +111,8 @@ bool KademliaNode::is_public_ipv4(const std::string& ip) {
 bool KademliaNode::should_connect_peer(
     const std::string& local_ip,
     const std::string& candidate_ip,
-    bool has_private_peer_alternative) {
+    bool has_private_peer_alternative,
+    bool allow_public_peers) {
     if (candidate_ip.empty()) {
         return false;
     }
@@ -159,6 +124,12 @@ bool KademliaNode::should_connect_peer(
     }
 
     if (is_private_ipv4(candidate_ip)) {
+        return true;
+    }
+
+    // Mạng được cấp IP public (mạng trường/lab) hoặc người dùng chủ động muốn nối peer Internet:
+    // bộ lọc LAN bị tắt, mọi peer hợp lệ đều được nối.
+    if (allow_public_peers) {
         return true;
     }
 
@@ -581,12 +552,16 @@ void KademliaNode::announcePeer(const std::string& infoHash, std::uint16_t annou
     // Tự ghi nhận chính mình đang seed info_hash này để trả lời get_peers từ node khác.
     std::lock_guard<std::mutex> lock(announcedMutex_);
     auto& list = announcedPeers_[infoHash];
-    const bool exists = std::any_of(list.begin(), list.end(), [&](const DhtContact& contact) {
+    const std::string myIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+    auto self = std::find_if(list.begin(), list.end(), [&](const DhtContact& contact) {
         return contact.id == selfId_;
     });
-    if (!exists) {
-        const std::string myIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+    if (self == list.end()) {
         list.push_back(DhtContact{selfId_, myIp, announcePort});
+    } else {
+        // Torrent bị xóa rồi thêm lại sẽ nghe ở cổng TCP mới: luôn làm mới cổng, nếu không DHT mãi trả cổng cũ đã đóng.
+        self->ip = myIp;
+        self->port = announcePort;
     }
 }
 

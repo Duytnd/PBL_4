@@ -1,7 +1,9 @@
 #include "network/torrent_session.h"
 
 #include "core/hash_utils.h"
+#include "network/allowed_fast.h"
 #include "network/extension.h"
+#include "network/lan_address.h"
 #include "network/lsd.h"
 #include "network/nat_traversal.h"
 #include "network/udp_rendezvous.h"
@@ -10,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -48,12 +51,33 @@ std::string session_state_to_string(SessionState s) {
 
 }  // namespace
 
+namespace {
+
+// true nếu tracker nằm trong LAN (IP private hoặc loopback). Announce rỗng (chỉ DHT) thì xét IP máy này.
+// Tên miền không biết được là LAN hay không -> coi là ngoài Internet.
+bool announce_targets_lan(const std::string& announce_url) {
+    if (announce_url.empty()) {
+        return KademliaNode::is_private_ipv4(network::detect_lan_ip());
+    }
+    const auto scheme_end = announce_url.find("://");
+    if (scheme_end == std::string::npos) {
+        return false;
+    }
+    const std::string rest = announce_url.substr(scheme_end + 3);
+    std::string host = rest.substr(0, rest.find_first_of(":/"));
+    return KademliaNode::is_private_ipv4(host) || network::is_loopback_address(host);
+}
+
+}  // namespace
+
 TorrentSession::TorrentSession(
     const TorrentFileMetadata& metadata,
     const TorrentSessionConfig& config)
     : metadata_(metadata),
             config_(config),
-            advertised_port_(config.listen_port) {
+            advertised_port_(config.listen_port),
+            download_limiter_(config.max_download_rate),
+            upload_limiter_(config.max_upload_rate) {
     if (config_.client_peer_id.empty()) {
         peer_id_ = generate_azureus_peer_id();
     } else {
@@ -63,6 +87,20 @@ TorrentSession::TorrentSession(
 
     info_hash_raw_ = p2p::sha1Digest(metadata_.infoRaw);
     info_hash_hex_ = p2p::sha1Hex(metadata_.infoRaw);
+
+    {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        const std::uint64_t key = gen();
+        announce_key_raw_.assign(8, '\0');
+        static const char* kHex = "0123456789abcdef";
+        for (int i = 0; i < 8; ++i) {
+            const auto byte = static_cast<unsigned char>((key >> (8 * (7 - i))) & 0xFF);
+            announce_key_raw_[static_cast<std::size_t>(i)] = static_cast<char>(byte);
+            announce_key_hex_.push_back(kHex[byte >> 4]);
+            announce_key_hex_.push_back(kHex[byte & 0x0F]);
+        }
+    }
 
     save_path_ = config_.download_dir / metadata_.name;
     part_path_ = save_path_;
@@ -76,6 +114,10 @@ TorrentSession::TorrentSession(
 
     const std::size_t piece_count = metadata_.pieces.size();
     my_bitfield_.assign(piece_count, false);
+    piece_wanted_.assign(piece_count, true);
+    file_wanted_.assign(metadata_.isMultiFile() ? metadata_.files.size() : 1, true);
+    wanted_remaining_ = piece_count;
+    wanted_bytes_ = total_bytes_;
 
     piece_manager_ = std::make_unique<PieceManager>(
         piece_count,
@@ -84,7 +126,9 @@ TorrentSession::TorrentSession(
         metadata_.pieces);
 
     // Mặc định sử dụng chiến lược Rarest-First và Tit-For-Tat
-    piece_picker_ = std::make_unique<strategy::RarestFirstPicker>();
+    strategy::RarestFirstConfig picker_config;
+    picker_config.pipeline_depth = std::max<std::size_t>(1, config_.pipeline_depth);
+    piece_picker_ = std::make_unique<strategy::RarestFirstPicker>(picker_config);
     choker_ = std::make_unique<strategy::TitForTatChoker>();
 
     check_existing_files();
@@ -121,11 +165,15 @@ void TorrentSession::check_existing_files() {
               << " | Expected total: " << total_bytes_ << " bytes, "
               << metadata_.pieces.size() << " pieces" << std::endl;
 
-    // File đầy đủ ưu tiên; nếu chưa có thì resume từ file tạm .part.
+    // Single-file: file đầy đủ ưu tiên; chưa có thì resume từ file tạm .part.
+    // Multi-file: dữ liệu ghi thẳng vào các file dưới thư mục save_path_ (không có .part).
+    const bool multi = metadata_.isMultiFile();
     const std::filesystem::path& source =
-        std::filesystem::exists(save_path_) ? save_path_ : part_path_;
+        (multi || std::filesystem::exists(save_path_)) ? save_path_ : part_path_;
     if (std::filesystem::exists(source)) {
-        if (piece_manager_->loadFromFile(source)) {
+        const bool loaded = multi ? piece_manager_->loadFromFiles(save_path_, metadata_.files)
+                                  : piece_manager_->loadFromFile(source);
+        if (loaded) {
             completed_pieces_count_ = 0;
             for (std::size_t i = 0; i < metadata_.pieces.size(); ++i) {
                 if (piece_manager_->verifyPiece(i)) {
@@ -151,9 +199,9 @@ void TorrentSession::check_existing_files() {
         std::cout << "[SESSION] File does not exist yet (download target): " << save_path_ << std::endl;
     }
 
-    if (!metadata_.pieces.empty() && completed_pieces_count_ == metadata_.pieces.size()) {
+    recompute_wanted_locked();
+    if (all_wanted_done_locked()) {
         set_state(SessionState::Seeding);
-        left_bytes_ = 0;
         std::cout << "[SESSION] Status set to SEEDING (100% complete)" << std::endl;
     } else if (completed_pieces_count_ > 0) {
         set_state(SessionState::Downloading);
@@ -228,7 +276,16 @@ bool TorrentSession::start() {
                     return;
                 }
 
-                advertised_port_.store(mapping.external_port);
+                // Router có thể đổi cổng ngoài. Peer cùng LAN nối thẳng IP private tới cổng nội bộ
+                // (socket thật chỉ nghe ở listen_port), nên với tracker/mạng nội bộ phải quảng bá
+                // listen_port; cổng ngoài chỉ có nghĩa với peer ngoài Internet.
+                if (mapping.external_port != config_.listen_port && announce_targets_lan(metadata_.announce)) {
+                    std::cout << "[NAT] External port " << mapping.external_port
+                              << " differs from listen port " << config_.listen_port
+                              << "; LAN tracker detected, advertising the listen port to LAN peers" << std::endl;
+                } else {
+                    advertised_port_.store(mapping.external_port);
+                }
                 mapped_tcp_port_ = mapping.external_port;
                 tcp_port_mapped_ = true;
                 next_port_mapping_refresh_ =
@@ -287,7 +344,7 @@ bool TorrentSession::start() {
         }
     }
 
-    if (completed_pieces_count_ == metadata_.pieces.size() && !metadata_.pieces.empty()) {
+    if (all_wanted_done_locked()) {
         set_state(SessionState::Seeding);
         std::cout << "[SESSION] Started as SEEDER on port " << config_.listen_port << std::endl;
     } else {
@@ -504,6 +561,150 @@ void TorrentSession::stop() {
     }
 }
 
+void TorrentSession::recompute_wanted_locked() {
+    wanted_remaining_ = 0;
+    wanted_bytes_ = 0;
+    left_bytes_ = 0;
+    for (std::size_t i = 0; i < piece_wanted_.size(); ++i) {
+        if (!piece_wanted_[i]) {
+            continue;
+        }
+        const std::uint64_t size = piece_manager_->pieceSize(i);
+        wanted_bytes_ += size;
+        if (!my_bitfield_[i]) {
+            ++wanted_remaining_;
+            left_bytes_ += size;
+        }
+    }
+}
+
+bool TorrentSession::set_file_selection(const std::vector<bool>& wanted) {
+    std::unique_lock<std::mutex> lock(session_mutex_);
+    bool need_peers = false;
+    if (wanted.size() != file_wanted_.size() ||
+        std::none_of(wanted.begin(), wanted.end(), [](bool w) { return w; })) {
+        return false;
+    }
+
+    std::vector<bool> piece_wanted(piece_wanted_.size(), false);
+    if (!metadata_.isMultiFile()) {
+        piece_wanted.assign(piece_wanted.size(), true);
+    } else {
+        const std::uint64_t piece_len = static_cast<std::uint64_t>(metadata_.pieceLength);
+        std::uint64_t offset = 0;
+        for (std::size_t f = 0; f < metadata_.files.size(); ++f) {
+            const std::uint64_t length = metadata_.files[f].length;
+            if (wanted[f] && length > 0 && piece_len > 0) {
+                const std::size_t first = static_cast<std::size_t>(offset / piece_len);
+                const std::size_t last = static_cast<std::size_t>((offset + length - 1) / piece_len);
+                for (std::size_t p = first; p <= last && p < piece_wanted.size(); ++p) {
+                    piece_wanted[p] = true;
+                }
+            }
+            offset += length;
+        }
+    }
+
+    file_wanted_ = wanted;
+    piece_wanted_ = std::move(piece_wanted);
+    recompute_wanted_locked();
+
+    // Bỏ các piece dở dang không còn được chọn (đã nhận một phần): giải phóng chỗ trong pipeline.
+    for (auto it = in_progress_pieces_.begin(); it != in_progress_pieces_.end();) {
+        if (it->first < piece_wanted_.size() && !piece_wanted_[it->first]) {
+            const std::uint32_t dropped = static_cast<std::uint32_t>(it->first);
+            pending_blocks_.erase(
+                std::remove_if(pending_blocks_.begin(), pending_blocks_.end(),
+                               [dropped](const auto& pb) { return pb.piece_index == dropped; }),
+                pending_blocks_.end());
+            it = in_progress_pieces_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (running_ && !paused_) {
+        if (all_wanted_done_locked()) {
+            set_state(SessionState::Seeding);
+        } else {
+            if (state_ == SessionState::Seeding) {
+                set_state(SessionState::Downloading);
+                need_peers = true;  // kết nối tới các seed khác thường đã rụng khi mình xong việc
+            }
+            need_peers = need_peers || active_peers_.empty();
+            // Peer đang kết nối có thể vừa trở nên đáng quan tâm (piece mới được chọn).
+            for (auto& [endpoint, peer] : active_peers_) {
+                if (!peer || !peer->connection || peer->am_interested || !peer->connection->is_open()) {
+                    continue;
+                }
+                for (std::size_t i = 0; i < peer->bitfield.size() && i < my_bitfield_.size(); ++i) {
+                    if (peer->bitfield[i] && !my_bitfield_[i] && piece_wanted_[i]) {
+                        try {
+                            peer->connection->send_interested();
+                            peer->am_interested = true;
+                        } catch (...) {
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    lock.unlock();
+    // Lấy lại peer ngay thay vì chờ chu kỳ tracker. Dọn peer đã chết trước, nếu không announce sẽ bỏ qua
+    // chúng vì "đã biết" (vòng bảo trì chỉ dọn mỗi giây một lần).
+    if (need_peers) {
+        cleanup_disconnected_peers();
+        process_tracker_announce("");
+    }
+    return true;
+}
+
+std::vector<bool> TorrentSession::file_selection() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return file_wanted_;
+}
+
+std::vector<FileStatus> TorrentSession::files_status() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    std::vector<FileStatus> result;
+    const std::uint64_t piece_len = static_cast<std::uint64_t>(metadata_.pieceLength);
+
+    std::vector<FileEntry> files = metadata_.files;
+    if (files.empty()) {
+        files.push_back(FileEntry{metadata_.name, total_bytes_});
+    }
+
+    std::uint64_t offset = 0;
+    for (std::size_t f = 0; f < files.size(); ++f) {
+        FileStatus status;
+        status.path = files[f].path;
+        status.length = files[f].length;
+        status.wanted = f < file_wanted_.size() ? static_cast<bool>(file_wanted_[f]) : true;
+
+        if (status.length > 0 && piece_len > 0) {
+            const std::uint64_t end = offset + status.length;
+            const std::size_t first = static_cast<std::size_t>(offset / piece_len);
+            const std::size_t last = static_cast<std::size_t>((end - 1) / piece_len);
+            for (std::size_t p = first; p <= last && p < my_bitfield_.size(); ++p) {
+                if (!my_bitfield_[p]) {
+                    continue;
+                }
+                const std::uint64_t piece_start = static_cast<std::uint64_t>(p) * piece_len;
+                const std::uint64_t piece_end = piece_start + piece_manager_->pieceSize(p);
+                const std::uint64_t from = std::max(piece_start, offset);
+                const std::uint64_t to = std::min(piece_end, end);
+                if (to > from) {
+                    status.completed_bytes += to - from;
+                }
+            }
+        }
+        offset += status.length;
+        result.push_back(std::move(status));
+    }
+    return result;
+}
+
 void TorrentSession::pause() {
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (running_ && !paused_) {
@@ -513,14 +714,24 @@ void TorrentSession::pause() {
 }
 
 void TorrentSession::resume() {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    if (running_ && paused_) {
-        paused_ = false;
-        if (completed_pieces_count_ == metadata_.pieces.size() && !metadata_.pieces.empty()) {
-            set_state(SessionState::Seeding);
-        } else {
-            set_state(SessionState::Downloading);
+    bool need_peers = false;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (running_ && paused_) {
+            paused_ = false;
+            if (all_wanted_done_locked()) {
+                set_state(SessionState::Seeding);
+            } else {
+                set_state(SessionState::Downloading);
+                need_peers = true;
+            }
         }
+    }
+    // Pause làm các worker đóng kết nối và vòng bảo trì tạm dừng nên chưa ai dọn các peer đã chết: dọn ngay,
+    // nếu không lượt announce này sẽ thấy chúng "đã biết" và bỏ qua, rồi phải chờ chu kỳ tracker (~60 giây).
+    if (need_peers) {
+        cleanup_disconnected_peers();
+        process_tracker_announce("");
     }
 }
 
@@ -530,7 +741,7 @@ bool TorrentSession::is_running() const noexcept {
 
 bool TorrentSession::is_complete() const noexcept {
     std::lock_guard<std::mutex> lock(session_mutex_);
-    return !metadata_.pieces.empty() && completed_pieces_count_ == metadata_.pieces.size();
+    return all_wanted_done_locked();
 }
 
 SessionState TorrentSession::state() const noexcept {
@@ -541,7 +752,15 @@ SessionState TorrentSession::state() const noexcept {
 void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     if (ip.empty() || port == 0) return;
 
-    const std::string local_ip = (dht() && !dht()->localIp().empty()) ? dht()->localIp() : "";
+    // Tắt DHT thì không có localIp từ DHT: tự dò, tránh local_ip rỗng làm bộ lọc coi mọi peer public là rác.
+    std::string local_ip = (dht() && !dht()->localIp().empty()) ? dht()->localIp() : "";
+    if (local_ip.empty()) {
+        static const std::string detected_lan_ip = network::detect_lan_ip();
+        local_ip = detected_lan_ip;
+    }
+    const char* allow_public_env = std::getenv("P2P_ALLOW_PUBLIC_PEERS");
+    const bool allow_public_peers =
+        config_.allow_public_peers || (allow_public_env != nullptr && std::string(allow_public_env) == "1");
     bool has_private_alternative = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -554,7 +773,7 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
                 break;
             }
         }
-        if (!KademliaNode::should_connect_peer(local_ip, ip, has_private_alternative)) {
+        if (!KademliaNode::should_connect_peer(local_ip, ip, has_private_alternative, allow_public_peers)) {
             std::cout << "[ADD-PEER] Skipping public peer " << ip << ":" << port
                       << " while LAN private peers are preferred" << std::endl;
             return;
@@ -587,7 +806,7 @@ void TorrentSession::send_udp_registration() {
         utp_engine_->send_datagram(
             tracker_udp_endpoint_,
             udp_rendezvous::encode_register_request(
-                info_hash_raw_, peer_id_, advertised_port_.load()));
+                info_hash_raw_, peer_id_, advertised_port_.load(), announce_key_raw_));
     } catch (const std::exception& ex) {
         std::cout << "[uTP] UDP registration failed: " << ex.what() << std::endl;
     }
@@ -599,7 +818,7 @@ void TorrentSession::request_peer_holepunch(const std::string& ip, std::uint16_t
     }
     const std::string tcp_endpoint = ip + ":" + std::to_string(tcp_port);
     const auto now = std::chrono::steady_clock::now();
-    const std::uint32_t transaction = next_rendezvous_transaction_.fetch_add(1);
+    std::uint32_t transaction = 0;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (discovered_tcp_peer_endpoints_.find(tcp_endpoint) == discovered_tcp_peer_endpoints_.end()) {
@@ -611,7 +830,21 @@ void TorrentSession::request_peer_holepunch(const std::string& ip, std::uint16_t
             return;
         }
         last_rendezvous_request_[tcp_endpoint] = now;
-        pending_rendezvous_targets_[transaction] = tcp_endpoint;
+
+        // Yêu cầu chờ phản hồi quá 30 giây là không bao giờ có phản hồi nữa: dọn, và chặn kích thước.
+        for (auto it = pending_rendezvous_targets_.begin(); it != pending_rendezvous_targets_.end();) {
+            it = now - it->second.requested_at > std::chrono::seconds(30) ? pending_rendezvous_targets_.erase(it)
+                                                                           : std::next(it);
+        }
+        if (pending_rendezvous_targets_.size() >= 256) {
+            return;
+        }
+        // transaction_id ngẫu nhiên, khác 0 và không trùng yêu cầu đang chờ.
+        static thread_local std::mt19937 transaction_rng{std::random_device{}()};
+        do {
+            transaction = std::uniform_int_distribution<std::uint32_t>(1, 0xFFFFFFFFu)(transaction_rng);
+        } while (pending_rendezvous_targets_.count(transaction) != 0);
+        pending_rendezvous_targets_[transaction] = PendingRendezvous{tcp_endpoint, now};
         if (last_rendezvous_request_.size() > 512) {
             for (auto it = last_rendezvous_request_.begin(); it != last_rendezvous_request_.end();) {
                 if (now - it->second > std::chrono::minutes(1)) {
@@ -627,7 +860,7 @@ void TorrentSession::request_peer_holepunch(const std::string& ip, std::uint16_t
         utp_engine_->send_datagram(
             tracker_udp_endpoint_,
             udp_rendezvous::encode_punch_request(
-                info_hash_raw_, peer_id_, advertised_port_.load(), ip, tcp_port, transaction));
+                info_hash_raw_, peer_id_, advertised_port_.load(), ip, tcp_port, transaction, announce_key_raw_));
         send_udp_registration();
         std::cout << "[uTP] Requested UDP rendezvous for " << tcp_endpoint << std::endl;
     } catch (const std::exception& ex) {
@@ -658,7 +891,7 @@ bool TorrentSession::handle_rendezvous_datagram(
         if (pending == pending_rendezvous_targets_.end()) {
             return true;
         }
-        const std::string expected_tcp_endpoint = pending->second;
+        const std::string expected_tcp_endpoint = pending->second.tcp_endpoint;
         pending_rendezvous_targets_.erase(pending);
         const auto colon = expected_tcp_endpoint.find(':');
         if (result.status == udp_rendezvous::Status::Ok &&
@@ -712,6 +945,7 @@ TorrentSessionStats TorrentSession::stats() const {
     s.downloaded_bytes = downloaded_bytes_;
     s.uploaded_bytes = uploaded_bytes_;
     s.left_bytes = left_bytes_;
+    s.wanted_bytes = wanted_bytes_;
     s.total_pieces = metadata_.pieces.size();
     s.completed_pieces = completed_pieces_count_;
     s.connected_peers = active_peers_.size();
@@ -724,23 +958,24 @@ TorrentSessionStats TorrentSession::stats() const {
     // Nếu đang Seeding → luôn 100%
     if (state_ == SessionState::Seeding) {
         s.progress_percent = 100.0;
-    } else if (total_bytes_ > 0 && s.total_pieces > 0) {
+    } else if (wanted_bytes_ > 0 && s.total_pieces > 0) {
         // Byte của piece đã verify + các block đã nhận của piece đang dở, để thanh tiến độ
         // chạy liên tục thay vì nhảy từng piece (piece 256KB trở lên trông như đứng yên).
         std::uint64_t partial = 0;
         for (const auto& [idx, prog] : in_progress_pieces_) {
-            partial += static_cast<std::uint64_t>(prog.received_blocks) * pbl4::network::kStandardBlockSize;
+            if (idx < piece_wanted_.size() && piece_wanted_[idx]) {
+                partial += static_cast<std::uint64_t>(prog.received_blocks) * pbl4::network::kStandardBlockSize;
+            }
         }
-        const std::uint64_t verified = total_bytes_ > left_bytes_ ? total_bytes_ - left_bytes_ : 0;
-        const std::uint64_t done = std::min<std::uint64_t>(verified + partial, total_bytes_);
+        const std::uint64_t verified = wanted_bytes_ > left_bytes_ ? wanted_bytes_ - left_bytes_ : 0;
+        const std::uint64_t done = std::min<std::uint64_t>(verified + partial, wanted_bytes_);
         s.progress_percent = std::clamp(
-            (static_cast<double>(done) / static_cast<double>(total_bytes_)) * 100.0, 0.0, 100.0);
-        if (s.completed_pieces < s.total_pieces) {
+            (static_cast<double>(done) / static_cast<double>(wanted_bytes_)) * 100.0, 0.0, 100.0);
+        if (wanted_remaining_ > 0) {
             s.progress_percent = std::min(s.progress_percent, 99.9);  // 100% chỉ khi đã verify hết
         }
-    } else if (total_bytes_ > 0) {
-        const double downloaded = static_cast<double>(total_bytes_ - left_bytes_);
-        s.progress_percent = std::clamp((downloaded / static_cast<double>(total_bytes_)) * 100.0, 0.0, 100.0);
+    } else if (all_wanted_done_locked()) {
+        s.progress_percent = 100.0;
     } else {
         s.progress_percent = 0.0;
     }
@@ -893,6 +1128,21 @@ void TorrentSession::orchestration_loop() {
                 last_tracker_time = now;
             }
 
+            // 3b. Đang cần tải mà không còn peer nào (vd. seed đóng kết nối, pause/resume, vừa chọn thêm file):
+            // hỏi lại tracker sau tối đa 5 giây thay vì chờ chu kỳ đầy đủ. Giới hạn tần suất để không dồn tracker.
+            if (config_.enable_tracker && now - last_tracker_time >= std::chrono::seconds(5)) {
+                bool starving = false;
+                {
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    starving = state_ == SessionState::Downloading && active_peers_.empty() &&
+                               !all_wanted_done_locked();
+                }
+                if (starving) {
+                    process_tracker_announce("");
+                    last_tracker_time = now;
+                }
+            }
+
             // 4. Announce định kỳ LSD (mỗi 60 giây)
             if (config_.enable_lsd && lsd_ && now - last_lsd_time >= std::chrono::seconds(60)) {
                 lsd_->announce(info_hash_raw_);
@@ -922,6 +1172,37 @@ void TorrentSession::orchestration_loop() {
     }
 }
 
+bool TorrentSession::inbound_allowed_locked(const std::string& ip) const {
+    if (active_peers_.size() >= config_.max_connections) {
+        return false;
+    }
+    const std::size_t reserved_for_outbound = config_.max_connections / 5;
+    std::size_t inbound_total = 0;
+    std::size_t inbound_same_ip = 0;
+    for (const auto& entry : active_peers_) {
+        if (!entry.second || entry.second->outbound) {
+            continue;
+        }
+        ++inbound_total;
+        if (entry.second->ip == ip) {
+            ++inbound_same_ip;
+        }
+    }
+    if (inbound_total + reserved_for_outbound >= config_.max_connections) {
+        return false;
+    }
+    // Nhiều client thật sau cùng một NAT công cộng dùng chung 1 IP: nâng giới hạn bằng P2P_MAX_INBOUND_PER_IP (0 = tắt).
+    std::size_t per_ip_limit = config_.max_inbound_per_ip;
+    if (const char* env = std::getenv("P2P_MAX_INBOUND_PER_IP")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            per_ip_limit = static_cast<std::size_t>(parsed);
+        }
+    }
+    return per_ip_limit == 0 || inbound_same_ip < per_ip_limit;
+}
+
 void TorrentSession::acceptor_loop() {
     try {
         while (running_) {
@@ -942,7 +1223,7 @@ void TorrentSession::acceptor_loop() {
             std::shared_ptr<ActivePeer> peer;
             {
                 std::lock_guard<std::mutex> lock(session_mutex_);
-                if (active_peers_.size() >= config_.max_connections) {
+                if (!inbound_allowed_locked(remote_ip)) {
                     socket.close(ec);
                     continue;
                 }
@@ -950,8 +1231,9 @@ void TorrentSession::acceptor_loop() {
                 peer->ip = remote_ip;
                 peer->port = remote_port;
                 peer->endpoint_str = ep;
+                // Chưa bắt tay thì chỉ cho thời gian ngắn: kết nối im lặng không được giữ chỗ lâu.
                 peer->connection = std::make_shared<pbl4::network::PeerConnection>(
-                    std::move(socket), config_.peer_timeout);
+                    std::move(socket), std::min(config_.handshake_timeout, config_.peer_timeout));
                 peer->bitfield.assign(metadata_.pieces.size(), false);
                 peer->last_active = std::chrono::steady_clock::now();
                 peer->worker_active = true;
@@ -975,7 +1257,7 @@ void TorrentSession::accept_utp_stream(std::shared_ptr<pbl4::network::UtpStream>
 
     auto peer = std::make_shared<ActivePeer>();
     peer->connection = std::make_shared<pbl4::network::PeerConnection>(
-        std::move(stream), config_.peer_timeout);
+        std::move(stream), std::min(config_.handshake_timeout, config_.peer_timeout));
     peer->ip = peer->connection->remote_address();
     peer->port = peer->connection->remote_port();
     peer->endpoint_str = peer->ip + ":" + std::to_string(peer->port);
@@ -985,7 +1267,7 @@ void TorrentSession::accept_utp_stream(std::shared_ptr<pbl4::network::UtpStream>
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
-        if (!running_ || active_peers_.size() >= config_.max_connections ||
+        if (!running_ || !inbound_allowed_locked(peer->ip) ||
             active_peers_.find(peer->endpoint_str) != active_peers_.end()) {
             peer->connection->close();
             return;
@@ -1029,6 +1311,7 @@ void TorrentSession::connect_candidate_peers() {
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
+            peer->outbound = true;  // do mình chủ động mở: không tính vào hạn mức kết nối vào
             peer->endpoint_str = ep_str;
             peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(conn));
             peer->bitfield.assign(metadata_.pieces.size(), false);
@@ -1082,6 +1365,7 @@ void TorrentSession::connect_utp_candidates() {
             auto peer = std::make_shared<ActivePeer>();
             peer->ip = ip;
             peer->port = port;
+            peer->outbound = true;
             peer->endpoint_str = endpoint;
             peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(connection));
             peer->bitfield.assign(metadata_.pieces.size(), false);
@@ -1116,6 +1400,7 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
     std::memcpy(our_hs.peer_id.data(), peer_id_.data(), 20);
     our_hs.set_supports_extension(true);
     our_hs.set_supports_dht(true);
+    our_hs.set_supports_fast(true);
 
     try {
         if (!peer->connection->handshake_completed()) {
@@ -1135,6 +1420,7 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                 peer->worker_active = false;
                 return;
             }
+            peer->connection->set_io_timeout(config_.peer_timeout);  // đã bắt tay xong: hết hạn ngắn của kết nối vào
             std::cout << "[PEER-WIRE] Handshake OK with " << peer->endpoint_str
                       << " (peer_id: " << peer->remote_peer_id.substr(0, 8) << "...)" << std::endl;
         } else {
@@ -1142,7 +1428,9 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
             std::cout << "[PEER-WIRE] Inbound Handshake reply sent to " << peer->endpoint_str << std::endl;
         }
 
-        // Gửi Bitfield của client cho Peer ngay sau handshake
+        peer->fast = peer->connection->remote_handshake().supports_fast();
+
+        // Gửi Bitfield của client cho Peer ngay sau handshake (BEP 6: HaveAll / HaveNone khi cả hai hỗ trợ Fast Extension)
         std::vector<bool> current_bits;
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
@@ -1150,9 +1438,31 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
         }
         std::size_t my_has = 0;
         for (bool b : current_bits) if (b) my_has++;
-        std::cout << "[PEER-WIRE] Sending bitfield (" << my_has << "/" << current_bits.size()
-                  << " pieces) to " << peer->endpoint_str << std::endl;
-        peer->connection->send_bitfield(current_bits);
+        if (peer->fast && !current_bits.empty() && my_has == current_bits.size()) {
+            std::cout << "[PEER-WIRE] Sending HAVE_ALL to " << peer->endpoint_str << std::endl;
+            peer->connection->send_have_all();
+        } else if (peer->fast && my_has == 0) {
+            std::cout << "[PEER-WIRE] Sending HAVE_NONE to " << peer->endpoint_str << std::endl;
+            peer->connection->send_have_none();
+        } else {
+            std::cout << "[PEER-WIRE] Sending bitfield (" << my_has << "/" << current_bits.size()
+                      << " pieces) to " << peer->endpoint_str << std::endl;
+            peer->connection->send_bitfield(current_bits);
+        }
+
+        // BEP 6: cho peer xin một tập piece cố định ngay cả khi họ đang bị choke (khởi động nhanh, không cần chờ unchoke).
+        if (peer->fast && !metadata_.pieces.empty()) {
+            asio::error_code addr_ec;
+            const auto addr = asio::ip::make_address_v4(peer->ip, addr_ec);
+            if (!addr_ec) {
+                const auto allowed = pbl4::network::compute_allowed_fast_set(
+                    addr.to_uint(), info_hash_raw_, static_cast<std::uint32_t>(metadata_.pieces.size()), 10);
+                for (std::uint32_t piece_index : allowed) {
+                    peer->allowed_fast_for_peer.insert(piece_index);
+                    peer->connection->send_allowed_fast(piece_index);
+                }
+            }
+        }
 
         // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
         if (auto* d = dht(); d && peer->connection->is_open()) {
@@ -1173,7 +1483,12 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
 
         // Vòng lặp nhận và xử lý message
         while (running_ && !paused_ && peer->connection->is_open()) {
-            if (!peer->peer_choking && peer->am_interested) {
+            bool may_request = false;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                may_request = peer->can_request();
+            }
+            if (may_request) {
                 request_next_blocks(peer);
             }
 
@@ -1187,8 +1502,11 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                 }
             }
         }
-    } catch (...) {
+    } catch (const std::exception& e) {
         // Socket closed or error during peer communication
+        std::cout << "[PEER-WIRE] Connection with " << peer->endpoint_str << " ended: " << e.what() << std::endl;
+    } catch (...) {
+        std::cout << "[PEER-WIRE] Connection with " << peer->endpoint_str << " ended (unknown error)" << std::endl;
     }
 
     if (peer->connection && peer->connection->is_open()) {
@@ -1218,10 +1536,14 @@ void TorrentSession::handle_peer_message(
             {
                 // Peer huỷ mọi request khi choke; nếu không xoá, các block này kẹt mãi
                 // trong pending_blocks_ và pipeline của peer đầy 4/4 nên không tải nữa.
+                // BEP 6: với peer Fast, request của piece "allowed fast" vẫn được phục vụ nên giữ lại.
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 pending_blocks_.erase(
                     std::remove_if(pending_blocks_.begin(), pending_blocks_.end(),
-                                   [&](const PendingBlock& pb) { return pb.peer_endpoint == peer->endpoint_str; }),
+                                   [&](const PendingBlock& pb) {
+                                       return pb.peer_endpoint == peer->endpoint_str &&
+                                              !(peer->fast && peer->allowed_fast_to_us.count(pb.piece_index) != 0);
+                                   }),
                     pending_blocks_.end());
             }
             std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " CHOKED us." << std::endl;
@@ -1229,6 +1551,10 @@ void TorrentSession::handle_peer_message(
         }
         case pbl4::network::PeerMessageId::Unchoke: {
             peer->peer_choking = false;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                peer->rejected_pieces.clear();  // trạng thái peer đổi: cho phép thử lại các piece từng bị từ chối
+            }
             std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " UNCHOKED us! Requesting blocks..." << std::endl;
             request_next_blocks(peer);
             break;
@@ -1256,7 +1582,7 @@ void TorrentSession::handle_peer_message(
             if (have.index < peer->bitfield.size()) {
                 peer->bitfield[have.index] = true;
             }
-            if (have.index < my_bitfield_.size() && !my_bitfield_[have.index]) {
+            if (have.index < my_bitfield_.size() && !my_bitfield_[have.index] && piece_wanted_[have.index]) {
                 if (!peer->am_interested) {
                     peer->connection->send_interested();
                     peer->am_interested = true;
@@ -1266,29 +1592,57 @@ void TorrentSession::handle_peer_message(
         }
         case pbl4::network::PeerMessageId::Bitfield: {
             auto bits = pbl4::network::peer_protocol::parse_bitfield(msg, metadata_.pieces.size());
-
+            apply_peer_bitfield(peer, bits);
+            break;
+        }
+        case pbl4::network::PeerMessageId::HaveAll: {
+            if (!peer->fast) break;  // chưa thoả thuận Fast Extension: bỏ qua
+            apply_peer_bitfield(peer, std::vector<bool>(metadata_.pieces.size(), true));
+            break;
+        }
+        case pbl4::network::PeerMessageId::HaveNone: {
+            if (!peer->fast) break;
+            apply_peer_bitfield(peer, std::vector<bool>(metadata_.pieces.size(), false));
+            break;
+        }
+        case pbl4::network::PeerMessageId::SuggestPiece: {
+            if (!peer->fast) break;
+            (void)pbl4::network::peer_protocol::parse_suggest_piece(msg);  // chỉ là gợi ý: piece picker tự quyết
+            break;
+        }
+        case pbl4::network::PeerMessageId::AllowedFast: {
+            if (!peer->fast) break;
+            const std::uint32_t piece_index = pbl4::network::peer_protocol::parse_allowed_fast(msg);
             bool should_request = false;
             {
                 std::lock_guard<std::mutex> lock(session_mutex_);
-                peer->bitfield = bits;
-                bool interested = false;
-                for (std::size_t i = 0; i < bits.size() && i < my_bitfield_.size(); ++i) {
-                    if (bits[i] && !my_bitfield_[i]) {
-                        interested = true;
-                        break;
-                    }
+                constexpr std::size_t kMaxAllowedFastFromPeer = 64;  // chặn peer gửi vô hạn để phình bộ nhớ
+                if (piece_index < metadata_.pieces.size() && peer->allowed_fast_to_us.size() < kMaxAllowedFastFromPeer) {
+                    peer->allowed_fast_to_us.insert(piece_index);
                 }
-                if (interested && !peer->am_interested) {
-                    peer->connection->send_interested();
-                    peer->am_interested = true;
-                }
-                // Nếu đã được unchoke từ trước (race: unchoke đến trước bitfield),
-                // đánh dấu để gửi request ngay sau khi giải phóng lock
-                should_request = (!peer->peer_choking && peer->am_interested);
+                should_request = peer->can_request();
             }
             if (should_request) {
                 request_next_blocks(peer);
             }
+            break;
+        }
+        case pbl4::network::PeerMessageId::RejectRequest: {
+            if (!peer->fast) break;
+            const auto rejected = pbl4::network::peer_protocol::parse_reject_request(msg);
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                // Trả block về để xin nơi khác; piece này không xin lại từ peer này cho tới khi họ unchoke.
+                pending_blocks_.erase(
+                    std::remove_if(pending_blocks_.begin(), pending_blocks_.end(), [&](const PendingBlock& pb) {
+                        return pb.piece_index == rejected.index && pb.begin == rejected.begin &&
+                               pb.peer_endpoint == peer->endpoint_str;
+                    }),
+                    pending_blocks_.end());
+                peer->rejected_pieces.insert(rejected.index);
+            }
+            std::cout << "[PEER-WIRE] Peer " << peer->endpoint_str << " REJECTED request for piece #" << rejected.index
+                      << " (begin: " << rejected.begin << ")." << std::endl;
             break;
         }
         case pbl4::network::PeerMessageId::Request: {
@@ -1301,7 +1655,12 @@ void TorrentSession::handle_peer_message(
             handle_piece_block(peer, piece);
             // Pipeline: ngay sau khi nhận được block, gửi tiếp request block kế tiếp
             // để luôn duy trì 4 request song song → tốc độ tải tối đa
-            if (!peer->peer_choking && peer->am_interested) {
+            bool may_request = false;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                may_request = peer->can_request();
+            }
+            if (may_request) {
                 request_next_blocks(peer);
             }
             break;
@@ -1406,9 +1765,20 @@ void TorrentSession::handle_peer_message(
 void TorrentSession::handle_request_block(
     std::shared_ptr<ActivePeer> peer,
     const pbl4::network::RequestPayload& req) {
-    if (peer->am_choking) {
+    // BEP 6: với peer Fast, từ chối phải nói rõ bằng Reject Request (peer không phải chờ timeout để biết).
+    const auto reject = [&]() {
+        if (!peer->fast) return;
+        try {
+            peer->connection->send_reject_request(req.index, req.begin, req.length);
+        } catch (...) {
+        }
+    };
+    // Peer bị choke chỉ được xin piece "allowed fast" (đã gửi cho họ lúc đầu).
+    const bool allowed_while_choked = peer->fast && peer->allowed_fast_for_peer.count(req.index) != 0;
+    if (peer->am_choking && !allowed_while_choked) {
         std::cout << "[UPLOAD] Rejected request from " << peer->endpoint_str
                   << " because peer is choked by us." << std::endl;
+        reject();
         return;
     }
 
@@ -1422,6 +1792,12 @@ void TorrentSession::handle_request_block(
     }
 
     if (success && !block_data.empty()) {
+        while (running_ && !upload_limiter_.consume(block_data.size())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!running_) {
+            return;
+        }
         peer->connection->send_piece(
             req.index, req.begin,
             reinterpret_cast<const pbl4::network::Byte*>(block_data.data()),
@@ -1436,6 +1812,7 @@ void TorrentSession::handle_request_block(
                   << " | Total uploaded: " << uploaded_bytes_ << " bytes" << std::endl;
     } else {
         std::cout << "[UPLOAD] Failed to read piece #" << req.index << " (we might not have it)." << std::endl;
+        reject();
     }
 }
 
@@ -1444,6 +1821,7 @@ void TorrentSession::handle_piece_block(
     const pbl4::network::PiecePayload& piece) {
     bool torrent_finished = false;
     PieceCompletedCallback piece_cb;
+    std::vector<std::function<void()>> deferred_sends;  // gửi qua socket phải chạy sau khi nhả session_mutex_
     TorrentFinishedCallback finished_cb;
     std::size_t completed_snapshot = 0;
     const std::size_t total_pieces = metadata_.pieces.size();
@@ -1506,9 +1884,14 @@ void TorrentSession::handle_piece_block(
         for (const auto& pb : to_cancel) {
             auto other = active_peers_.find(pb.peer_endpoint);
             if (other != active_peers_.end() && other->second->connection) {
-                other->second->connection->send_cancel(pb.piece_index, pb.begin, pb.length);
-                std::cout << "[DOWNLOAD-REQ][ENDGAME] Cancel piece #" << pb.piece_index << " (begin: "
-                          << pb.begin << ") sent to " << pb.peer_endpoint << std::endl;
+                deferred_sends.push_back([connection = other->second->connection, pb]() {
+                    try {
+                        connection->send_cancel(pb.piece_index, pb.begin, pb.length);
+                        std::cout << "[DOWNLOAD-REQ][ENDGAME] Cancel piece #" << pb.piece_index << " (begin: "
+                                  << pb.begin << ") sent to " << pb.peer_endpoint << std::endl;
+                    } catch (...) {
+                    }
+                });
             }
         }
 
@@ -1530,22 +1913,48 @@ void TorrentSession::handle_piece_block(
                 std::cout << "[PIECE-VERIFY] Piece #" << piece.index << " SHA-1 VERIFIED OK! ("
                           << completed_pieces_count_ << "/" << total_pieces << " completed)" << std::endl;
 
-                if (left_bytes_ >= piece_sz) {
-                    left_bytes_ -= piece_sz;
-                } else {
-                    left_bytes_ = 0;
+                // Piece ngoài phần được chọn (về muộn sau khi người dùng bỏ file) không tính vào tiến độ.
+                const bool piece_was_wanted = piece_wanted_[piece.index];
+                if (piece_was_wanted) {
+                    if (wanted_remaining_ > 0) {
+                        --wanted_remaining_;
+                    }
+                    if (left_bytes_ >= piece_sz) {
+                        left_bytes_ -= piece_sz;
+                    } else {
+                        left_bytes_ = 0;
+                    }
                 }
 
                 in_progress_pieces_.erase(piece.index);
 
                 // Lưu ngay piece đã verify vào file .part để tắt app giữa chừng không mất tiến độ.
-                if (!piece_manager_->writePieceToFile(piece.index, part_path_)) {
+                const bool persisted = metadata_.isMultiFile()
+                    ? piece_manager_->writePieceToFiles(piece.index, save_path_, metadata_.files)
+                    : piece_manager_->writePieceToFile(piece.index, part_path_);
+                if (!persisted) {
                     std::cout << "[SESSION] Warning: could not persist piece #" << piece.index
-                              << " to " << part_path_ << std::endl;
+                              << " to " << (metadata_.isMultiFile() ? save_path_ : part_path_) << std::endl;
                 }
 
-                // Báo cho các peer khác biết mình đã có mảnh này (Have)
-                broadcast_have(piece.index);
+                // Báo cho các peer khác biết mình đã có mảnh này (Have): chụp danh sách kết nối trong khoá, gửi ngoài khoá.
+                {
+                    std::vector<std::shared_ptr<pbl4::network::PeerConnection>> have_targets;
+                    for (auto& [ep, other_peer] : active_peers_) {
+                        if (other_peer && other_peer->connection && other_peer->connection->is_open()) {
+                            have_targets.push_back(other_peer->connection);
+                        }
+                    }
+                    const std::uint32_t have_index = static_cast<std::uint32_t>(piece.index);
+                    deferred_sends.push_back([have_targets, have_index]() {
+                        for (const auto& connection : have_targets) {
+                            try {
+                                connection->send_have(have_index);
+                            } catch (...) {
+                            }
+                        }
+                    });
+                }
 
                 piece_verified = true;
                 verified_piece = piece.index;
@@ -1553,7 +1962,7 @@ void TorrentSession::handle_piece_block(
                 piece_cb = piece_cb_;
 
                 // Kiểm tra hoàn tất toàn bộ torrent
-                torrent_finished = check_and_finalize_completion();
+                torrent_finished = piece_was_wanted && check_and_finalize_completion();
                 if (torrent_finished) {
                     finished_cb = finished_cb_;
                 }
@@ -1562,6 +1971,10 @@ void TorrentSession::handle_piece_block(
                 in_progress_pieces_.erase(piece.index);
             }
         }
+    }
+
+    for (const auto& send : deferred_sends) {
+        send();
     }
 
     // Announce tracker và callback phải chạy NGOÀI session_mutex_ (mutex không recursive:
@@ -1577,7 +1990,52 @@ void TorrentSession::handle_piece_block(
     }
 }
 
+void TorrentSession::apply_peer_bitfield(const std::shared_ptr<ActivePeer>& peer, const std::vector<bool>& bits) {
+    bool should_request = false;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        peer->bitfield = bits;
+        bool interested = false;
+        for (std::size_t i = 0; i < bits.size() && i < my_bitfield_.size(); ++i) {
+            if (bits[i] && !my_bitfield_[i] && piece_wanted_[i]) {
+                interested = true;
+                break;
+            }
+        }
+        if (interested && !peer->am_interested) {
+            peer->connection->send_interested();
+            peer->am_interested = true;
+        }
+        // Nếu đã được unchoke từ trước (race: unchoke đến trước bitfield) hoặc peer Fast đã cho piece "allowed fast",
+        // gửi request ngay sau khi nhả khoá.
+        should_request = peer->can_request();
+    }
+    if (should_request) {
+        request_next_blocks(peer);
+    }
+}
+
 bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
+    BlockRequest request;
+    const bool result = request_next_blocks_locked(peer, request);
+    if (request.valid) {
+        // Gửi NGOÀI khoá. Gửi lỗi thì bỏ ghi nhận block đang chờ để xin lại từ nơi khác.
+        try {
+            peer->connection->send_request(request.piece, request.begin, request.length);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            pending_blocks_.erase(
+                std::remove_if(pending_blocks_.begin(), pending_blocks_.end(), [&](const PendingBlock& pb) {
+                    return pb.piece_index == request.piece && pb.begin == request.begin &&
+                           pb.peer_endpoint == peer->endpoint_str;
+                }),
+                pending_blocks_.end());
+        }
+    }
+    return result;
+}
+
+bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer, BlockRequest& out) {
     std::lock_guard<std::mutex> lock(session_mutex_);
     // Cho phép request trong trạng thái Downloading HOẶC nếu vẫn còn piece cần tải
     if (my_bitfield_.empty()) {
@@ -1599,9 +2057,21 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
         return false;
     }
 
+    // Peer này phục vụ được piece nào: có piece đó, chưa từng Reject, và (không bị choke hoặc là piece "allowed fast").
+    const bool choked = peer->peer_choking;
+    const auto peer_can_serve = [&](std::size_t piece_idx) {
+        if (piece_idx >= peer->bitfield.size() || !peer->bitfield[piece_idx]) return false;
+        const auto index32 = static_cast<std::uint32_t>(piece_idx);
+        if (peer->rejected_pieces.count(index32) != 0) return false;
+        return !choked || (peer->fast && peer->allowed_fast_to_us.count(index32) != 0);
+    };
+
     // 1. Tìm block chưa tải trong các piece đang dở dang mà peer này có
     for (auto& [piece_idx, prog] : in_progress_pieces_) {
-        if (piece_idx < peer->bitfield.size() && peer->bitfield[piece_idx]) {
+        if (piece_idx < piece_wanted_.size() && !piece_wanted_[piece_idx]) {
+            continue;  // người dùng đã bỏ file chứa piece này
+        }
+        if (peer_can_serve(piece_idx)) {
             for (std::size_t b = 0; b < prog.total_blocks; ++b) {
                 if (!prog.received_block_mask[b]) {
                     const std::uint32_t begin = static_cast<std::uint32_t>(b * pbl4::network::kStandardBlockSize);
@@ -1619,7 +2089,10 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
                     }
 
                     if (!already_requested) {
-                        peer->connection->send_request(piece_idx, begin, len);
+                        if (!download_limiter_.consume(len)) {
+                            return false;  // hết băng thông tải: thử lại ở lượt sau
+                        }
+                        out = BlockRequest{true, static_cast<std::uint32_t>(piece_idx), begin, len};
                         pending_blocks_.push_back({piece_idx, begin, len, peer->endpoint_str, std::chrono::steady_clock::now()});
                         return true;
                     }
@@ -1636,21 +2109,48 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
     }
 
     std::vector<bool> unavailable_or_in_progress = my_bitfield_;
+    std::size_t wanted_total = 0;
+    for (std::size_t i = 0; i < piece_wanted_.size() && i < unavailable_or_in_progress.size(); ++i) {
+        if (piece_wanted_[i]) {
+            ++wanted_total;
+        } else {
+            unavailable_or_in_progress[i] = true;  // không chọn tải: coi như đã có để picker bỏ qua
+        }
+    }
     for (const auto& [piece_idx, prog] : in_progress_pieces_) {
         if (piece_idx < unavailable_or_in_progress.size()) {
             unavailable_or_in_progress[piece_idx] = true;
         }
     }
 
+    if (choked || !peer->rejected_pieces.empty()) {
+        // Chỉ chọn trong những piece peer này thật sự phục vụ được (bị choke -> chỉ piece "allowed fast").
+        for (std::size_t i = 0; i < unavailable_or_in_progress.size(); ++i) {
+            if (!peer_can_serve(i)) unavailable_or_in_progress[i] = true;
+        }
+    }
+
     strategy::PickerContext picker_ctx;
-    picker_ctx.total_pieces = my_bitfield_.size();
-    picker_ctx.completed_pieces = completed_pieces_count_;
-    picker_ctx.in_progress_pieces = in_progress_pieces_.size();
+    picker_ctx.total_pieces = wanted_total;
+    picker_ctx.completed_pieces = wanted_total >= wanted_remaining_ ? wanted_total - wanted_remaining_ : 0;
+    picker_ctx.in_progress_pieces = 0;
+    for (const auto& entry : in_progress_pieces_) {
+        if (entry.first < piece_wanted_.size() && piece_wanted_[entry.first]) {
+            ++picker_ctx.in_progress_pieces;
+        }
+    }
 
     const int next_piece = piece_picker_->pick_piece(picker_ctx, unavailable_or_in_progress, peers_bits);
-    if (next_piece >= 0 && static_cast<std::size_t>(next_piece) < peer->bitfield.size() && peer->bitfield[next_piece]) {
+    if (next_piece >= 0 && peer_can_serve(static_cast<std::size_t>(next_piece))) {
         const std::size_t piece_sz = piece_manager_->pieceSize(next_piece);
         const std::size_t block_count = (piece_sz + pbl4::network::kStandardBlockSize - 1) / pbl4::network::kStandardBlockSize;
+
+        const std::uint32_t begin = 0;
+        const std::uint32_t len = static_cast<std::uint32_t>(
+            std::min<std::size_t>(pbl4::network::kStandardBlockSize, piece_sz));
+        if (!download_limiter_.consume(len)) {
+            return false;  // hết băng thông tải: chưa đánh dấu piece đang tải, thử lại ở lượt sau
+        }
 
         PieceProgress prog;
         prog.total_blocks = block_count;
@@ -1658,11 +2158,7 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
         prog.received_block_mask.assign(block_count, false);
         in_progress_pieces_[next_piece] = prog;
 
-        const std::uint32_t begin = 0;
-        const std::uint32_t len = static_cast<std::uint32_t>(
-            std::min<std::size_t>(pbl4::network::kStandardBlockSize, piece_sz));
-
-        peer->connection->send_request(next_piece, begin, len);
+        out = BlockRequest{true, static_cast<std::uint32_t>(next_piece), begin, len};
         pending_blocks_.push_back({static_cast<std::uint32_t>(next_piece), begin, len, peer->endpoint_str, std::chrono::steady_clock::now()});
         std::cout << "[DOWNLOAD-REQ] Sent request for piece #" << next_piece << " (begin: " << begin
                   << ", len: " << len << ") to " << peer->endpoint_str << std::endl;
@@ -1674,7 +2170,8 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
         if (piece_picker_->in_endgame(picker_ctx)) {
             const std::size_t max_copies = piece_picker_->endgame_max_copies();
             for (auto& [piece_idx, prog] : in_progress_pieces_) {
-                if (piece_idx >= peer->bitfield.size() || !peer->bitfield[piece_idx]) {
+                if (!peer_can_serve(piece_idx) ||
+                    (piece_idx < piece_wanted_.size() && !piece_wanted_[piece_idx])) {
                     continue;
                 }
                 for (std::size_t b = 0; b < prog.total_blocks; ++b) {
@@ -1697,7 +2194,10 @@ bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
                     if (requested_by_this_peer || copies == 0 || copies >= max_copies) {
                         continue;
                     }
-                    peer->connection->send_request(piece_idx, begin, len);
+                    if (!download_limiter_.consume(len)) {
+                        return false;
+                    }
+                    out = BlockRequest{true, static_cast<std::uint32_t>(piece_idx), begin, len};
                     pending_blocks_.push_back({piece_idx, begin, len, peer->endpoint_str, std::chrono::steady_clock::now()});
                     std::cout << "[DOWNLOAD-REQ][ENDGAME] Duplicate request for piece #" << piece_idx
                               << " (begin: " << begin << ", len: " << len << ") to " << peer->endpoint_str
@@ -1736,9 +2236,23 @@ void TorrentSession::broadcast_have(std::uint32_t piece_index) {
 bool TorrentSession::check_and_finalize_completion() {
     // Gọi khi đang giữ session_mutex_. Trả true nếu vừa hoàn tất; người gọi tự announce
     // "completed" và gọi callback sau khi nhả lock.
-    if (completed_pieces_count_ >= metadata_.pieces.size() && !metadata_.pieces.empty()) {
+    if (all_wanted_done_locked()) {
         try {
-            piece_manager_->writeToFile(save_path_);
+            if (metadata_.isMultiFile()) {
+                // Piece đã ghi dần vào từng file; chỉ cần bảo đảm đủ file (gồm file dài 0).
+                // Chỉ tạo file được chọn; file bị bỏ không được tạo rỗng giả như đã tải xong.
+                std::vector<FileEntry> wanted_files;
+                for (std::size_t i = 0; i < metadata_.files.size(); ++i) {
+                    if (i >= file_wanted_.size() || file_wanted_[i]) {
+                        wanted_files.push_back(metadata_.files[i]);
+                    }
+                }
+                if (!PieceManager::ensureFiles(save_path_, wanted_files)) {
+                    throw std::runtime_error("cannot create torrent files under " + save_path_.string());
+                }
+            } else {
+                piece_manager_->writeToFile(save_path_);
+            }
         } catch (const std::exception& e) {
             error_message_ = std::string("Failed to write completed torrent to disk: ") + e.what();
             set_state(SessionState::Error);
@@ -1750,48 +2264,62 @@ bool TorrentSession::check_and_finalize_completion() {
 
         set_state(SessionState::Seeding);
         error_message_.clear();
-        left_bytes_ = 0;
         return true;
     }
     return false;
 }
 
 void TorrentSession::perform_choker_update() {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    if (active_peers_.empty() || !choker_) {
-        return;
+    // Chỉ quyết định trong khoá; gửi choke/unchoke ngoài khoá (một peer ngừng đọc sẽ chặn lệnh gửi tới 30 giây,
+    // và nếu đang giữ session_mutex_ thì cả Web UI treo theo).
+    struct ChokeAction {
+        std::shared_ptr<ActivePeer> peer;
+        bool unchoke = false;
+    };
+    std::vector<ChokeAction> actions;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (active_peers_.empty() || !choker_) {
+            return;
+        }
+
+        std::vector<strategy::PeerStatus> statuses;
+        statuses.reserve(active_peers_.size());
+
+        for (const auto& [ep, peer] : active_peers_) {
+            strategy::PeerStatus ps;
+            ps.peer_id = peer->remote_peer_id.empty() ? peer->endpoint_str : peer->remote_peer_id;
+            ps.is_interested = peer->peer_interested;
+            ps.am_choking_them = peer->am_choking;
+            ps.download_rate = peer->download_rate;
+            ps.upload_rate = peer->upload_rate;
+            statuses.push_back(ps);
+        }
+
+        const bool is_seeding = (state_ == SessionState::Seeding);
+        const auto unchoked_ids = choker_->update_chokes(statuses, is_seeding);
+
+        for (auto& [ep, peer] : active_peers_) {
+            const std::string id = peer->remote_peer_id.empty() ? peer->endpoint_str : peer->remote_peer_id;
+            const bool should_unchoke = (std::find(unchoked_ids.begin(), unchoked_ids.end(), id) != unchoked_ids.end());
+            if (should_unchoke && peer->am_choking) {
+                actions.push_back({peer, true});
+            } else if (!should_unchoke && !peer->am_choking) {
+                actions.push_back({peer, false});
+            }
+        }
     }
 
-    std::vector<strategy::PeerStatus> statuses;
-    statuses.reserve(active_peers_.size());
-
-    for (const auto& [ep, peer] : active_peers_) {
-        strategy::PeerStatus ps;
-        ps.peer_id = peer->remote_peer_id.empty() ? peer->endpoint_str : peer->remote_peer_id;
-        ps.is_interested = peer->peer_interested;
-        ps.am_choking_them = peer->am_choking;
-        ps.download_rate = peer->download_rate;
-        ps.upload_rate = peer->upload_rate;
-        statuses.push_back(ps);
-    }
-
-    const bool is_seeding = (state_ == SessionState::Seeding);
-    const auto unchoked_ids = choker_->update_chokes(statuses, is_seeding);
-
-    for (auto& [ep, peer] : active_peers_) {
-        const std::string id = peer->remote_peer_id.empty() ? peer->endpoint_str : peer->remote_peer_id;
-        const bool should_unchoke = (std::find(unchoked_ids.begin(), unchoked_ids.end(), id) != unchoked_ids.end());
-
-        if (should_unchoke && peer->am_choking) {
-            try {
-                peer->connection->send_unchoke();
-                peer->am_choking = false;
-            } catch (...) {}
-        } else if (!should_unchoke && !peer->am_choking) {
-            try {
-                peer->connection->send_choke();
-                peer->am_choking = true;
-            } catch (...) {}
+    for (const auto& action : actions) {
+        try {
+            if (action.unchoke) {
+                action.peer->connection->send_unchoke();
+                action.peer->am_choking = false;
+            } else {
+                action.peer->connection->send_choke();
+                action.peer->am_choking = true;
+            }
+        } catch (...) {
         }
     }
 }
@@ -1874,6 +2402,7 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
     req.event = event;
     req.numwant = 50;
     req.compact = true;
+    req.key = announce_key_hex_;  // giữ chỗ peer_id: người khác biết peer_id cũng không announce/xoá/đổi UDP thay mình
 
     const std::string url = metadata_.announce;
     std::cout << "[TRACKER-ANNOUNCE] Sending event='" << event
@@ -1905,7 +2434,7 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
         } guard{announce_inflight_};
 
         try {
-            TrackerResponse resp = TrackerClient::announceHttp(url, req);
+            TrackerResponse resp = TrackerClient::announceTracker(url, req);
             if (resp.success) {
                 send_udp_registration();
                 std::cout << "[TRACKER-ANNOUNCE] Response OK | peers received: "
@@ -1914,8 +2443,7 @@ void TorrentSession::process_tracker_announce(const std::string& event) {
                     std::lock_guard<std::mutex> lock(session_mutex_);
                     if (state_ == SessionState::Waiting && running_) {
                         error_message_.clear();
-                        const bool complete =
-                            !metadata_.pieces.empty() && completed_pieces_count_ == metadata_.pieces.size();
+                        const bool complete = all_wanted_done_locked();
                         set_state(complete ? SessionState::Seeding : SessionState::Downloading);
                     }
                 }

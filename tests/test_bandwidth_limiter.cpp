@@ -90,6 +90,15 @@ void testSetRateToZeroBecomesUnlimited() {
 // ---------------------------------------------------------------------------
 // Nhiều luồng consume() không crash / race condition (smoke test)
 // ---------------------------------------------------------------------------
+// Block 16 KiB với giới hạn 10 KB/s: lớn hơn cả bucket nhưng không được kẹt vĩnh viễn.
+void testPacketLargerThanBucketIsEventuallyAllowed() {
+    BandwidthLimiter limiter(10000);
+    CHECK(limiter.consume(16384));   // bucket đầy -> cho qua và ghi nợ
+    CHECK(!limiter.consume(1));      // đang nợ -> phải chờ
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));  // trả nợ ~8000 byte, còn dư
+    CHECK(limiter.consume(1));
+}
+
 void testConcurrentConsumeNoCrash() {
     BandwidthLimiter limiter(0);  // unlimited để tránh tính đúng sai
     std::vector<std::thread> threads;
@@ -113,6 +122,7 @@ int main() {
     RUN(testRefillAfterDelay);
     RUN(testSetRateDynamic);
     RUN(testSetRateToZeroBecomesUnlimited);
+    RUN(testPacketLargerThanBucketIsEventuallyAllowed);
     RUN(testConcurrentConsumeNoCrash);
     return TEST_REPORT();
 }

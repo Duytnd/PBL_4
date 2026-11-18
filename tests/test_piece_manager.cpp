@@ -3,6 +3,10 @@
 #include "core/hash_utils.h"
 #include "core/piece_manager.h"
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
 using namespace p2p;
 
 void testOffsetsAndSizesWithUnevenLastPiece() {
@@ -76,6 +80,68 @@ void testAssembleFileSkipsIncompletePieces() {
     CHECK(assembled.size() <= std::size_t(6));
 }
 
+namespace {
+
+std::string readAll(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+void testMultiFileRoundTrip() {
+    // Luồng 10 byte "0123456789" chia thành a.bin(3) + sub/empty(0) + sub/b.bin(5) + c.bin(2),
+    // piece length 4 -> piece 0 vắt qua a.bin/b.bin, piece 1 nằm trong b.bin, piece 2 vắt b.bin/c.bin.
+    const std::string payload = "0123456789";
+    const std::vector<FileEntry> files = {{"a.bin", 3}, {"sub/empty.bin", 0}, {"sub/b.bin", 5}, {"c.bin", 2}};
+    std::vector<std::string> hashes = {sha1Digest(payload.substr(0, 4)), sha1Digest(payload.substr(4, 4)),
+                                       sha1Digest(payload.substr(8, 2))};
+
+    const auto root = std::filesystem::temp_directory_path() / "p2p_multifile_test";
+    std::filesystem::remove_all(root);
+
+    PieceManager writer(3, 4, 10, hashes);
+    CHECK(writer.writeBlock(0, 0, 4, payload.substr(0, 4)));
+    CHECK(writer.writeBlock(2, 0, 2, payload.substr(8, 2)));
+    CHECK(writer.writePieceToFiles(0, root, files));
+    CHECK(writer.writePieceToFiles(2, root, files));
+    CHECK(!writer.writePieceToFiles(1, root, files));  // piece 1 chưa đủ byte
+
+    CHECK_EQ(readAll(root / "a.bin").size(), std::size_t(3));
+    CHECK_EQ(readAll(root / "a.bin"), std::string("012"));
+    CHECK_EQ(readAll(root / "sub/b.bin").size(), std::size_t(5));  // sparse, giãn đủ độ dài
+    CHECK_EQ(readAll(root / "c.bin"), std::string("89"));
+
+    // Nạp lại: piece 1 chưa ghi nên sai hash, piece 0 và 2 đúng.
+    PieceManager reader(3, 4, 10, hashes);
+    CHECK(reader.loadFromFiles(root, files));
+    CHECK(reader.verifyPiece(0));
+    CHECK(!reader.verifyPiece(1));
+    CHECK(reader.verifyPiece(2));
+
+    CHECK(writer.writeBlock(1, 0, 4, payload.substr(4, 4)));
+    CHECK(writer.writePieceToFiles(1, root, files));
+    CHECK(PieceManager::ensureFiles(root, files));
+    CHECK(std::filesystem::exists(root / "sub/empty.bin"));
+    CHECK_EQ(readAll(root / "sub/b.bin"), std::string("34567"));
+
+    PieceManager full(3, 4, 10, hashes);
+    CHECK(full.loadFromFiles(root, files));
+    CHECK(full.verifyPiece(0) && full.verifyPiece(1) && full.verifyPiece(2));
+    CHECK_EQ(full.assembleFile(), payload);
+
+    std::filesystem::remove_all(root);
+}
+
+void testMultiFileRejectsMismatchedLayoutAndMissingFiles() {
+    const auto root = std::filesystem::temp_directory_path() / "p2p_multifile_missing";
+    std::filesystem::remove_all(root);
+    PieceManager manager(1, 4, 4);
+    CHECK(!manager.loadFromFiles(root, {{"x", 4}}));          // không có file nào
+    CHECK(!manager.loadFromFiles(root, {{"x", 3}}));          // tổng độ dài sai
+    CHECK(!manager.writePieceToFiles(0, root, {{"x", 3}}));
+}
+
 int main() {
     RUN(testOffsetsAndSizesWithUnevenLastPiece);
     RUN(testWriteBlockThenCompleteAndVerify);
@@ -85,5 +151,7 @@ int main() {
     RUN(testWriteBlockRejectsBeyondLastPieceSize);
     RUN(testAssembleFileConcatenatesInOrder);
     RUN(testAssembleFileSkipsIncompletePieces);
+    RUN(testMultiFileRoundTrip);
+    RUN(testMultiFileRejectsMismatchedLayoutAndMissingFiles);
     return TEST_REPORT();
 }
