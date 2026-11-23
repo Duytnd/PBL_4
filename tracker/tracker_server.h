@@ -17,20 +17,22 @@ public:
     explicit TrackerServer(int interval = 1800, std::size_t maxPeers = 50);
 
     bool addPeer(const std::string& infoHash, const PeerRegistration& peer);
-    void removePeer(const std::string& infoHash, const std::string& peerId);
+    void removePeer(const std::string& infoHash, const std::string& peerId, const std::string& key = {});
     std::string announce(const TrackerRequest& request);
     bool registerUdpEndpoint(
         const std::string& infoHash,
         const std::string& peerId,
         const std::string& sourceIp,
         std::uint16_t sourcePort,
-        std::uint16_t announcedTcpPort);
+        std::uint16_t announcedTcpPort,
+        const std::string& key = {});
     [[nodiscard]] std::optional<TrackerPeer> rendezvousEndpoint(
         const std::string& infoHash,
         const std::string& requesterPeerId,
         const std::string& requesterIp,
         const std::string& targetIp,
-        std::uint16_t targetTcpPort) const;
+        std::uint16_t targetTcpPort,
+        const std::string& requesterKey = {}) const;
 
     [[nodiscard]] std::vector<TrackerPeer> getPeers(const std::string& infoHash) const;
     [[nodiscard]] bool hasPeer(const std::string& infoHash, const std::string& peerId) const;

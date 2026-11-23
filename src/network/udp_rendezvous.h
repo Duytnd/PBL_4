@@ -20,11 +20,17 @@ enum class Status : std::uint8_t {
     EndpointNotReady = 3
 };
 
+// Khoá phiên 8 byte gắn với peer_id (client tự sinh ngẫu nhiên, gửi kèm HTTP announce qua tham số `key` dạng hex).
+// peer_id lộ ra cho mọi peer đã bắt tay với mình, nên chỉ biết peer_id là chưa đủ để đăng ký/đổi endpoint UDP của
+// peer đó: tracker còn đòi đúng khoá. 8 byte 0 nghĩa là "không có khoá" (client cũ), tracker không áp dụng kiểm tra.
+constexpr std::size_t kKeySize = 8;
+
 struct Request {
     Opcode opcode = Opcode::Register;
     std::string info_hash;
     std::string peer_id;
     std::uint16_t peer_tcp_port = 0;
+    std::string key = std::string(kKeySize, '\0');
     std::string target_ip;
     std::uint16_t target_tcp_port = 0;
     std::uint32_t transaction_id = 0;
@@ -49,14 +55,16 @@ struct Notification {
 std::string encode_register_request(
     const std::string& info_hash,
     const std::string& peer_id,
-    std::uint16_t peer_tcp_port);
+    std::uint16_t peer_tcp_port,
+    const std::string& key = std::string(kKeySize, '\0'));
 std::string encode_punch_request(
     const std::string& info_hash,
     const std::string& peer_id,
     std::uint16_t peer_tcp_port,
     const std::string& target_ip,
     std::uint16_t target_tcp_port,
-    std::uint32_t transaction_id);
+    std::uint32_t transaction_id,
+    const std::string& key = std::string(kKeySize, '\0'));
 bool decode_request(const char* data, std::size_t size, Request& request) noexcept;
 
 std::string encode_register_result(Status status);

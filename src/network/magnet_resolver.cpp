@@ -4,14 +4,20 @@
 #include "core/hash_utils.h"
 #include "network/dht/kademlia_node.h"
 #include "network/extension.h"
+#include "network/lan_address.h"
 #include "network/peer_connection.h"
 #include "network/tracker_client.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <memory>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 namespace p2p::network {
 namespace {
@@ -148,7 +154,8 @@ TorrentFileMetadata fetch_magnet_metadata_from_peers(
 	const MagnetLink& magnet,
 	const std::vector<TrackerPeer>& peers,
 	const std::string& peer_id,
-	const std::string& announce_url) {
+	const std::string& announce_url,
+	std::chrono::milliseconds budget) {
 	if (magnet.info_hash.size() != 20) {
 		throw std::invalid_argument("magnet info_hash must contain 20 bytes");
 	}
@@ -157,7 +164,13 @@ TorrentFileMetadata fetch_magnet_metadata_from_peers(
 	}
 
 	std::string errors;
+	const auto started = std::chrono::steady_clock::now();
 	for (const auto& peer : unique_peers(peers)) {
+		if (std::chrono::steady_clock::now() - started >= budget) {
+			if (!errors.empty()) errors += "; ";
+			errors += "time budget for this attempt exhausted";
+			break;
+		}
 		try {
 			return request_metadata_from_peer(magnet, peer, peer_id, announce_url);
 		} catch (const std::exception& error) {
@@ -168,7 +181,36 @@ TorrentFileMetadata fetch_magnet_metadata_from_peers(
 	throw std::runtime_error(errors.empty() ? "no peers available for magnet metadata" : errors);
 }
 
-TorrentFileMetadata resolve_magnet_uri(
+namespace {
+
+// Chọn và sắp xếp peer ứng viên theo chính sách LAN: peer nội bộ (và loopback) trước; peer public chỉ giữ khi không
+// có peer nội bộ nào, hoặc khi người dùng cho phép nối Internet.
+std::vector<TrackerPeer> prefer_local_peers(std::vector<TrackerPeer> peers, bool allow_public) {
+	const char* env = std::getenv("P2P_ALLOW_PUBLIC_PEERS");
+	allow_public = allow_public || (env != nullptr && std::string(env) == "1");
+	const std::string local_ip = p2p::network::detect_lan_ip();
+	bool has_private = false;
+	for (const auto& peer : peers) {
+		if (KademliaNode::is_private_ipv4(peer.ip) || peer.ip == "127.0.0.1") {
+			has_private = true;
+			break;
+		}
+	}
+	std::vector<TrackerPeer> local;
+	std::vector<TrackerPeer> remote;
+	for (const auto& peer : peers) {
+		if (KademliaNode::is_private_ipv4(peer.ip) || peer.ip == "127.0.0.1") {
+			local.push_back(peer);
+		} else if (KademliaNode::should_connect_peer(local_ip, peer.ip, has_private, allow_public)) {
+			remote.push_back(peer);
+		}
+	}
+	local.insert(local.end(), remote.begin(), remote.end());
+	return local;
+}
+
+// Một lượt: hỏi các tracker trong magnet rồi (nếu cấu hình) DHT. Ném lỗi nếu lượt này không lấy được metadata.
+TorrentFileMetadata resolve_magnet_once(
 	const std::string& uri,
 	const MagnetResolveOptions& options) {
 	if (options.listen_port == 0) {
@@ -205,7 +247,7 @@ TorrentFileMetadata resolve_magnet_uri(
 			request.event = "started";
 			request.numwant = 50;
 			request.compact = true;
-			const auto response = TrackerClient::announceHttp(tracker, request);
+			const auto response = TrackerClient::announceTracker(tracker, request);
 			if (response.success) {
 				peers.insert(peers.end(), response.peers.begin(), response.peers.end());
 			}
@@ -215,7 +257,7 @@ TorrentFileMetadata resolve_magnet_uri(
 		if (unique_peers(peers).size() >= options.max_peer_attempts) break;
 	}
 
-	std::vector<TrackerPeer> tracker_candidates = unique_peers(peers);
+	std::vector<TrackerPeer> tracker_candidates = prefer_local_peers(unique_peers(peers), options.allow_public_peers);
 	if (tracker_candidates.size() > options.max_peer_attempts) {
 		tracker_candidates.resize(options.max_peer_attempts);
 	}
@@ -223,7 +265,7 @@ TorrentFileMetadata resolve_magnet_uri(
 	if (!tracker_candidates.empty()) {
 		try {
 			return fetch_magnet_metadata_from_peers(
-				magnet, tracker_candidates, peer_id, announce_url);
+				magnet, tracker_candidates, peer_id, announce_url, options.peer_fetch_budget);
 		} catch (const std::exception& error) {
 			tracker_error = error.what();
 		}
@@ -237,12 +279,22 @@ TorrentFileMetadata resolve_magnet_uri(
 	}
 
 	const std::uint16_t dht_port = options.dht_port == 0 ? options.listen_port : options.dht_port;
-	KademliaNode dht(NodeId::random(), dht_port);
-	if (!dht.start()) {
+	// Cổng UDP mặc định thường đã bị node DHT dùng chung (hoặc tiến trình khác) chiếm, nên thử các cổng kế tiếp.
+	std::unique_ptr<KademliaNode> dht_node;
+	for (std::uint16_t offset = 0; offset < 20 && !dht_node; ++offset) {
+		const std::uint32_t candidate = static_cast<std::uint32_t>(dht_port) + offset;
+		if (candidate > 65535) break;
+		auto node = std::make_unique<KademliaNode>(NodeId::random(), static_cast<std::uint16_t>(candidate));
+		if (node->start()) {
+			dht_node = std::move(node);
+		}
+	}
+	if (!dht_node) {
 		throw std::runtime_error(tracker_error.empty()
 			? "could not start DHT for magnet peer discovery"
 			: tracker_error + "; DHT could not start");
 	}
+	KademliaNode& dht = *dht_node;
 
 	std::vector<TrackerPeer> dht_candidates;
 	try {
@@ -266,16 +318,66 @@ TorrentFileMetadata resolve_magnet_uri(
 		[&](const TrackerPeer& peer) {
 			return tracker_endpoints.find({peer.ip, peer.port}) != tracker_endpoints.end();
 		}), dht_candidates.end());
-	dht_candidates = unique_peers(dht_candidates);
+	dht_candidates = prefer_local_peers(unique_peers(dht_candidates), options.allow_public_peers);
 	if (dht_candidates.size() > options.max_peer_attempts) {
 		dht_candidates.resize(options.max_peer_attempts);
 	}
 	try {
-		return fetch_magnet_metadata_from_peers(magnet, dht_candidates, peer_id, announce_url);
+		return fetch_magnet_metadata_from_peers(magnet, dht_candidates, peer_id, announce_url, options.peer_fetch_budget);
 	} catch (const std::exception& error) {
 		throw std::runtime_error(tracker_error.empty()
 			? error.what()
 			: tracker_error + "; DHT peers failed: " + error.what());
+	}
+}
+
+}  // namespace
+
+TorrentFileMetadata resolve_magnet_uri(
+	const std::string& uri,
+	const MagnetResolveOptions& options) {
+	if (options.listen_port == 0) {
+		throw std::invalid_argument("magnet resolver requires a listening port");
+	}
+	if (options.max_peer_attempts == 0 || options.max_peer_attempts > kMaxMetadataPeers) {
+		throw std::invalid_argument("magnet resolver peer attempt limit is invalid");
+	}
+	// URI sai (invalid_argument) là lỗi người dùng: báo ngay, không thử lại.
+	const MagnetLink magnet = parse_magnet_uri(uri);
+
+	// Cố định peer_id cho mọi lượt, nếu không mỗi lượt sẽ đăng ký thêm 1 peer ma với tracker.
+	MagnetResolveOptions attempt_options = options;
+	if (attempt_options.peer_id.empty()) {
+		attempt_options.peer_id = TrackerClient::makePeerId();
+	}
+
+	const bool has_tracker_source = options.enable_trackers && !magnet.trackers.empty();
+	const bool has_dht_source = options.enable_dht && !options.dht_bootstrap_host.empty() &&
+		options.dht_bootstrap_port != 0;
+	const bool can_retry = (has_tracker_source || has_dht_source) &&
+		options.retry_timeout.count() > 0;
+
+	const auto deadline = std::chrono::steady_clock::now() + options.retry_timeout;
+	for (int attempt_number = 1;; ++attempt_number) {
+		const auto attempt_started = std::chrono::steady_clock::now();
+		try {
+			return resolve_magnet_once(uri, attempt_options);
+		} catch (const std::invalid_argument&) {
+			throw;
+		} catch (const std::exception& error) {
+			const auto finished = std::chrono::steady_clock::now();
+			std::cout << "[MAGNET] attempt " << attempt_number << " failed after "
+					  << std::chrono::duration_cast<std::chrono::milliseconds>(finished - attempt_started).count()
+					  << " ms: " << error.what() << std::endl;
+			// Một lượt có thể mất hàng chục giây (tra DHT, chờ peer): chỉ thử lại nếu lượt tiếp theo, ước lượng
+			// bằng thời gian lượt vừa rồi, vẫn kịp trong hạn. Nếu không, tổng thời gian có thể gần gấp đôi retry_timeout
+			// và request WebUI bị client bỏ cuộc trước khi resolver trả lời.
+			const auto last_duration = finished - attempt_started;
+			if (!can_retry || finished + options.retry_interval + last_duration >= deadline) {
+				throw;
+			}
+		}
+		std::this_thread::sleep_for(options.retry_interval);
 	}
 }
 

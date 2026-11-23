@@ -67,6 +67,10 @@ void testParseMultiFileTorrent() {
     CHECK_EQ(metadata.filePaths.size(), std::size_t(2));
     CHECK_EQ(metadata.filePaths[0], std::string("dir/a.txt"));
     CHECK_EQ(metadata.filePaths[1], std::string("b.txt"));
+    CHECK(metadata.isMultiFile());
+    CHECK_EQ(metadata.files[0].length, std::uint64_t(5));
+    CHECK_EQ(metadata.files[1].length, std::uint64_t(7));
+    CHECK_EQ(metadata.length, std::uint64_t(12));  // tổng các file
 }
 
 void testParseRejectsMissingInfo() {

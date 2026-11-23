@@ -122,6 +122,9 @@ std::string TrackerProtocol::encodeRequestQuery(const TrackerRequest& request) {
     if (request.numwant > 0) {
         query << "&numwant=" << request.numwant;
     }
+    if (!request.key.empty()) {
+        query << "&key=" << percentEncode(request.key);
+    }
 
     return query.str();
 }

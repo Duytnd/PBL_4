@@ -64,6 +64,11 @@ public:
     // Không cần start() trước — announce() hoạt động độc lập qua socket riêng.
     bool announce(const std::string& infoHashRaw);
 
+    // Tham gia lại nhóm multicast sau khi đổi mạng: lúc tham gia, hệ điều hành gắn nhóm vào card mạng mặc định ĐANG
+    // dùng; đổi card (WiFi <-> dây) thì socket nghe vẫn nằm ở card cũ và không nhận được announce của máy khác.
+    // Trả false nếu chưa start() hoặc hệ điều hành từ chối (chưa có mạng); gọi lại được.
+    bool rejoinMulticast();
+
     [[nodiscard]] bool isRunning() const { return running_; }
 
 private:

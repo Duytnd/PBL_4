@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/file_entry.h"
+
 #include <cstddef>
 #include <filesystem>
 #include <string>
@@ -39,6 +41,17 @@ public:
     // Ghi riêng 1 piece (đã đủ byte) vào đúng offset của file tạm dạng sparse có kích thước
     // totalLength; dùng để lưu tiến độ tải dở, tắt app rồi chạy lại vẫn resume được.
     bool writePieceToFile(std::size_t pieceIndex, const std::filesystem::path& filePath) const;
+
+    // Multi-file (BEP 3): luồng byte của torrent là các file nối liên tiếp theo thứ tự `files`,
+    // nằm dưới thư mục `rootDir`. Tổng độ dài các file phải bằng totalLength().
+    // Nạp dữ liệu từ đĩa; file thiếu/ngắn được coi như vùng trống (piece đó sẽ sai hash).
+    // Trả false nếu không có file nào tồn tại hoặc layout không khớp totalLength().
+    bool loadFromFiles(const std::filesystem::path& rootDir, const std::vector<FileEntry>& files);
+    // Ghi 1 piece đủ byte vào đúng các file (tạo thư mục, tạo/giãn file sparse khi cần).
+    bool writePieceToFiles(std::size_t pieceIndex, const std::filesystem::path& rootDir,
+                           const std::vector<FileEntry>& files) const;
+    // Tạo mọi file (kể cả file dài 0) với đúng kích thước, để thư mục đầy đủ khi tải xong.
+    static bool ensureFiles(const std::filesystem::path& rootDir, const std::vector<FileEntry>& files);
 
     // Bỏ dữ liệu của 1 piece (vd. piece nạp từ đĩa nhưng sai hash).
     void discardPiece(std::size_t pieceIndex);

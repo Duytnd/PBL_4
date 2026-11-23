@@ -10,6 +10,10 @@ if(WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
 endif()
 
+# HTTPS tracker: cpp-httplib bật TLS (OpenSSL) cho mọi target; PHẢI đồng nhất giữa các TU để tránh ODR.
+find_package(OpenSSL REQUIRED)
+add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
+
 enable_testing()
 
 add_executable(test_piece_picker
@@ -53,6 +57,20 @@ target_include_directories(test_metrics PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_metrics COMMAND test_metrics)
 
 # DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
+# Dò IP LAN dùng chung cho tracker, DHT và WebUI
+add_library(p2p_lan STATIC src/network/lan_address.cpp src/network/network_monitor.cpp)
+target_include_directories(p2p_lan PUBLIC ${CMAKE_SOURCE_DIR}/src)
+find_package(Threads REQUIRED)
+target_link_libraries(p2p_lan PUBLIC Threads::Threads)
+if(WIN32)
+    target_link_libraries(p2p_lan PUBLIC ws2_32 iphlpapi)
+endif()
+
+add_executable(test_network_monitor tests/test_network_monitor.cpp)
+target_include_directories(test_network_monitor PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_network_monitor PRIVATE p2p_lan)
+add_test(NAME test_network_monitor COMMAND test_network_monitor)
+
 add_executable(test_kademlia
     tests/test_kademlia.cpp
     src/network/dht/node_id.cpp
@@ -66,7 +84,7 @@ add_executable(test_kademlia
 target_include_directories(test_kademlia PRIVATE ${CMAKE_SOURCE_DIR}/src)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-target_link_libraries(test_kademlia PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(test_kademlia PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads p2p_lan)
 if(WIN32)
     target_link_libraries(test_kademlia PRIVATE ws2_32 crypt32)
 endif()
@@ -95,6 +113,8 @@ if(UNIX)
     target_compile_definitions(libutp PRIVATE POSIX)
 endif()
 if(WIN32)
+    # libutp checks the legacy WIN32 macro, which MinGW/GCC does not define
+    target_compile_definitions(libutp PRIVATE WIN32)
     target_link_libraries(libutp PUBLIC ws2_32)
 endif()
 
@@ -105,6 +125,14 @@ target_include_directories(p2p_utp PUBLIC
     ${CMAKE_SOURCE_DIR}/third_party/libutp
 )
 target_link_libraries(p2p_utp PUBLIC libutp Threads::Threads)
+
+# Kiểm tra Host/Origin và loại file được mở của WebUI (chỉ logic thuần, không cần mạng)
+add_executable(test_request_guard
+    tests/test_request_guard.cpp
+    src/webui/request_guard.cpp
+)
+target_include_directories(test_request_guard PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_request_guard COMMAND test_request_guard)
 
 add_executable(test_bencode
     tests/test_bencode.cpp
@@ -187,7 +215,7 @@ add_executable(test_tracker_protocol
 
 target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
 target_include_directories(test_tracker_protocol PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_tracker_protocol PRIVATE Threads::Threads)
+target_link_libraries(test_tracker_protocol PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 if(WIN32)
     target_link_libraries(test_tracker_protocol PRIVATE ws2_32 crypt32)
 endif()
@@ -227,6 +255,7 @@ target_include_directories(test_peer_connection PRIVATE
 )
 target_link_libraries(test_peer_connection PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_link_libraries(test_peer_connection PRIVATE p2p_utp)
+target_link_libraries(test_peer_connection PRIVATE p2p_lan)
 if(WIN32)
     target_link_libraries(test_peer_connection PRIVATE ws2_32 crypt32)
 endif()
@@ -254,11 +283,26 @@ target_include_directories(test_nat_traversal PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
-target_link_libraries(test_nat_traversal PRIVATE Threads::Threads)
+target_link_libraries(test_nat_traversal PRIVATE Threads::Threads p2p_lan)
 if(WIN32)
     target_link_libraries(test_nat_traversal PRIVATE ws2_32 crypt32)
 endif()
 add_test(NAME test_nat_traversal COMMAND test_nat_traversal)
+
+# An ninh NAT: thiết bị UPnP giả (im lặng / nhỏ giọt / ngập dữ liệu), SSDP LOCATION giả mạo (SSRF)
+add_executable(test_nat_security
+    tests/test_nat_security.cpp
+    src/network/nat_traversal.cpp
+)
+target_include_directories(test_nat_security PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(test_nat_security PRIVATE Threads::Threads p2p_lan)
+if(WIN32)
+    target_link_libraries(test_nat_security PRIVATE ws2_32 crypt32)
+endif()
+add_test(NAME test_nat_security COMMAND test_nat_security)
 
 # Torrent Session (Orchestrator kết nối Peer, PieceManager, Tracker, Strategy, LSD, DHT)
 add_executable(test_torrent_session
@@ -300,6 +344,7 @@ target_include_directories(test_torrent_session PRIVATE
 )
 target_link_libraries(test_torrent_session PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_link_libraries(test_torrent_session PRIVATE p2p_utp)
+target_link_libraries(test_torrent_session PRIVATE p2p_lan)
 if(WIN32)
     target_link_libraries(test_torrent_session PRIVATE ws2_32 crypt32)
 endif()
@@ -320,6 +365,7 @@ target_include_directories(peer_wire_tool PRIVATE
 )
 target_link_libraries(peer_wire_tool PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_link_libraries(peer_wire_tool PRIVATE p2p_utp)
+target_link_libraries(peer_wire_tool PRIVATE p2p_lan)
 if(WIN32)
     target_link_libraries(peer_wire_tool PRIVATE ws2_32 crypt32)
 endif()
@@ -339,6 +385,7 @@ target_include_directories(dht_tool PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party
 )
 target_link_libraries(dht_tool PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(dht_tool PRIVATE p2p_lan)
 if(WIN32)
     target_link_libraries(dht_tool PRIVATE ws2_32 crypt32)
 endif()
@@ -353,6 +400,7 @@ set(P2P_CLIENT_SOURCES
     src/core/torrent_builder.cpp
     src/core/piece_manager.cpp
     src/webui/http_server.cpp
+    src/webui/request_guard.cpp
     src/webui/api_routes.cpp
     src/webui/state_bridge.cpp
     src/network/torrent_session.cpp
@@ -387,8 +435,9 @@ target_include_directories(p2p_client PRIVATE
 )
 target_link_libraries(p2p_client PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_link_libraries(p2p_client PRIVATE p2p_utp)
+target_link_libraries(p2p_client PRIVATE p2p_lan)
 if(WIN32)
-    target_link_libraries(p2p_client PRIVATE ws2_32 crypt32)
+    target_link_libraries(p2p_client PRIVATE ws2_32 crypt32 shell32)
 endif()
 
 # Tracker server thật (BEP 3 + BEP 23): bind 0.0.0.0 để các máy khác trong
@@ -408,7 +457,8 @@ target_include_directories(p2p_tracker PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/asio
 )
 target_include_directories(p2p_tracker PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(p2p_tracker PRIVATE Threads::Threads)
+target_link_libraries(p2p_tracker PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(p2p_tracker PRIVATE p2p_lan)
 
 if(WIN32)
     target_link_libraries(p2p_tracker PRIVATE ws2_32 crypt32)

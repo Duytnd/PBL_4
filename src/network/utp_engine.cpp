@@ -102,6 +102,44 @@ void UtpEngine::set_datagram_handler(DatagramHandler handler) {
     datagram_handler_ = std::move(handler);
 }
 
+namespace {
+constexpr std::size_t kMaxAllowedEndpoints = 2048;
+}  // namespace
+
+void UtpEngine::set_allow_ttl(std::chrono::milliseconds ttl) {
+    allow_ttl_ms_.store(ttl.count() > 0 ? ttl.count() : 1);
+}
+
+void UtpEngine::remember_allowed(const std::string& key) {
+    const auto now = std::chrono::steady_clock::now();
+    allowed_peer_endpoints_[key] = now + std::chrono::milliseconds(allow_ttl_ms_.load());
+    if (allowed_peer_endpoints_.size() <= kMaxAllowedEndpoints) {
+        return;
+    }
+    for (auto it = allowed_peer_endpoints_.begin(); it != allowed_peer_endpoints_.end();) {
+        it = it->second <= now ? allowed_peer_endpoints_.erase(it) : std::next(it);
+    }
+    while (allowed_peer_endpoints_.size() > kMaxAllowedEndpoints) {
+        // Vẫn quá nhiều mục chưa hết hạn: bỏ mục sắp hết hạn nhất.
+        const auto oldest = std::min_element(
+            allowed_peer_endpoints_.begin(), allowed_peer_endpoints_.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+        allowed_peer_endpoints_.erase(oldest);
+    }
+}
+
+bool UtpEngine::is_allowed(const std::string& key) {
+    const auto it = allowed_peer_endpoints_.find(key);
+    if (it == allowed_peer_endpoints_.end()) {
+        return false;
+    }
+    if (it->second <= std::chrono::steady_clock::now()) {
+        allowed_peer_endpoints_.erase(it);
+        return false;
+    }
+    return true;
+}
+
 void UtpEngine::allow_peer(const asio::ip::udp::endpoint& endpoint) {
     if (!endpoint.address().is_v4() || endpoint.port() == 0) {
         return;
@@ -109,7 +147,7 @@ void UtpEngine::allow_peer(const asio::ip::udp::endpoint& endpoint) {
     const std::string key = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
     asio::post(ioc_, [this, key]() {
         if (running_.load()) {
-            allowed_peer_endpoints_.insert(key);
+            remember_allowed(key);
         }
     });
 }
@@ -152,8 +190,7 @@ std::shared_ptr<UtpStream> UtpEngine::connect_to(
                 new UtpStream(shared_from_this(), socket, endpoint));
             utp_set_userdata(socket, stream.get());
             streams_.emplace(socket, stream);
-            allowed_peer_endpoints_.insert(
-                endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
+            remember_allowed(endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
             const auto address = endpoint.address().to_v4().to_bytes();
             sockaddr_in remote{};
             remote.sin_family = AF_INET;
@@ -370,16 +407,15 @@ uint64 UtpEngine::on_firewall(utp_callback_arguments* args) {
         args->address->sa_family != AF_INET || args->address_len < sizeof(sockaddr_in)) {
         return 1;
     }
-    // Nếu engine đã đăng ký accept_handler, cho phép nhận stream từ peer
-    if (engine->accept_handler_) {
-        return 0;
-    }
+    // Trước đây có accept_handler là cho phép MỌI endpoint mở kết nối, nên danh sách cho phép chỉ là trang trí
+    // và bất kỳ máy nào cũng gửi SYN uTP tới cổng UDP này được. Giờ chỉ endpoint đã được tracker/rendezvous
+    // xác nhận (hoặc do mình nối ra) mới được mở kết nối vào, đúng ý nghĩa "firewall" của hole punching.
     const auto* remote = reinterpret_cast<const sockaddr_in*>(args->address);
     asio::ip::address_v4::bytes_type addressBytes{};
     std::memcpy(addressBytes.data(), &remote->sin_addr, addressBytes.size());
     const std::string key = asio::ip::address_v4(addressBytes).to_string() + ":" +
                             std::to_string(ntohs(remote->sin_port));
-    return engine->allowed_peer_endpoints_.find(key) != engine->allowed_peer_endpoints_.end() ? 0 : 1;
+    return engine->is_allowed(key) ? 0 : 1;
 }
 
 uint64 UtpEngine::on_read(utp_callback_arguments* args) {

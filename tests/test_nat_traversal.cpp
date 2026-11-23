@@ -1,3 +1,6 @@
+// Các test dùng assert(): bật lại cả khi build Release (-DNDEBUG), nếu không chúng không kiểm tra gì.
+#undef NDEBUG
+
 #include "network/nat_traversal.h"
 
 #include <cassert>

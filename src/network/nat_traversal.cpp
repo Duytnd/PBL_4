@@ -7,7 +7,11 @@
 #include <iostream>
 #include <sstream>
 
+#include "network/lan_address.h"
+
 #include <asio.hpp>
+#include <functional>
+#include <memory>
 
 namespace pbl4::network {
 
@@ -85,13 +89,51 @@ bool parse_http_url(const std::string& url, std::string& host, std::uint16_t& po
 		port = 80;
 	} else {
 		host = host_port_part.substr(0, colon_pos);
-		try {
-			port = static_cast<std::uint16_t>(std::stoul(host_port_part.substr(colon_pos + 1)));
-		} catch (...) {
-			port = 80;
+		const std::string port_text = host_port_part.substr(colon_pos + 1);
+		if (port_text.empty() || port_text.size() > 5 ||
+			port_text.find_first_not_of("0123456789") != std::string::npos) {
+			return false;
 		}
+		const unsigned long parsed_port = std::stoul(port_text);
+		if (parsed_port == 0 || parsed_port > 65535) {
+			return false;  // trước đây bị cắt ngầm về 16 bit hoặc đổi thành 80
+		}
+		port = static_cast<std::uint16_t>(parsed_port);
 	}
 	return !host.empty();
+}
+
+
+// Đã nhận đủ header và (nếu có Content-Length) đủ body chưa.
+bool http_response_complete(const std::string& response) {
+	const auto header_end = response.find("\r\n\r\n");
+	if (header_end == std::string::npos) {
+		return false;
+	}
+	const std::string headers = to_lower_str(response.substr(0, header_end));
+	const auto pos = headers.find("content-length:");
+	if (pos == std::string::npos) {
+		return false;  // không biết độ dài: đọc tới khi đóng kết nối hoặc hết hạn
+	}
+	std::size_t value_start = pos + 15;
+	while (value_start < headers.size() && (headers[value_start] == ' ' || headers[value_start] == '\t')) {
+		++value_start;
+	}
+	const std::size_t value_end = headers.find_first_not_of("0123456789", value_start);
+	const std::string number = headers.substr(
+		value_start, value_end == std::string::npos ? std::string::npos : value_end - value_start);
+	if (number.empty() || number.size() > 9) {
+		return false;
+	}
+	return response.size() - (header_end + 4) >= std::stoul(number);
+}
+
+std::string ssdp_search_request(const char* search_target) {
+	return std::string("M-SEARCH * HTTP/1.1\r\n"
+					   "HOST: 239.255.255.250:1900\r\n"
+					   "MAN: \"ssdp:discover\"\r\n"
+					   "MX: 1\r\n"
+					   "ST: ") + search_target + "\r\n\r\n";
 }
 
 }  // namespace
@@ -124,6 +166,37 @@ bool NatTraversal::parse_ssdp_response(const std::string& response, std::string&
 		}
 	}
 	return false;
+}
+
+bool NatTraversal::validate_ssdp_location(
+	const std::string& location_url,
+	const std::string& sender_ip,
+	std::string& host,
+	std::uint16_t& port,
+	std::string& path) {
+	asio::error_code ec;
+	const auto sender = asio::ip::make_address_v4(sender_ip, ec);
+	if (ec || !p2p::network::is_local_network_address(sender_ip)) {
+		return false;
+	}
+	std::string parsed_host, parsed_path;
+	std::uint16_t parsed_port = 80;
+	if (!parse_http_url(location_url, parsed_host, parsed_port, parsed_path)) {
+		return false;
+	}
+	const auto location_ip = asio::ip::make_address_v4(parsed_host, ec);
+	if (ec || location_ip != sender) {
+		return false;  // tên miền hoặc IP khác người gửi: có thể là SSRF
+	}
+	for (unsigned char c : parsed_path) {
+		if (c <= 0x20 || c == 0x7F) {
+			return false;
+		}
+	}
+	host = parsed_host;
+	port = parsed_port;
+	path = parsed_path;
+	return true;
 }
 
 bool NatTraversal::parse_upnp_description(
@@ -303,6 +376,41 @@ bool NatTraversal::parse_natpmp_map_response(
 	return true;
 }
 
+bool NatTraversal::parse_natpmp_map_response(
+	const std::uint8_t* data,
+	std::size_t len,
+	NatProtocol expected_protocol,
+	std::uint16_t expected_internal_port,
+	std::uint16_t& external_port_out,
+	std::uint32_t& lifetime_out,
+	bool allow_zero_external_port) {
+	if (!data || len < 16) {
+		return false;
+	}
+	const std::uint8_t expected_opcode = (expected_protocol == NatProtocol::UDP) ? 129 : 130;
+	if (data[0] != 0x00 || data[1] != expected_opcode) {
+		return false;
+	}
+	const std::uint16_t internal_echo = (static_cast<std::uint16_t>(data[8]) << 8) | data[9];
+	if (internal_echo != expected_internal_port) {
+		return false;
+	}
+	std::uint16_t external_port = 0;
+	std::uint32_t lifetime = 0;
+	if (!parse_natpmp_map_response(data, len, external_port, lifetime) ||
+		(external_port == 0 && !allow_zero_external_port)) {
+		return false;
+	}
+	external_port_out = external_port;
+	lifetime_out = lifetime;
+	return true;
+}
+
+void NatTraversal::configure_natpmp_gateway(const std::string& ip, std::uint16_t port) {
+	natpmp_gateway_override_ = ip;
+	natpmp_port_ = port == 0 ? 5351 : port;
+}
+
 // =========================================================================
 // Network I/O (UPnP & NAT-PMP)
 // =========================================================================
@@ -316,39 +424,18 @@ std::string NatTraversal::send_http_request(
 	const std::string& body,
 	std::chrono::milliseconds timeout) {
 	try {
-		asio::io_context ioc;
-		asio::ip::tcp::resolver resolver(ioc);
-		auto endpoints = resolver.resolve(host, std::to_string(port));
-
-		asio::ip::tcp::socket socket(ioc);
-		asio::steady_timer timer(ioc);
-		timer.expires_after(timeout);
-
-		bool timed_out = false;
-		timer.async_wait([&](const asio::error_code& ec) {
-			if (!ec) {
-				timed_out = true;
-				socket.cancel();
-			}
-		});
-
-		asio::async_connect(socket, endpoints, [&](const asio::error_code&, const asio::ip::tcp::endpoint&) {
-			timer.cancel();
-		});
-
-		ioc.restart();
-		ioc.run();
-		if (timed_out || !socket.is_open()) {
+		// Chỉ IPv4 literal: không phân giải DNS (resolver đồng bộ không có timeout và mở đường cho DNS rebinding).
+		asio::error_code address_ec;
+		const auto address = asio::ip::make_address_v4(host, address_ec);
+		if (address_ec || port == 0) {
 			return {};
 		}
 
-		// Chuẩn bị HTTP request
 		std::ostringstream req;
 		req << method << " " << path << " HTTP/1.1\r\n"
 			<< "Host: " << host << ":" << port << "\r\n"
 			<< "User-Agent: PBL4-BitTorrent/1.0\r\n"
 			<< "Connection: close\r\n";
-
 		if (!soap_action.empty()) {
 			req << "SOAPAction: \"" << soap_action << "\"\r\n"
 				<< "Content-Type: text/xml; charset=\"utf-8\"\r\n";
@@ -358,22 +445,76 @@ std::string NatTraversal::send_http_request(
 		} else {
 			req << "\r\n";
 		}
+		const std::string request_text = req.str();
 
-		const std::string req_str = req.str();
-		asio::write(socket, asio::buffer(req_str));
+		asio::io_context ioc;
+		asio::ip::tcp::socket socket(ioc);
+		asio::steady_timer deadline(ioc);
+		deadline.expires_after(timeout);
 
-		// Đọc toàn bộ phản hồi
+		bool timed_out = false;
+		bool too_large = false;
 		std::string response;
-		std::array<char, 2048> buf{};
-		asio::error_code ec;
-		while (true) {
-			const std::size_t n = socket.read_some(asio::buffer(buf), ec);
-			if (n > 0) {
-				response.append(buf.data(), n);
+		std::array<char, 4096> buffer{};
+
+		// Một đồng hồ duy nhất cho cả kết nối, gửi và nhận: thiết bị im lặng hay nhỏ giọt từng byte cũng
+		// không giữ luồng quá `timeout` (trước đây vòng đọc không có hạn, treo cả session.stop()).
+		deadline.async_wait([&](const asio::error_code& ec) {
+			if (!ec) {
+				timed_out = true;
+				asio::error_code ignored;
+				socket.close(ignored);
 			}
+		});
+
+		std::function<void()> read_more;
+		read_more = [&]() {
+			socket.async_read_some(asio::buffer(buffer), [&](const asio::error_code& ec, std::size_t n) {
+				if (n > 0) {
+					response.append(buffer.data(), n);
+					if (response.size() > kMaxHttpResponseBytes) {
+						too_large = true;
+						asio::error_code ignored;
+						socket.close(ignored);
+						deadline.cancel();
+						return;
+					}
+					if (http_response_complete(response)) {
+						asio::error_code ignored;
+						socket.close(ignored);
+						deadline.cancel();
+						return;
+					}
+				}
+				if (ec) {
+					deadline.cancel();  // EOF hoặc lỗi: kết thúc
+					return;
+				}
+				read_more();
+			});
+		};
+
+		socket.async_connect(asio::ip::tcp::endpoint(address, port), [&](const asio::error_code& ec) {
 			if (ec) {
-				break;
+				deadline.cancel();
+				return;
 			}
+			asio::async_write(socket, asio::buffer(request_text), [&](const asio::error_code& write_ec, std::size_t) {
+				if (write_ec) {
+					deadline.cancel();
+					return;
+				}
+				read_more();
+			});
+		});
+
+		ioc.run();
+
+		if (too_large) {
+			return {};
+		}
+		if (timed_out && response.find("\r\n\r\n") == std::string::npos) {
+			return {};  // quá hạn khi chưa có nổi header: bỏ
 		}
 		return response;
 	} catch (...) {
@@ -383,77 +524,123 @@ std::string NatTraversal::send_http_request(
 
 bool NatTraversal::discover_upnp(std::chrono::milliseconds timeout) {
 	try {
+		// Router có thể chờ ngẫu nhiên tới MX giây rồi mới trả lời: không để cửa sổ chờ quá ngắn.
+		const auto window = std::max(timeout, std::chrono::milliseconds(1500));
+
+		// Gửi M-SEARCH trên TỪNG card mạng. Một socket không chọn card sẽ dùng card mặc định của hệ điều hành,
+		// với máy nhiều card (Tailscale, VPN, máy ảo) thì gói không tới LAN thật và client mãi báo "không có router".
+		std::vector<std::string> interfaces = p2p::network::local_ipv4_addresses();
+		if (interfaces.empty()) {
+			interfaces.push_back(p2p::network::detect_lan_ip());
+		}
+
 		asio::io_context ioc;
-		asio::ip::udp::socket socket(ioc);
-		socket.open(asio::ip::udp::v4());
+		struct Probe {
+			explicit Probe(asio::io_context& context) : socket(context) {}
+			asio::ip::udp::socket socket;
+			std::string local_ip;
+			std::array<char, 4096> buffer{};
+			asio::ip::udp::endpoint sender;
+			int errors = 0;
+		};
+		std::vector<std::unique_ptr<Probe>> probes;
+		const asio::ip::udp::endpoint multicast_ep(asio::ip::make_address("239.255.255.250"), 1900);
+		const std::string requests[] = {
+			ssdp_search_request("urn:schemas-upnp-org:device:InternetGatewayDevice:1"),
+			ssdp_search_request("urn:schemas-upnp-org:device:InternetGatewayDevice:2")};
 
-		// Cho phép gửi multicast
-		socket.set_option(asio::socket_base::broadcast(true));
-
-		const std::string ssdp_request =
-			"M-SEARCH * HTTP/1.1\r\n"
-			"HOST: 239.255.255.250:1900\r\n"
-			"MAN: \"ssdp:discover\"\r\n"
-			"MX: 2\r\n"
-			"ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"
-			"\r\n";
-
-		const asio::ip::udp::endpoint multicast_ep(
-			asio::ip::make_address("239.255.255.250"), 1900);
-		socket.send_to(asio::buffer(ssdp_request), multicast_ep);
-
-		// Nhận phản hồi
-		std::array<char, 4096> recv_buf{};
-		asio::ip::udp::endpoint sender_ep;
-		asio::steady_timer timer(ioc);
-		timer.expires_after(timeout);
-
-		bool got_response = false;
-		std::string ssdp_response;
-
-		timer.async_wait([&](const asio::error_code& ec) {
-			if (!ec) {
-				socket.cancel();
+		for (const auto& ip : interfaces) {
+			asio::error_code ec;
+			const auto local_address = asio::ip::make_address_v4(ip, ec);
+			if (ec) continue;
+			auto probe = std::make_unique<Probe>(ioc);
+			probe->local_ip = ip;
+			probe->socket.open(asio::ip::udp::v4(), ec);
+			if (ec) continue;
+			probe->socket.bind(asio::ip::udp::endpoint(local_address, 0), ec);
+			if (ec) continue;
+			probe->socket.set_option(asio::ip::multicast::outbound_interface(local_address), ec);
+			probe->socket.set_option(asio::ip::multicast::hops(2), ec);
+			bool sent = false;
+			for (const auto& request : requests) {
+				asio::error_code send_ec;
+				probe->socket.send_to(asio::buffer(request), multicast_ep, 0, send_ec);
+				sent = sent || !send_ec;
 			}
+			if (sent) {
+				probes.push_back(std::move(probe));
+			}
+		}
+		if (probes.empty()) {
+			return false;
+		}
+
+		asio::steady_timer timer(ioc);
+		timer.expires_after(window);
+		bool found = false;
+		std::string host, path, found_local_ip;
+		std::uint16_t port = 80;
+		int datagrams = 0;
+
+		auto cancel_all = [&]() {
+			for (auto& probe : probes) {
+				asio::error_code ignored;
+				probe->socket.cancel(ignored);
+			}
+		};
+		timer.async_wait([&](const asio::error_code& ec) {
+			if (!ec) cancel_all();
 		});
 
-		socket.async_receive_from(
-			asio::buffer(recv_buf), sender_ep,
-			[&](const asio::error_code& ec, std::size_t bytes_recvd) {
-				if (!ec && bytes_recvd > 0) {
-					got_response = true;
-					ssdp_response.assign(recv_buf.data(), bytes_recvd);
-					timer.cancel();
-				}
-			});
-
-		ioc.restart();
+		std::function<void(Probe&)> listen;
+		listen = [&](Probe& probe) {
+			probe.socket.async_receive_from(
+				asio::buffer(probe.buffer), probe.sender,
+				[&](const asio::error_code& ec, std::size_t bytes) {
+					if (found || ec == asio::error::operation_aborted) {
+						return;
+					}
+					if (!ec && bytes > 0) {
+						// Chặn kẻ làm ngập: chỉ xử lý một số gói hữu hạn trong cửa sổ chờ.
+						if (++datagrams > 64) {
+							timer.cancel();
+							cancel_all();
+							return;
+						}
+						const std::string response(probe.buffer.data(), bytes);
+						std::string location, candidate_host, candidate_path;
+						std::uint16_t candidate_port = 80;
+						if (parse_ssdp_response(response, location) &&
+							validate_ssdp_location(location, probe.sender.address().to_string(),
+												   candidate_host, candidate_port, candidate_path)) {
+							found = true;
+							host = candidate_host;
+							port = candidate_port;
+							path = candidate_path;
+							found_local_ip = probe.local_ip;
+							timer.cancel();
+							cancel_all();
+							return;
+						}
+					} else if (++probe.errors > 16) {
+						return;  // lỗi lặp lại (vd. ICMP unreachable trên Windows): thôi nghe socket này
+					}
+					listen(probe);  // gói không hợp lệ hoặc lỗi nhất thời: nghe tiếp tới khi hết hạn
+				});
+		};
+		for (auto& probe : probes) {
+			listen(*probe);
+		}
 		ioc.run();
 
-		if (!got_response) {
+		if (!found) {
 			return false;
 		}
+		local_ip_ = found_local_ip;
 
-		// Lấy local IP từ socket
-		asio::error_code local_ec;
-		const auto local_ep = socket.local_endpoint(local_ec);
-		if (!local_ec) {
-			local_ip_ = local_ep.address().to_string();
-		}
-
-		std::string location_url;
-		if (!parse_ssdp_response(ssdp_response, location_url)) {
-			return false;
-		}
-
-		// Đọc XML mô tả thiết bị
-		std::string host, path;
-		std::uint16_t port = 80;
-		if (!parse_http_url(location_url, host, port, path)) {
-			return false;
-		}
-
-		const std::string desc_xml = send_http_request(host, port, "GET", path, "", "", timeout);
+		// Đọc XML mô tả thiết bị (host đã được xác nhận là chính thiết bị đã trả lời).
+		const auto http_timeout = std::max(timeout, std::chrono::milliseconds(2000));
+		const std::string desc_xml = send_http_request(host, port, "GET", path, "", "", http_timeout);
 		if (desc_xml.empty()) {
 			return false;
 		}
@@ -467,11 +654,14 @@ bool NatTraversal::discover_upnp(std::chrono::milliseconds timeout) {
 		upnp_port_ = port;
 		upnp_service_type_ = s_type;
 
-		// Chuẩn hóa control url (có thể là đường dẫn tương đối)
+		// Chuẩn hóa control url (có thể là đường dẫn tương đối). Chỉ giữ phần đường dẫn: mọi yêu cầu SOAP
+		// luôn đi tới đúng thiết bị đã xác nhận, không theo host do XML tự khai.
 		if (ctrl_url.rfind("http://", 0) == 0) {
 			std::string dummy_host;
 			std::uint16_t dummy_port;
-			parse_http_url(ctrl_url, dummy_host, dummy_port, upnp_control_url_);
+			if (!parse_http_url(ctrl_url, dummy_host, dummy_port, upnp_control_url_)) {
+				return false;
+			}
 		} else {
 			if (ctrl_url.empty() || ctrl_url.front() != '/') {
 				ctrl_url = "/" + ctrl_url;
@@ -485,7 +675,7 @@ bool NatTraversal::discover_upnp(std::chrono::milliseconds timeout) {
 		const std::string get_ip_body = build_upnp_soap_get_external_ip(upnp_service_type_);
 		const std::string soap_action = upnp_service_type_ + "#GetExternalIPAddress";
 		const std::string ip_resp = send_http_request(
-			upnp_host_, upnp_port_, "POST", upnp_control_url_, soap_action, get_ip_body, timeout);
+			upnp_host_, upnp_port_, "POST", upnp_control_url_, soap_action, get_ip_body, http_timeout);
 
 		parse_upnp_external_ip_response(ip_resp, external_ip_);
 		return true;
@@ -496,55 +686,73 @@ bool NatTraversal::discover_upnp(std::chrono::milliseconds timeout) {
 
 bool NatTraversal::discover_nat_pmp(std::chrono::milliseconds timeout) {
 	try {
-		// Thử default gateway IP (thường là 192.168.1.1 hoặc 192.168.0.1)
-		static const std::vector<std::string> candidate_gateways = {
-			"192.168.1.1", "192.168.0.1", "10.0.0.1"
-		};
+		// Gateway = hop kế tiếp thật của route mặc định, không đoán 192.168.1.1/10.0.0.1... Không biết gateway
+		// thì bỏ qua (không gửi gói NAT-PMP tới một địa chỉ ngẫu nhiên của mạng lạ).
+		const std::string gateway = natpmp_gateway_override_.empty()
+			? p2p::network::default_gateway_ipv4()
+			: natpmp_gateway_override_;
+		if (gateway.empty()) {
+			return false;
+		}
+		asio::error_code address_ec;
+		const auto gateway_address = asio::ip::make_address_v4(gateway, address_ec);
+		if (address_ec) {
+			return false;
+		}
+		const asio::ip::udp::endpoint gateway_ep(gateway_address, natpmp_port_);
 
 		asio::io_context ioc;
-		for (const auto& gw : candidate_gateways) {
-			try {
-				asio::ip::udp::socket socket(ioc);
-				socket.open(asio::ip::udp::v4());
+		asio::ip::udp::socket socket(ioc);
+		socket.open(asio::ip::udp::v4());
+		const auto request = build_natpmp_ip_request();
+		socket.send_to(asio::buffer(request), gateway_ep);
 
-				const auto req = build_natpmp_ip_request();
-				const asio::ip::udp::endpoint gw_ep(asio::ip::make_address(gw), natpmp_port_);
-				socket.send_to(asio::buffer(req), gw_ep);
-
-				std::array<std::uint8_t, 64> resp{};
-				asio::ip::udp::endpoint sender_ep;
-				asio::steady_timer timer(ioc);
-				timer.expires_after(timeout);
-
-				bool got_response = false;
-				timer.async_wait([&](const asio::error_code& ec) {
-					if (!ec) socket.cancel();
-				});
-
-				socket.async_receive_from(
-					asio::buffer(resp), sender_ep,
-					[&](const asio::error_code& ec, std::size_t bytes_recvd) {
-						if (!ec && bytes_recvd >= 12) {
-							if (parse_natpmp_ip_response(resp.data(), bytes_recvd, external_ip_)) {
-								got_response = true;
-								timer.cancel();
-							}
-						}
-					});
-
-				ioc.restart();
-				ioc.run();
-
-				if (got_response) {
-					natpmp_gateway_ip_ = gw;
-					device_type_ = NatDeviceType::NatPmp;
-					return true;
-				}
-			} catch (...) {
-				continue;
+		std::array<std::uint8_t, 64> response{};
+		asio::ip::udp::endpoint sender;
+		asio::steady_timer timer(ioc);
+		timer.expires_after(timeout);
+		timer.async_wait([&](const asio::error_code& ec) {
+			if (!ec) {
+				asio::error_code ignored;
+				socket.cancel(ignored);
 			}
+		});
+
+		bool found = false;
+		std::string external_ip;
+		int ignored_packets = 0;
+		std::function<void()> listen;
+		listen = [&]() {
+			socket.async_receive_from(
+				asio::buffer(response), sender,
+				[&](const asio::error_code& ec, std::size_t bytes) {
+					if (found || ec == asio::error::operation_aborted) {
+						return;
+					}
+					if (!ec && sender == gateway_ep && bytes >= 12 &&
+						parse_natpmp_ip_response(response.data(), bytes, external_ip)) {
+						found = true;
+						timer.cancel();
+						return;
+					}
+					// Gói từ máy khác (giả mạo) hoặc lỗi nhất thời: bỏ qua và chờ tiếp tới khi hết hạn.
+					if (++ignored_packets > 32) {
+						timer.cancel();
+						return;
+					}
+					listen();
+				});
+		};
+		listen();
+		ioc.run();
+
+		if (!found) {
+			return false;
 		}
-		return false;
+		external_ip_ = external_ip;
+		natpmp_gateway_ip_ = gateway;
+		device_type_ = NatDeviceType::NatPmp;
+		return true;
 	} catch (...) {
 		return false;
 	}
@@ -576,7 +784,7 @@ PortMappingResult NatTraversal::map_port(
 	}
 
 	if (device_type_ == NatDeviceType::UPnP) {
-		const std::string client_ip = local_ip_.empty() ? "192.168.1.100" : local_ip_;
+		const std::string client_ip = local_ip_.empty() ? p2p::network::detect_lan_ip() : local_ip_;
 		const std::string body = build_upnp_soap_add_port(
 			upnp_service_type_, client_ip, result.internal_port, result.external_port,
 			protocol, lifetime_sec, "PBL4 BitTorrent");
@@ -601,43 +809,64 @@ PortMappingResult NatTraversal::map_port(
 
 	if (device_type_ == NatDeviceType::NatPmp) {
 		try {
+			asio::error_code address_ec;
+			const auto gateway_address = asio::ip::make_address_v4(natpmp_gateway_ip_, address_ec);
+			if (address_ec) {
+				result.success = false;
+				result.message = "NAT-PMP gateway address is invalid";
+				return result;
+			}
+			const asio::ip::udp::endpoint gateway_ep(gateway_address, natpmp_port_);
+
 			asio::io_context ioc;
 			asio::ip::udp::socket socket(ioc);
 			socket.open(asio::ip::udp::v4());
-
-			const auto req = build_natpmp_map_request(
+			const auto request = build_natpmp_map_request(
 				protocol, result.internal_port, result.external_port, lifetime_sec);
-			const asio::ip::udp::endpoint gw_ep(
-				asio::ip::make_address(natpmp_gateway_ip_), natpmp_port_);
-			socket.send_to(asio::buffer(req), gw_ep);
+			socket.send_to(asio::buffer(request), gateway_ep);
 
-			std::array<std::uint8_t, 64> resp{};
-			asio::ip::udp::endpoint sender_ep;
+			std::array<std::uint8_t, 64> response{};
+			asio::ip::udp::endpoint sender;
 			asio::steady_timer timer(ioc);
 			timer.expires_after(std::chrono::milliseconds(2000));
-
-			bool ok = false;
 			timer.async_wait([&](const asio::error_code& ec) {
-				if (!ec) socket.cancel();
+				if (!ec) {
+					asio::error_code ignored;
+					socket.cancel(ignored);
+				}
 			});
 
-			socket.async_receive_from(
-				asio::buffer(resp), sender_ep,
-				[&](const asio::error_code& ec, std::size_t bytes_recvd) {
-					if (!ec && bytes_recvd >= 16) {
+			bool ok = false;
+			int ignored_packets = 0;
+			std::function<void()> listen;
+			listen = [&]() {
+				socket.async_receive_from(
+					asio::buffer(response), sender,
+					[&](const asio::error_code& ec, std::size_t bytes) {
+						if (ok || ec == asio::error::operation_aborted) {
+							return;
+						}
 						std::uint16_t mapped_ext_port = 0;
 						std::uint32_t granted_lifetime = 0;
-						if (parse_natpmp_map_response(resp.data(), bytes_recvd, mapped_ext_port, granted_lifetime)) {
+						// Chỉ tin gói từ đúng gateway và đúng là phản hồi cho yêu cầu này (giao thức + cổng nội bộ).
+						if (!ec && sender == gateway_ep &&
+							parse_natpmp_map_response(response.data(), bytes, protocol, result.internal_port,
+													  mapped_ext_port, granted_lifetime, lifetime_sec == 0)) {
 							result.external_port = mapped_ext_port;
 							result.lifetime = granted_lifetime;
 							result.success = true;
 							ok = true;
 							timer.cancel();
+							return;
 						}
-					}
-				});
-
-			ioc.restart();
+						if (++ignored_packets > 32) {
+							timer.cancel();
+							return;
+						}
+						listen();
+					});
+			};
+			listen();
 			ioc.run();
 
 			if (ok) {

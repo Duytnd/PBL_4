@@ -214,7 +214,10 @@ int handleVerify(int argc, char** argv) {
         std::cout << "Verifying data at " << dataPath << " against torrent " << meta.name << "...\n";
 
         p2p::PieceManager pm(meta.pieces.size(), static_cast<std::size_t>(meta.pieceLength), meta.length, meta.pieces);
-        if (!pm.loadFromFile(dataPath)) {
+        // Multi-file: dataPath là thư mục chứa các file của torrent (đã gồm thư mục `name`).
+        const bool loaded = meta.isMultiFile() ? pm.loadFromFiles(dataPath, meta.files)
+                                               : pm.loadFromFile(dataPath);
+        if (!loaded) {
             std::cerr << "Could not load data file at " << dataPath << "\n";
             return 1;
         }

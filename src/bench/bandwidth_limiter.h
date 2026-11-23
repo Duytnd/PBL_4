@@ -44,7 +44,16 @@ public:
     // Có thể gọi tường minh nếu muốn reset bucket sau khi idle.
     void refill();
 
+    // Tiêu `bytes` đồng thời từ `local` và `shared` (có thể null / cùng một đối tượng). Chỉ trừ khi CẢ HAI cùng đủ:
+    // nếu không, bucket nào còn token vẫn giữ nguyên, nên một giới hạn tổng đang cạn không rút cạn giới hạn riêng của
+    // từng torrent (và ngược lại).
+    static bool consume_both(BandwidthLimiter& local, BandwidthLimiter* shared, std::uint64_t bytes);
+
 private:
+    // Caller giữ mutex_. can_pay: bucket có đủ cho gói này không (đã refill); pay: trừ token.
+    bool can_pay_locked(std::uint64_t bytes);
+    void pay_locked(std::uint64_t bytes);
+
     void refill_internal();  // Hàm nội bộ — caller phải giữ mutex_
 
     mutable std::mutex mutex_;

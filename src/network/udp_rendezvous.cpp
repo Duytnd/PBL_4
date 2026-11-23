@@ -9,9 +9,9 @@ namespace p2p::network::udp_rendezvous {
 namespace {
 
 constexpr std::array<char, 4> kMagic{'P', '4', 'U', 'T'};
-constexpr char kVersion = 1;
-constexpr std::size_t kRequestHeaderSize = 48;
-constexpr std::size_t kPunchRequestSize = 58;
+constexpr char kVersion = 2;  // 2: thêm khoá phiên 8 byte vào Register/Punch
+constexpr std::size_t kRequestHeaderSize = 56;
+constexpr std::size_t kPunchRequestSize = 66;
 constexpr std::size_t kPunchResultSize = 37;
 constexpr std::size_t kNotificationSize = 39;
 
@@ -88,8 +88,9 @@ bool valid_info_hash_and_peer_id(const std::string& info_hash, const std::string
 std::string encode_register_request(
     const std::string& info_hash,
     const std::string& peer_id,
-    std::uint16_t peer_tcp_port) {
-    if (!valid_info_hash_and_peer_id(info_hash, peer_id) || peer_tcp_port == 0) {
+    std::uint16_t peer_tcp_port,
+    const std::string& key) {
+    if (!valid_info_hash_and_peer_id(info_hash, peer_id) || peer_tcp_port == 0 || key.size() != kKeySize) {
         throw std::invalid_argument("rendezvous registration has invalid fields");
     }
     std::string message;
@@ -98,6 +99,7 @@ std::string encode_register_request(
     message.append(info_hash);
     message.append(peer_id);
     append_port(message, peer_tcp_port);
+    message.append(key);
     return message;
 }
 
@@ -107,10 +109,11 @@ std::string encode_punch_request(
     std::uint16_t peer_tcp_port,
     const std::string& target_ip,
     std::uint16_t target_tcp_port,
-    std::uint32_t transaction_id) {
+    std::uint32_t transaction_id,
+    const std::string& key) {
     std::array<std::uint8_t, 4> octets{};
     if (!valid_info_hash_and_peer_id(info_hash, peer_id) || peer_tcp_port == 0 || target_tcp_port == 0 ||
-        !parse_ipv4(target_ip, octets)) {
+        key.size() != kKeySize || !parse_ipv4(target_ip, octets)) {
         throw std::invalid_argument("rendezvous punch request has invalid fields");
     }
     std::string message;
@@ -119,6 +122,7 @@ std::string encode_punch_request(
     message.append(info_hash);
     message.append(peer_id);
     append_port(message, peer_tcp_port);
+    message.append(key);
     for (const auto octet : octets) {
         message.push_back(static_cast<char>(octet));
     }
@@ -154,10 +158,11 @@ bool decode_request(const char* data, std::size_t size, Request& request) noexce
     if (request.peer_tcp_port == 0) {
         return false;
     }
+    request.key.assign(data + 48, kKeySize);
     if (opcode == Opcode::Punch) {
-        request.target_ip = format_ipv4(data + 48);
-        request.target_tcp_port = read_port(data + 52);
-        request.transaction_id = read_transaction(data + 54);
+        request.target_ip = format_ipv4(data + 56);
+        request.target_tcp_port = read_port(data + 60);
+        request.transaction_id = read_transaction(data + 62);
         if (request.target_tcp_port == 0 || request.target_ip == "0.0.0.0") {
             return false;
         }
