@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniBitTorrent</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
   <header class="topbar">
@@ -49,53 +49,103 @@
 
       <section class="view" id="view-torrents" aria-label="Torrents" hidden>
         <div class="toolbar">
-          <label class="field">Show:
-            <select>
-              <option>All</option>
-              <option>Downloading</option>
-              <option>Seeding</option>
-              <option>Paused</option>
+          <div class="seg" role="group" aria-label="Show torrents">
+            <button type="button" class="seg-btn" data-filter="all" aria-pressed="true">All</button>
+            <button type="button" class="seg-btn" data-filter="downloading" aria-pressed="false">Downloading</button>
+            <button type="button" class="seg-btn" data-filter="seeding" aria-pressed="false">Seeding</button>
+            <button type="button" class="seg-btn" data-filter="paused" aria-pressed="false">Paused</button>
+          </div>
+          <label class="select-pill" title="Sort by">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h13"/><path d="M3 12h9"/><path d="M3 18h5"/><path d="M17 8v12"/><path d="M13.5 16.5L17 20l3.5-3.5"/></svg>
+            <select id="sort-select" aria-label="Sort by">
+              <option value="recent">Most recent</option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
             </select>
-          </label>
-          <label class="field">Sort:
-            <select>
-              <option>Most Recent</option>
-              <option>Name</option>
-              <option>Size</option>
-            </select>
+            <svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </label>
           <span class="spacer"></span>
-          <button id="bandwidth-settings-btn" type="button" class="btn" title="Overall download/upload speed limit for all torrents">Speed limit: off</button>
-          <button id="queue-settings-btn" type="button" class="btn" title="Limit how many torrents download at once">Queue: off</button>
           <button id="create-torrent-btn" type="button" class="btn btn-primary">Create torrent <span aria-hidden="true">+</span></button>
           <button id="add-torrent-btn" type="button" class="btn">Add torrent <span aria-hidden="true">+</span></button>
+          <button id="settings-toggle-btn" type="button" class="btn btn-icon" aria-haspopup="dialog" aria-label="Settings" title="Settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
         </div>
 
         <div id="torrent-builder" class="torrent-builder">
           <input id="torrent-source" type="file" hidden>
           <div class="magnet-add-row">
-            <label for="magnet-add-input">Magnet link</label>
-            <input id="magnet-add-input" type="url" placeholder="magnet:?xt=urn:btih:..." autocomplete="off">
+            <input id="magnet-add-input" type="url" placeholder="Paste a magnet link (magnet:?xt=urn:btih:...)" aria-label="Magnet link" autocomplete="off">
             <button id="add-magnet-btn" type="button" class="btn">Add magnet</button>
           </div>
-          <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px;">
-            <label for="tracker-announce-input" style="font-size: 13px; font-weight: 500; color: var(--text);">Tracker URL:</label>
-            <input id="tracker-announce-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="http://&lt;LAN IP&gt;:6969/announce">
-          </div>
-          <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px;">
-            <label for="dht-bootstrap-input" style="font-size: 13px; font-weight: 500; color: var(--text);">DHT Bootstrap:</label>
-            <input id="dht-bootstrap-input" type="text" style="flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 12px; background: var(--bg);" placeholder="&lt;IP máy kia&gt;:6881 (để tải không cần Tracker)">
-            <button id="save-dht-btn" type="button" class="btn" style="padding: 6px 12px; font-size: 12px;">Connect DHT</button>
-          </div>
           <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
-          <div id="magnet-box" class="magnet-box" style="display: none; margin-top: 10px; padding: 12px; background: #eaf1ff; border: 1px solid #bfdbfe; border-radius: 8px;">
-            <div style="font-weight: 600; margin-bottom: 6px; color: #1e40af;">Magnet Link (share it so others can download):</div>
-            <div style="display: flex; gap: 8px;">
-              <input id="magnet-input" type="text" readonly style="flex: 1; padding: 6px 10px; border: 1px solid #93c5fd; border-radius: 6px; font-family: monospace; font-size: 12px; background: #ffffff;">
-              <button id="copy-magnet-btn" type="button" class="btn btn-primary" style="white-space: nowrap;">Copy Magnet</button>
+        </div>
+
+        <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+          <div class="settings-head">
+            <div>
+              <h2 id="settings-title" tabindex="-1" autofocus>Settings</h2>
+              <p class="settings-sub">Connection and transfer limits</p>
+            </div>
+            <button id="settings-close-btn" type="button" class="settings-close" aria-label="Close settings">&times;</button>
+          </div>
+          <div class="settings-tabs" role="tablist">
+            <button type="button" class="settings-tab" role="tab" id="tab-connect" aria-controls="pane-connect" aria-selected="true" data-pane="connect">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+              Connect
+            </button>
+            <button type="button" class="settings-tab" role="tab" id="tab-limit" aria-controls="pane-limit" aria-selected="false" data-pane="limit">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 14l4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+              Limit
+            </button>
+          </div>
+
+          <div id="pane-connect" class="settings-pane" role="tabpanel" aria-labelledby="tab-connect">
+            <div class="settings-group">
+              <label for="tracker-announce-input">Tracker URL</label>
+              <input id="tracker-announce-input" type="text" class="mono-input" placeholder="http://&lt;LAN IP&gt;:6969/announce">
+              <p class="settings-hint">Announce address embedded in newly created torrents.</p>
+            </div>
+            <div class="settings-group">
+              <label for="dht-bootstrap-input">DHT bootstrap</label>
+              <div class="settings-inline">
+                <input id="dht-bootstrap-input" type="text" class="mono-input" placeholder="&lt;IP máy kia&gt;:6881">
+                <button id="save-dht-btn" type="button" class="btn btn-primary">Connect DHT</button>
+              </div>
+              <p class="settings-hint">Used to find peers when no tracker is available.</p>
             </div>
           </div>
-        </div>
+
+          <div id="pane-limit" class="settings-pane" role="tabpanel" aria-labelledby="tab-limit" hidden>
+            <div class="settings-group">
+              <div class="settings-switch-row">
+                <div>
+                  <strong>Speed limit</strong>
+                  <p class="settings-hint">Caps the combined speed of all torrents.</p>
+                </div>
+                <label class="switch"><input id="speed-limit-toggle" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="visually-hidden">Enable speed limit</span></label>
+              </div>
+              <div id="speed-limit-fields" class="settings-fields" hidden>
+                <label>Download (KiB/s) <input id="speed-down-input" type="number" min="0" max="9999999" step="1" inputmode="numeric"></label>
+                <label>Upload (KiB/s) <input id="speed-up-input" type="number" min="0" max="9999999" step="1" inputmode="numeric"></label>
+                <button id="speed-apply-btn" type="button" class="btn">Apply</button>
+              </div>
+            </div>
+            <div class="settings-group">
+              <div class="settings-switch-row">
+                <div>
+                  <strong>Queue</strong>
+                  <p class="settings-hint">How many torrents download at once; the rest wait in line.</p>
+                </div>
+                <label class="switch"><input id="queue-toggle" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="visually-hidden">Enable queue</span></label>
+              </div>
+              <div id="queue-fields" class="settings-fields" hidden>
+                <label>Max active <input id="queue-max-input" type="number" min="1" max="64" step="1" inputmode="numeric"></label>
+                <button id="queue-apply-btn" type="button" class="btn">Apply</button>
+              </div>
+            </div>
+          </div>
+        </dialog>
 
         <div id="torrent-list" class="torrent-list" aria-live="polite"></div>
 
@@ -105,10 +155,47 @@
       </section>
 
       <section class="view" id="view-speed" aria-label="Speed" hidden>
-        <div class="tiles">
-          <div class="tile"><div class="tile-label">Download speed</div><div class="tile-value">0 B/s</div></div>
-          <div class="tile"><div class="tile-label">Upload speed</div><div class="tile-value">0 B/s</div></div>
+        <div class="speed-grid">
+          <article class="speed-card speed-down" aria-label="Download">
+            <header class="speed-head">
+              <span class="speed-badge" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg></span>
+              <span class="speed-label">Download</span>
+              <span id="speed-down-limit" class="speed-limit-chip">No limit</span>
+            </header>
+            <div id="speed-down-value" class="speed-value" aria-live="off">0 B/s</div>
+            <svg id="speed-down-chart" class="speed-chart" viewBox="0 0 300 80" preserveAspectRatio="none" role="img" aria-label="Download over the last 2 minutes">
+              <path class="speed-grid-line" d="M0 20H300M0 40H300M0 60H300"/>
+              <path id="speed-down-area" class="speed-area" d=""/>
+              <path id="speed-down-line" class="speed-line" d=""/>
+            </svg>
+            <div id="speed-down-bar" class="speed-bar" hidden><span></span></div>
+            <dl class="speed-stats">
+              <div><dt>Average</dt><dd id="speed-down-avg">0 B/s</dd></div>
+              <div><dt>Peak</dt><dd id="speed-down-peak">0 B/s</dd></div>
+              <div><dt>Transferred</dt><dd id="speed-down-total">0 B</dd></div>
+            </dl>
+          </article>
+          <article class="speed-card speed-up" aria-label="Upload">
+            <header class="speed-head">
+              <span class="speed-badge" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></span>
+              <span class="speed-label">Upload</span>
+              <span id="speed-up-limit" class="speed-limit-chip">No limit</span>
+            </header>
+            <div id="speed-up-value" class="speed-value" aria-live="off">0 B/s</div>
+            <svg id="speed-up-chart" class="speed-chart" viewBox="0 0 300 80" preserveAspectRatio="none" role="img" aria-label="Upload over the last 2 minutes">
+              <path class="speed-grid-line" d="M0 20H300M0 40H300M0 60H300"/>
+              <path id="speed-up-area" class="speed-area" d=""/>
+              <path id="speed-up-line" class="speed-line" d=""/>
+            </svg>
+            <div id="speed-up-bar" class="speed-bar" hidden><span></span></div>
+            <dl class="speed-stats">
+              <div><dt>Average</dt><dd id="speed-up-avg">0 B/s</dd></div>
+              <div><dt>Peak</dt><dd id="speed-up-peak">0 B/s</dd></div>
+              <div><dt>Transferred</dt><dd id="speed-up-total">0 B</dd></div>
+            </dl>
+          </article>
         </div>
+        <p class="speed-note">Live speed of all torrents combined, sampled every 2 seconds. The chart shows the last 2 minutes.</p>
       </section>
 
       <section class="view" id="view-files" aria-label="Files" hidden>
@@ -119,9 +206,41 @@
           </div>
           <button id="open-downloads-folder-btn" class="btn" type="button" style="display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; font-size: 13px;">
             <svg class="icon" viewBox="0 0 24 24" style="width: 15px; height: 15px;" aria-hidden="true"><path d="M3 7c0-1.1.9-2 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
-            <span>Mở thư mục trên máy</span>
+            <span>Open folder</span>
           </button>
         </div>
+
+        <div class="files-toolbar">
+          <div class="seg" role="group" aria-label="Time range">
+            <button type="button" class="seg-btn" data-range="all" aria-pressed="true">All time</button>
+            <button type="button" class="seg-btn" data-range="today" aria-pressed="false">Today</button>
+            <button type="button" class="seg-btn" data-range="7d" aria-pressed="false">7 days</button>
+            <button type="button" class="seg-btn" data-range="30d" aria-pressed="false">30 days</button>
+            <button type="button" class="seg-btn" data-range="custom" aria-pressed="false">Custom</button>
+          </div>
+          <span class="spacer"></span>
+          <label class="select-pill" title="Sort by">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h13"/><path d="M3 12h9"/><path d="M3 18h5"/><path d="M17 8v12"/><path d="M13.5 16.5L17 20l3.5-3.5"/></svg>
+            <select id="files-sort" aria-label="Sort files by">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="name-asc">Name A to Z</option>
+              <option value="name-desc">Name Z to A</option>
+              <option value="size-desc">Largest first</option>
+              <option value="size-asc">Smallest first</option>
+            </select>
+            <svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </label>
+          <button id="files-refresh-btn" type="button" class="icon-btn files-refresh" title="Refresh" aria-label="Refresh file list">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+        <div id="files-custom-range" class="files-range" hidden>
+          <label>From <input id="files-from" type="date"></label>
+          <label>To <input id="files-to" type="date"></label>
+          <button id="files-range-clear" type="button" class="btn">Clear</button>
+        </div>
+
         <div id="files-list" class="files-list" aria-live="polite"></div>
       </section>
     </main>
@@ -149,6 +268,6 @@
     </div>
   </div>
 
-  <script src="app.js" defer></script>
+  <script src="app.js?v=9" defer></script>
 </body>
 </html>

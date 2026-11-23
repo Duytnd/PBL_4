@@ -72,6 +72,7 @@
       if (link.dataset.view === view) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     }
+    if (view === 'files') loadFiles();
   }
 
   function setStatus(message, kind = 'info') {
@@ -139,15 +140,89 @@
       }
     }
 
-    // Update speed view tiles
-    const speedView = document.getElementById('view-speed');
-    if (speedView) {
-      const values = speedView.querySelectorAll('.tile-value');
-      if (values.length >= 2) {
-        values[0].textContent = formatSpeed(totalDlSpeed);
-        values[1].textContent = formatSpeed(totalUlSpeed);
+    recordSpeedSample(totalDlSpeed, totalUlSpeed, totalDownloaded, totalUploaded);
+  }
+
+  // Trang Speed: giữ 60 mẫu gần nhất (poll 2 giây/lần => 2 phút), vẽ biểu đồ vùng bằng SVG.
+  const SPEED_SAMPLES = 60;
+  const speedHistory = { down: [], up: [] };
+  const speedPeak = { down: 0, up: 0 };
+  const speedLimitKib = { down: 0, up: 0 };
+  let speedLimitFetchedAt = 0;
+
+  function drawSpeedChart(dir) {
+    const samples = speedHistory[dir];
+    const line = document.getElementById(`speed-${dir}-line`);
+    const area = document.getElementById(`speed-${dir}-area`);
+    if (!line || !area || samples.length === 0) return;
+    const width = 300;
+    const height = 80;
+    const top = 6;  // chừa lề trên để đỉnh không bị cắt
+    const maxValue = Math.max(...samples, 1024);  // tối thiểu 1 KB/s để mức rảnh không bị phóng đại
+    const step = width / (SPEED_SAMPLES - 1);
+    const points = samples.map((value, index) => {
+      const x = width - (samples.length - 1 - index) * step;
+      const y = height - (value / maxValue) * (height - top);
+      return [x.toFixed(1), y.toFixed(1)];
+    });
+    const path = points.map(([x, y], index) => `${index === 0 ? 'M' : 'L'}${x} ${y}`).join(' ');
+    line.setAttribute('d', path);
+    area.setAttribute('d', `${path} L${points[points.length - 1][0]} ${height} L${points[0][0]} ${height} Z`);
+  }
+
+  function renderSpeedDirection(dir, current, transferred) {
+    const samples = speedHistory[dir];
+    const set = (suffix, text) => {
+      const el = document.getElementById(`speed-${dir}-${suffix}`);
+      if (el) el.textContent = text;
+    };
+    const average = samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
+    set('value', formatSpeed(current));
+    set('avg', formatSpeed(average));
+    set('peak', formatSpeed(speedPeak[dir]));
+    set('total', formatBytes(transferred));
+
+    const limit = speedLimitKib[dir];
+    const chip = document.getElementById(`speed-${dir}-limit`);
+    const bar = document.getElementById(`speed-${dir}-bar`);
+    if (chip) {
+      chip.textContent = limit ? `Limit ${limit.toLocaleString('en-US')} KiB/s` : 'No limit';
+      chip.classList.toggle('is-limited', Boolean(limit));
+    }
+    if (bar) {
+      bar.hidden = !limit;
+      if (limit) {
+        const percent = Math.min(100, (current / (limit * 1024)) * 100);
+        bar.firstElementChild.style.width = `${percent.toFixed(0)}%`;
       }
     }
+    drawSpeedChart(dir);
+  }
+
+  async function refreshSpeedLimits() {
+    // Giới hạn chỉ đổi khi người dùng chỉnh trong Settings: tra lại tối đa 10 giây/lần và chỉ khi đang xem trang Speed.
+    const view = document.getElementById('view-speed');
+    if (!view || view.hidden || Date.now() - speedLimitFetchedAt < 10000) return;
+    speedLimitFetchedAt = Date.now();
+    try {
+      const res = await fetch('/api/settings/bandwidth');
+      if (!res.ok) return;
+      const data = await res.json();
+      speedLimitKib.down = Number(data.down) || 0;
+      speedLimitKib.up = Number(data.up) || 0;
+    } catch (_) { /* giữ giá trị cũ */ }
+  }
+
+  function recordSpeedSample(downRate, upRate, downloaded, uploaded) {
+    for (const [dir, rate] of [['down', downRate], ['up', upRate]]) {
+      const value = Number.isFinite(rate) && rate > 0 ? rate : 0;
+      speedHistory[dir].push(value);
+      if (speedHistory[dir].length > SPEED_SAMPLES) speedHistory[dir].shift();
+      speedPeak[dir] = Math.max(speedPeak[dir], value);
+    }
+    renderSpeedDirection('down', speedHistory.down[speedHistory.down.length - 1], downloaded);
+    renderSpeedDirection('up', speedHistory.up[speedHistory.up.length - 1], uploaded);
+    refreshSpeedLimits();
   }
 
   const STATE_BADGE_STYLE = {
@@ -199,6 +274,18 @@
     return list;
   }
 
+  // Icon nét đơn (Feather-style), dùng cho các nút trên thẻ torrent. Chuỗi cố định, không chứa dữ liệu người dùng.
+  const svgIcon = (body) => `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+  const ICONS = {
+    copy: svgIcon('<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'),
+    check: svgIcon('<polyline points="20 6 9 17 4 12"/>'),
+    pause: svgIcon('<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>'),
+    play: svgIcon('<polygon points="6 4 20 12 6 20 6 4"/>'),
+    files: svgIcon('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>'),
+    limit: svgIcon('<path d="M12 14l4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>'),
+    remove: svgIcon('<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>'),
+  };
+
   // Dựng khung card 1 lần; các lần poll sau chỉ cập nhật text/width tại chỗ
   // (không innerHTML lại) để không nháy, không mất hover/focus và thanh tiến độ chạy mượt.
   function buildCard(torrent) {
@@ -215,12 +302,12 @@
             <span data-f="meta" style="font-size: 12px; color: var(--muted);"></span>
           </div>
         </div>
-        <div style="display: flex; align-items: center; flex-shrink: 0;">
-          <button type="button" class="torrent-copy-magnet btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Copy Magnet</button>
-          <button type="button" class="torrent-pause btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Pause</button>
-          <button type="button" class="torrent-files btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Files</button>
-          <button type="button" class="torrent-limit btn" style="padding: 4px 8px; font-size: 12px; margin-right: 6px;">Limit</button>
-          <button type="button" class="torrent-remove btn" style="padding: 4px 8px; font-size: 12px; color: #dc2626;">Remove</button>
+        <div class="torrent-actions">
+          <button type="button" class="torrent-copy-magnet icon-btn" title="Copy magnet link" aria-label="Copy magnet link">${ICONS.copy}</button>
+          <button type="button" class="torrent-pause icon-btn" title="Pause" aria-label="Pause">${ICONS.pause}</button>
+          <button type="button" class="torrent-files icon-btn" title="Choose files" aria-label="Choose files">${ICONS.files}</button>
+          <button type="button" class="torrent-limit icon-btn" title="Speed limit" aria-label="Speed limit">${ICONS.limit}</button>
+          <button type="button" class="torrent-remove icon-btn icon-btn-danger" title="Remove" aria-label="Remove">${ICONS.remove}</button>
         </div>
       </div>
       <div role="progressbar" aria-valuemin="0" aria-valuemax="100" data-f="track" style="height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 8px;">
@@ -342,13 +429,21 @@
 
     const pauseButton = card.querySelector('.torrent-pause');
     const pauseLabel = torrent.queued ? 'Start now' : (torrent.paused ? 'Resume' : 'Pause');
-    pauseButton.textContent = pauseLabel;
+    const pauseIcon = (torrent.queued || torrent.paused) ? 'play' : 'pause';
+    // Chỉ dựng lại SVG khi trạng thái đổi, để poll mỗi giây không làm nháy icon.
+    if (pauseButton.dataset.icon !== pauseIcon) {
+      pauseButton.innerHTML = ICONS[pauseIcon];
+      pauseButton.dataset.icon = pauseIcon;
+    }
+    pauseButton.title = pauseLabel;
     pauseButton.setAttribute('aria-label', `${pauseLabel} ${torrent.name}`);
     const kib = (bytes) => (bytes ? `${Math.round(bytes / 1024)} KiB/s` : 'unlimited');
     const limitButton = card.querySelector('.torrent-limit');
-    limitButton.title = `Download: ${kib(torrent.downloadLimit)} • Upload: ${kib(torrent.uploadLimit)}`;
+    limitButton.title = `Speed limit — Download: ${kib(torrent.downloadLimit)} • Upload: ${kib(torrent.uploadLimit)}`;
+    limitButton.setAttribute('aria-label', `Speed limit for ${torrent.name}`);
 
     card.querySelector('.torrent-copy-magnet').hidden = !torrent.magnetUri;
+    card.querySelector('.torrent-files').setAttribute('aria-label', `Choose files of ${torrent.name}`);
     card.querySelector('.torrent-remove').setAttribute('aria-label', `Remove ${torrent.name}`);
   }
 
@@ -474,20 +569,21 @@
 
   let currentLightboxFile = null;
 
-  async function openFileOnComputer(filename) {
-    if (!filename) return;
-    setStatus(`Đang mở "${filename}" bằng ứng dụng mặc định...`);
+  async function openFileOnComputer(relativePath) {
+    if (!relativePath) return;
+    const label = relativePath.split('/').pop();
+    setStatus(`Opening "${label}" with the default app...`);
     try {
-      const res = await fetch(`/api/files/open?name=${encodeURIComponent(filename)}`, { method: 'POST' });
+      const res = await fetch(`/api/files/open?path=${encodeURIComponent(relativePath)}`, { method: 'POST' });
       if (res.ok) {
-        setStatus(`Đã mở "${filename}" trên máy tính!`, 'success');
+        setStatus(`Opened "${label}" on this computer.`, 'success');
       } else {
         const err = await res.text();
-        setStatus(`Không thể mở trực tiếp: ${err}`, 'error');
-        window.open(`/api/files/content?name=${encodeURIComponent(filename)}`, '_blank');
+        setStatus(`Could not open it directly: ${err}`, 'error');
+        window.open(`/api/files/content?path=${encodeURIComponent(relativePath)}`, '_blank');
       }
     } catch (err) {
-      setStatus(`Lỗi khi mở file: ${err.message}`, 'error');
+      setStatus(`Error opening file: ${err.message}`, 'error');
     }
   }
 
@@ -505,8 +601,8 @@
     }
   }
 
-  function openLightbox(filename, sizeStr, isVideo = false) {
-    currentLightboxFile = filename;
+  function openLightbox(relativePath, sizeStr, isVideo = false) {
+    currentLightboxFile = relativePath;
     const modal = document.getElementById('lightbox-modal');
     const img = document.getElementById('lightbox-img');
     const video = document.getElementById('lightbox-video');
@@ -516,12 +612,13 @@
 
     if (!modal) return;
 
+    const filename = relativePath.split('/').pop();
+    const fileUrl = `/api/files/content?path=${encodeURIComponent(relativePath)}`;
     title.textContent = filename;
     size.textContent = sizeStr || '';
-    downloadBtn.href = `/api/files/content?name=${encodeURIComponent(filename)}`;
+    downloadBtn.href = fileUrl;
     downloadBtn.download = filename;
 
-    const fileUrl = `/api/files/content?name=${encodeURIComponent(filename)}`;
     if (isVideo) {
       img.hidden = true;
       video.hidden = false;
@@ -548,81 +645,248 @@
     currentLightboxFile = null;
   }
 
+  // ---- Trang Files: liệt kê mọi file thật trong thư mục tải, nhóm theo ngày, lọc thời gian, sắp xếp ----
+  let filesData = [];
+  let filesTruncated = false;
+  let filesLoaded = false;
+  let filesError = '';
+  let filesRange = 'all';
+  let filesFrom = '';
+  let filesTo = '';
+  let filesSort = 'newest';
+  let filesRenderedSignature = '';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const dayKey = (date) => `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  const addDays = (date, days) => {
+    const copy = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    copy.setDate(copy.getDate() + days);
+    return copy;
+  };
+
+  function dayLabel(key) {
+    const today = new Date();
+    if (key === dayKey(today)) return 'Today';
+    if (key === dayKey(addDays(today, -1))) return 'Yesterday';
+    const [y, m, d] = key.split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  }
+
+  async function loadFiles() {
+    try {
+      const res = await fetch('/api/files/list');
+      if (!res.ok) {
+        // 404 = server đang chạy là bản cũ, chưa có API liệt kê file: phải khởi động lại client sau khi cập nhật.
+        filesError = res.status === 404
+          ? 'This server is an older version without the file list. Restart the client and reload the page.'
+          : `Could not load the file list (server responded ${res.status}).`;
+        renderFilesList();
+        return;
+      }
+      const data = await res.json();
+      filesData = Array.isArray(data.files) ? data.files : [];
+      filesTruncated = Boolean(data.truncated);
+      filesLoaded = true;
+      filesError = '';
+      renderFilesList();
+    } catch (_) {
+      filesError = 'Could not reach the server to load the file list.';
+      renderFilesList();
+    }
+  }
+
+  function filteredFiles() {
+    let from = '';
+    let to = '';
+    const today = new Date();
+    if (filesRange === 'today') {
+      from = to = dayKey(today);
+    } else if (filesRange === '7d') {
+      from = dayKey(addDays(today, -6));
+    } else if (filesRange === '30d') {
+      from = dayKey(addDays(today, -29));
+    } else if (filesRange === 'custom') {
+      from = filesFrom;
+      to = filesTo;
+      if (from && to && from > to) [from, to] = [to, from];
+    }
+    return filesData.filter((file) => {
+      const key = dayKey(new Date(file.mtime * 1000));
+      return (!from || key >= from) && (!to || key <= to);
+    });
+  }
+
+  function sortFiles(list) {
+    const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    const sorters = {
+      newest: (a, b) => b.mtime - a.mtime || byName(a, b),
+      oldest: (a, b) => a.mtime - b.mtime || byName(a, b),
+      'name-asc': byName,
+      'name-desc': (a, b) => byName(b, a),
+      'size-desc': (a, b) => b.size - a.size || byName(a, b),
+      'size-asc': (a, b) => a.size - b.size || byName(a, b),
+    };
+    return list.slice().sort(sorters[filesSort] || sorters.newest);
+  }
+
+  function fileCardHtml(file, downloading) {
+    const category = getFileCategory(file.name);
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    const contentUrl = `/api/files/content?path=${encodeURIComponent(file.path)}`;
+    const when = new Date(file.mtime * 1000);
+    const folder = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
+
+    const previewHtml = category === 'image'
+      ? `
+          <div class="file-card-preview img-thumb-wrap">
+            <img src="${contentUrl}" alt="${escapeHtml(file.name)}" loading="lazy" class="file-thumb-img" onerror="this.style.display='none'; this.nextElementSibling.style.opacity='1';">
+            <div class="file-zoom-hint">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+              Zoom
+            </div>
+          </div>`
+      : `
+          <div class="file-card-preview">
+            ${renderFileIconSvg(category, ext)}
+          </div>`;
+
+    const hint = category === 'image' ? 'Click to zoom' : (category === 'video' ? 'Click to play' : 'Click to open');
+    return `
+        <div class="file-card" data-path="${escapeHtml(file.path)}" data-category="${category}" data-filesize="${formatBytes(file.size)}" title="${hint}">
+          ${previewHtml}
+          <div class="file-card-body">
+            <div class="file-card-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+            ${folder ? `<div class="file-card-path" title="${escapeHtml(folder)}">${escapeHtml(folder)}</div>` : ''}
+            <div class="file-card-meta">
+              <span>${formatBytes(file.size)}</span>
+              <span>${pad2(when.getHours())}:${pad2(when.getMinutes())}</span>
+              ${downloading ? '<span class="file-chip">Downloading</span>' : ''}
+            </div>
+          </div>
+        </div>`;
+  }
+
   function renderFilesList() {
     const container = document.getElementById('files-list');
     const countEl = document.getElementById('files-count');
     if (!container) return;
 
+    const visible = sortFiles(filteredFiles());
+    const downloadingNames = new Set(torrentList.filter((t) => (Number(t.progress) || 0) < 100).map((t) => t.name));
+    const isDownloading = (file) => downloadingNames.has(file.path) || downloadingNames.has(file.path.split('/')[0]);
+
+    const totalBytes = visible.reduce((sum, file) => sum + file.size, 0);
     if (countEl) {
-      countEl.textContent = `${torrentList.length} file${torrentList.length === 1 ? '' : 's'}`;
+      const filtered = visible.length !== filesData.length;
+      countEl.textContent = `${filtered ? `${visible.length} of ${filesData.length}` : visible.length} file${filesData.length === 1 ? '' : 's'} · ${formatBytes(totalBytes)}`;
     }
 
-    if (!torrentList.length) {
-      container.innerHTML = '<div class="files-empty">Chưa có file nào được tải về. Thêm file .torrent hoặc magnet link để bắt đầu.</div>';
+    // Poll torrent gọi hàm này mỗi 2 giây: chỉ dựng lại DOM khi nội dung hiển thị thật sự đổi, tránh nháy ảnh thu nhỏ.
+    const signature = JSON.stringify([filesRange, filesFrom, filesTo, filesSort, filesLoaded, filesTruncated, filesError,
+      visible.map((f) => [f.path, f.size, f.mtime, isDownloading(f)])]);
+    if (signature === filesRenderedSignature) return;
+    filesRenderedSignature = signature;
+
+    if (!filesLoaded) {
+      container.innerHTML = filesError
+        ? `<div class="files-empty files-error" role="alert">${escapeHtml(filesError)}</div>`
+        : '<div class="files-empty">Loading files...</div>';
+      return;
+    }
+    if (!visible.length) {
+      container.innerHTML = filesData.length
+        ? '<div class="files-empty">No files in this period.</div>'
+        : '<div class="files-empty">The download folder is empty. Add a .torrent file or a magnet link to get started.</div>';
       return;
     }
 
-    const cardsHtml = torrentList.map((t) => {
-      const stateInfo = normalizeTorrentState(t.state);
-      const progress = Math.min(Math.max(Number(t.progress) || 0, 0), 100);
-      const category = getFileCategory(t.name);
-      const ext = (t.name.split('.').pop() || '').toLowerCase();
-      const contentUrl = `/api/files/content?name=${encodeURIComponent(t.name)}`;
-
-      let previewHtml = '';
-      if (category === 'image') {
-        previewHtml = `
-          <div class="file-card-preview img-thumb-wrap">
-            <img src="${contentUrl}" alt="${escapeHtml(t.name)}" loading="lazy" class="file-thumb-img" onerror="this.style.display='none'; this.nextElementSibling.style.opacity='1';">
-            <div class="file-zoom-hint">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-              Phóng to
-            </div>
-          </div>`;
-      } else {
-        previewHtml = `
-          <div class="file-card-preview">
-            ${renderFileIconSvg(category, ext)}
-          </div>`;
+    // Sắp theo ngày (mới/cũ nhất): nhóm theo từng ngày. Sắp theo tên/dung lượng: một danh sách chung cho dễ so sánh.
+    const groupByDay = filesSort === 'newest' || filesSort === 'oldest';
+    const groups = [];
+    if (groupByDay) {
+      for (const file of visible) {
+        const key = dayKey(new Date(file.mtime * 1000));
+        const last = groups[groups.length - 1];
+        if (last && last.key === key) last.files.push(file);
+        else groups.push({ key, title: dayLabel(key), files: [file] });
       }
+    } else {
+      groups.push({ key: 'all', title: 'All files', files: visible });
+    }
 
-      const isCompleted = progress >= 100;
-      const statusText = isCompleted ? '✓ Hoàn thành' : `${progress.toFixed(0)}%`;
-      const statusColor = isCompleted ? '#16a34a' : '#2563eb';
-
+    const html = groups.map((group) => {
+      const bytes = group.files.reduce((sum, file) => sum + file.size, 0);
       return `
-        <div class="file-card" data-filename="${escapeHtml(t.name)}" data-category="${category}" data-filesize="${formatBytes(t.length)}" title="Click để ${category === 'image' ? 'phóng to ảnh' : (category === 'video' ? 'xem video' : 'mở file')}">
-          ${previewHtml}
-          <div class="file-card-body">
-            <div class="file-card-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-            <div class="file-card-meta">
-              <span>${formatBytes(t.length)}</span>
-              <span style="color: ${statusColor}; font-weight: 600;">${statusText}</span>
-            </div>
-            ${!isCompleted ? `
-              <div class="file-card-progress">
-                <div class="file-card-progress-bar" style="width: ${progress}%;"></div>
-              </div>` : ''}
+        <section class="files-day">
+          <div class="files-day-head">
+            <h3 class="files-day-title">${escapeHtml(group.title)}</h3>
+            <span class="files-day-meta">${group.files.length} file${group.files.length === 1 ? '' : 's'} · ${formatBytes(bytes)}</span>
           </div>
-        </div>`;
+          <div class="files-explorer-grid">${group.files.map((file) => fileCardHtml(file, isDownloading(file))).join('')}</div>
+        </section>`;
     }).join('');
-
-    container.innerHTML = `<div class="files-explorer-grid">${cardsHtml}</div>`;
+    container.innerHTML = html + (filesTruncated ? '<p class="files-note">Showing the first 10,000 files only.</p>' : '');
 
     container.querySelectorAll('.file-card').forEach((card) => {
       card.addEventListener('click', () => {
-        const filename = card.getAttribute('data-filename');
+        const relativePath = card.getAttribute('data-path');
         const category = card.getAttribute('data-category');
         const filesize = card.getAttribute('data-filesize');
         if (category === 'image') {
-          openLightbox(filename, filesize, false);
+          openLightbox(relativePath, filesize, false);
         } else if (category === 'video') {
-          openLightbox(filename, filesize, true);
+          openLightbox(relativePath, filesize, true);
         } else {
-          openFileOnComputer(filename);
+          openFileOnComputer(relativePath);
         }
       });
     });
+  }
+
+  function bindFilesControls() {
+    const rangeButtons = document.querySelectorAll('#view-files .seg-btn');
+    const customRow = document.getElementById('files-custom-range');
+    const fromInput = document.getElementById('files-from');
+    const toInput = document.getElementById('files-to');
+
+    for (const button of rangeButtons) {
+      button.addEventListener('click', () => {
+        filesRange = button.dataset.range;
+        for (const other of rangeButtons) other.setAttribute('aria-pressed', String(other === button));
+        if (customRow) customRow.hidden = filesRange !== 'custom';
+        renderFilesList();
+      });
+    }
+    const onDateChange = () => {
+      filesFrom = fromInput.value;
+      filesTo = toInput.value;
+      renderFilesList();
+    };
+    if (fromInput) fromInput.addEventListener('change', onDateChange);
+    if (toInput) toInput.addEventListener('change', onDateChange);
+    const clearButton = document.getElementById('files-range-clear');
+    if (clearButton) {
+      clearButton.addEventListener('click', () => {
+        fromInput.value = '';
+        toInput.value = '';
+        onDateChange();
+      });
+    }
+    const sortSelect = document.getElementById('files-sort');
+    if (sortSelect) {
+      sortSelect.addEventListener('change', () => {
+        filesSort = sortSelect.value;
+        renderFilesList();
+      });
+    }
+    const refreshButton = document.getElementById('files-refresh-btn');
+    if (refreshButton) refreshButton.addEventListener('click', loadFiles);
+
+    // Danh sách trên đĩa có thể đổi bất cứ lúc nào (tải xong, xoá tay): làm tươi mỗi 10 giây khi đang xem trang này.
+    setInterval(() => {
+      const view = document.getElementById('view-files');
+      if (view && !view.hidden && !document.hidden) loadFiles();
+    }, 10000);
   }
 
   function renderTorrentList() {
@@ -738,25 +1002,33 @@
           setStatus('Clipboard access denied.', 'error');
           return;
         }
-        const orig = button.textContent;
-        button.textContent = 'Copied!';
-        setTimeout(() => { button.textContent = orig === 'Copied!' ? 'Copy Magnet' : orig; }, 1500);
+        button.innerHTML = ICONS.check;
+        button.title = 'Copied!';
+        button.classList.add('icon-btn-ok');
+        setTimeout(() => {
+          button.innerHTML = ICONS.copy;
+          button.title = 'Copy magnet link';
+          button.classList.remove('icon-btn-ok');
+        }, 1500);
       }
     });
   }
 
   function bindListControls() {
-    const [showSelect, sortSelect] = document.querySelectorAll('#view-torrents .toolbar select');
-    if (showSelect) {
-      showSelect.addEventListener('change', () => {
-        viewFilter = showSelect.value.toLowerCase();
+    const filterButtons = document.querySelectorAll('#view-torrents .seg-btn');
+    for (const button of filterButtons) {
+      button.addEventListener('click', () => {
+        viewFilter = button.dataset.filter;
+        for (const other of filterButtons) {
+          other.setAttribute('aria-pressed', String(other === button));
+        }
         renderTorrentList();
       });
     }
+    const sortSelect = document.getElementById('sort-select');
     if (sortSelect) {
       sortSelect.addEventListener('change', () => {
-        const v = sortSelect.value.toLowerCase();
-        viewSort = v.startsWith('most') ? 'recent' : v;
+        viewSort = sortSelect.value;
         renderTorrentList();
       });
     }
@@ -884,16 +1156,6 @@
       link.remove();
       URL.revokeObjectURL(url);
 
-      // Display magnet link in UI box
-      if (magnetUri) {
-        const magnetBox = document.getElementById('magnet-box');
-        const magnetInput = document.getElementById('magnet-input');
-        if (magnetBox && magnetInput) {
-          magnetInput.value = magnetUri;
-          magnetBox.style.display = 'block';
-        }
-      }
-
       setStatus(`Torrent created successfully and added to the swarm: ${downloadName}`, 'success');
       await syncTorrentsFromServer();
     } catch (error) {
@@ -973,95 +1235,153 @@
     input.click();
   }
 
+  // Popup Settings (Connect / Limit). Công tắc Speed limit và Queue áp dụng ngay khi bật/tắt.
+  function bindSettingsDialog() {
+    const dialog = document.getElementById('settings-dialog');
+    const openButton = document.getElementById('settings-toggle-btn');
+    if (!dialog || !openButton || typeof dialog.showModal !== 'function') return;
+
+    const speedToggle = document.getElementById('speed-limit-toggle');
+    const speedFields = document.getElementById('speed-limit-fields');
+    const speedDown = document.getElementById('speed-down-input');
+    const speedUp = document.getElementById('speed-up-input');
+    const queueToggle = document.getElementById('queue-toggle');
+    const queueFields = document.getElementById('queue-fields');
+    const queueMax = document.getElementById('queue-max-input');
+    const DEFAULT_SPEED_KIB = 1024;
+    const DEFAULT_QUEUE = 3;
+
+    const showPane = (name) => {
+      for (const tab of dialog.querySelectorAll('.settings-tab')) {
+        tab.setAttribute('aria-selected', String(tab.dataset.pane === name));
+      }
+      for (const pane of dialog.querySelectorAll('.settings-pane')) {
+        pane.hidden = pane.id !== `pane-${name}`;
+      }
+    };
+    for (const tab of dialog.querySelectorAll('.settings-tab')) {
+      tab.addEventListener('click', () => showPane(tab.dataset.pane));
+    }
+
+    const refreshLimits = async () => {
+      try {
+        const [bandwidthRes, queueRes] = await Promise.all([
+          fetch('/api/settings/bandwidth'), fetch('/api/settings/queue')]);
+        if (bandwidthRes.ok) {
+          const data = await bandwidthRes.json();
+          const on = Boolean(data.down || data.up);
+          speedToggle.checked = on;
+          speedFields.hidden = !on;
+          if (on) {
+            speedDown.value = String(data.down || 0);
+            speedUp.value = String(data.up || 0);
+          }
+        }
+        if (queueRes.ok) {
+          const data = await queueRes.json();
+          const on = Boolean(data.max_active);
+          queueToggle.checked = on;
+          queueFields.hidden = !on;
+          if (on) queueMax.value = String(data.max_active);
+        }
+      } catch (_) { /* server chưa sẵn sàng: giữ nguyên trạng thái hiện có */ }
+    };
+
+    const saveSpeed = async (down, up) => {
+      if (!/^\d{1,7}$/.test(down) || !/^\d{1,7}$/.test(up)) {
+        setStatus('Limits must be whole numbers of KiB/s.', 'error');
+        return false;
+      }
+      try {
+        const res = await fetch(`/api/settings/bandwidth?down=${down}&up=${up}`, { method: 'POST' });
+        setStatus(res.ok ? (down === '0' && up === '0' ? 'Speed limit turned off.' : 'Speed limit saved.')
+          : `Could not save speed limit: server responded ${res.status}`, res.ok ? 'success' : 'error');
+        return res.ok;
+      } catch (_) {
+        setStatus('Could not save speed limit: server unreachable.', 'error');
+        return false;
+      }
+    };
+
+    const saveQueue = async (value) => {
+      if (!/^\d{1,2}$/.test(value) || Number(value) > 64) {
+        setStatus('Queue size must be a whole number from 1 to 64.', 'error');
+        return false;
+      }
+      try {
+        const res = await fetch(`/api/settings/queue?max_active=${value}`, { method: 'POST' });
+        setStatus(res.ok ? (value === '0' ? 'Queue turned off.' : 'Queue setting saved.')
+          : `Could not save queue setting: server responded ${res.status}`, res.ok ? 'success' : 'error');
+        return res.ok;
+      } catch (_) {
+        setStatus('Could not save queue setting: server unreachable.', 'error');
+        return false;
+      }
+    };
+
+    speedToggle.addEventListener('change', async () => {
+      if (speedToggle.checked) {
+        if (!Number(speedDown.value) && !Number(speedUp.value)) {
+          speedDown.value = String(DEFAULT_SPEED_KIB);
+          speedUp.value = String(DEFAULT_SPEED_KIB);
+        }
+        speedFields.hidden = false;
+        if (!(await saveSpeed(speedDown.value.trim(), speedUp.value.trim()))) await refreshLimits();
+      } else {
+        speedFields.hidden = true;
+        if (!(await saveSpeed('0', '0'))) await refreshLimits();
+      }
+    });
+    document.getElementById('speed-apply-btn').addEventListener('click', async () => {
+      const down = speedDown.value.trim() || '0';
+      const up = speedUp.value.trim() || '0';
+      if (down === '0' && up === '0') {
+        setStatus('Enter a limit above 0, or switch the speed limit off.', 'error');
+        return;
+      }
+      if (!(await saveSpeed(down, up))) await refreshLimits();
+    });
+
+    queueToggle.addEventListener('change', async () => {
+      if (queueToggle.checked) {
+        if (!Number(queueMax.value)) queueMax.value = String(DEFAULT_QUEUE);
+        queueFields.hidden = false;
+        if (!(await saveQueue(queueMax.value.trim()))) await refreshLimits();
+      } else {
+        queueFields.hidden = true;
+        if (!(await saveQueue('0'))) await refreshLimits();
+      }
+    });
+    document.getElementById('queue-apply-btn').addEventListener('click', async () => {
+      if (!(await saveQueue(queueMax.value.trim() || '0')) ) await refreshLimits();
+    });
+
+    openButton.addEventListener('click', () => {
+      showPane('connect');
+      dialog.showModal();
+      refreshLimits();
+    });
+    document.getElementById('settings-close-btn').addEventListener('click', () => dialog.close());
+    // Bấm ra vùng nền mờ (chính phần tử <dialog>, ngoài hộp nội dung) thì đóng.
+    dialog.addEventListener('click', (event) => {
+      if (event.target === dialog) {
+        const box = dialog.getBoundingClientRect();
+        const inside = event.clientX >= box.left && event.clientX <= box.right
+          && event.clientY >= box.top && event.clientY <= box.bottom;
+        if (!inside) dialog.close();
+      }
+    });
+  }
+
   function bindFilePicker() {
+    bindSettingsDialog();
     const input = document.getElementById('torrent-source');
     const createTorrentButton = document.getElementById('create-torrent-btn');
     const addTorrentButton = document.getElementById('add-torrent-btn');
-    const queueButton = document.getElementById('queue-settings-btn');
-    const bandwidthButton = document.getElementById('bandwidth-settings-btn');
     const addMagnetButton = document.getElementById('add-magnet-btn');
     const magnetAddInput = document.getElementById('magnet-add-input');
     const dropzone = document.getElementById('torrent-dropzone');
     const dashboardDropzone = document.getElementById('dashboard-dropzone');
-    const copyMagnetBtn = document.getElementById('copy-magnet-btn');
-
-    if (bandwidthButton) {
-      const label = (kib) => (kib ? `${kib} KiB/s` : 'unlimited');
-      const refreshBandwidthLabel = async () => {
-        try {
-          const res = await fetch('/api/settings/bandwidth');
-          if (!res.ok) return;
-          const data = await res.json();
-          bandwidthButton.textContent = (data.down || data.up) ? `Speed limit: ↓${label(data.down)} ↑${label(data.up)}` : 'Speed limit: off';
-          bandwidthButton.dataset.down = String(data.down || 0);
-          bandwidthButton.dataset.up = String(data.up || 0);
-        } catch (_) { /* server chưa sẵn sàng */ }
-      };
-      bandwidthButton.addEventListener('click', async () => {
-        const down = window.prompt('Overall download limit in KiB/s (0 = unlimited):', bandwidthButton.dataset.down || '0');
-        if (down === null) return;
-        const up = window.prompt('Overall upload limit in KiB/s (0 = unlimited):', bandwidthButton.dataset.up || '0');
-        if (up === null) return;
-        if (!/^\d{1,7}$/.test(down.trim()) || !/^\d{1,7}$/.test(up.trim())) {
-          setStatus('Limits must be whole numbers of KiB/s.', 'error');
-          return;
-        }
-        try {
-          const res = await fetch(`/api/settings/bandwidth?down=${down.trim()}&up=${up.trim()}`, { method: 'POST' });
-          setStatus(res.ok ? 'Speed limit saved.' : `Could not save speed limit: server responded ${res.status}`, res.ok ? 'success' : 'error');
-          await refreshBandwidthLabel();
-        } catch (_) {
-          setStatus('Could not save speed limit: server unreachable.', 'error');
-        }
-      });
-      refreshBandwidthLabel();
-    }
-
-    if (queueButton) {
-      const refreshQueueLabel = async () => {
-        try {
-          const res = await fetch('/api/settings/queue');
-          if (!res.ok) return;
-          const data = await res.json();
-          queueButton.textContent = data.max_active ? `Queue: ${data.max_active} at a time` : 'Queue: off';
-          queueButton.dataset.max = String(data.max_active || 0);
-        } catch (_) { /* server chưa sẵn sàng */ }
-      };
-      queueButton.addEventListener('click', async () => {
-        const answer = window.prompt('How many torrents may download at the same time? (0 = no limit, max 64)', queueButton.dataset.max || '0');
-        if (answer === null) return;
-        const value = answer.trim();
-        if (!/^\d{1,2}$/.test(value) || Number(value) > 64) {
-          setStatus('Queue size must be a whole number from 0 to 64.', 'error');
-          return;
-        }
-        try {
-          const res = await fetch(`/api/settings/queue?max_active=${value}`, { method: 'POST' });
-          setStatus(res.ok ? 'Queue setting saved.' : `Could not save queue setting: server responded ${res.status}`, res.ok ? 'success' : 'error');
-          await refreshQueueLabel();
-        } catch (_) {
-          setStatus('Could not save queue setting: server unreachable.', 'error');
-        }
-      });
-      refreshQueueLabel();
-    }
-
-    if (copyMagnetBtn) {
-      copyMagnetBtn.addEventListener('click', async () => {
-        const magnetInput = document.getElementById('magnet-input');
-        if (magnetInput && magnetInput.value) {
-          try {
-            await navigator.clipboard.writeText(magnetInput.value);
-          } catch (_) {
-            setStatus('Clipboard access denied.', 'error');
-            return;
-          }
-          copyMagnetBtn.textContent = 'Copied!';
-          setTimeout(() => { copyMagnetBtn.textContent = 'Copy Magnet'; }, 2000);
-        }
-      });
-    }
-
     const saveDhtBtn = document.getElementById('save-dht-btn');
     if (saveDhtBtn) {
       saveDhtBtn.addEventListener('click', handleSaveDhtBootstrap);
@@ -1164,6 +1484,7 @@
   bindFilePicker();
   bindTorrentListActions();
   bindListControls();
+  bindFilesControls();
   bindFilesViewEvents();
   syncTorrentsFromServer();
   setInterval(syncTorrentsFromServer, 2000);
