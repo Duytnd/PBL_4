@@ -58,11 +58,18 @@ add_test(NAME test_metrics COMMAND test_metrics)
 
 # DHT (BEP 5): NodeId + RoutingTable + Krpc (logic thuần) + KademliaNode (I/O thật)
 # Dò IP LAN dùng chung cho tracker, DHT và WebUI
-add_library(p2p_lan STATIC src/network/lan_address.cpp)
+add_library(p2p_lan STATIC src/network/lan_address.cpp src/network/network_monitor.cpp)
 target_include_directories(p2p_lan PUBLIC ${CMAKE_SOURCE_DIR}/src)
+find_package(Threads REQUIRED)
+target_link_libraries(p2p_lan PUBLIC Threads::Threads)
 if(WIN32)
     target_link_libraries(p2p_lan PUBLIC ws2_32 iphlpapi)
 endif()
+
+add_executable(test_network_monitor tests/test_network_monitor.cpp)
+target_include_directories(test_network_monitor PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_network_monitor PRIVATE p2p_lan)
+add_test(NAME test_network_monitor COMMAND test_network_monitor)
 
 add_executable(test_kademlia
     tests/test_kademlia.cpp

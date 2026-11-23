@@ -978,11 +978,44 @@
     const createTorrentButton = document.getElementById('create-torrent-btn');
     const addTorrentButton = document.getElementById('add-torrent-btn');
     const queueButton = document.getElementById('queue-settings-btn');
+    const bandwidthButton = document.getElementById('bandwidth-settings-btn');
     const addMagnetButton = document.getElementById('add-magnet-btn');
     const magnetAddInput = document.getElementById('magnet-add-input');
     const dropzone = document.getElementById('torrent-dropzone');
     const dashboardDropzone = document.getElementById('dashboard-dropzone');
     const copyMagnetBtn = document.getElementById('copy-magnet-btn');
+
+    if (bandwidthButton) {
+      const label = (kib) => (kib ? `${kib} KiB/s` : 'unlimited');
+      const refreshBandwidthLabel = async () => {
+        try {
+          const res = await fetch('/api/settings/bandwidth');
+          if (!res.ok) return;
+          const data = await res.json();
+          bandwidthButton.textContent = (data.down || data.up) ? `Speed limit: ↓${label(data.down)} ↑${label(data.up)}` : 'Speed limit: off';
+          bandwidthButton.dataset.down = String(data.down || 0);
+          bandwidthButton.dataset.up = String(data.up || 0);
+        } catch (_) { /* server chưa sẵn sàng */ }
+      };
+      bandwidthButton.addEventListener('click', async () => {
+        const down = window.prompt('Overall download limit in KiB/s (0 = unlimited):', bandwidthButton.dataset.down || '0');
+        if (down === null) return;
+        const up = window.prompt('Overall upload limit in KiB/s (0 = unlimited):', bandwidthButton.dataset.up || '0');
+        if (up === null) return;
+        if (!/^\d{1,7}$/.test(down.trim()) || !/^\d{1,7}$/.test(up.trim())) {
+          setStatus('Limits must be whole numbers of KiB/s.', 'error');
+          return;
+        }
+        try {
+          const res = await fetch(`/api/settings/bandwidth?down=${down.trim()}&up=${up.trim()}`, { method: 'POST' });
+          setStatus(res.ok ? 'Speed limit saved.' : `Could not save speed limit: server responded ${res.status}`, res.ok ? 'success' : 'error');
+          await refreshBandwidthLabel();
+        } catch (_) {
+          setStatus('Could not save speed limit: server unreachable.', 'error');
+        }
+      });
+      refreshBandwidthLabel();
+    }
 
     if (queueButton) {
       const refreshQueueLabel = async () => {

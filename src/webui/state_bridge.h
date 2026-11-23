@@ -66,6 +66,14 @@ public:
     // Đọc các torrent đã lưu; file hỏng bị bỏ qua.
     [[nodiscard]] std::vector<SavedTorrent> loadSavedTorrents() const;
 
+    // ---- Giới hạn băng thông TỔNG cho cả ứng dụng (byte/s, 0 = không giới hạn) ----
+    // Cộng dồn với giới hạn riêng của từng torrent: mỗi block phải đủ token ở cả hai. Lưu cùng thư mục trạng thái.
+    void setGlobalLimits(std::uint64_t downBytesPerSec, std::uint64_t upBytesPerSec);
+    [[nodiscard]] std::uint64_t globalDownloadLimit() const;
+    [[nodiscard]] std::uint64_t globalUploadLimit() const;
+    // Gắn hai giới hạn tổng vào cấu hình session sắp tạo.
+    void applyGlobalLimiters(TorrentSessionConfig& config) const;
+
     // ---- Hàng đợi tải ----
     // Chỉ tối đa `max` torrent ĐANG TẢI (chưa xong, không tạm dừng) chạy cùng lúc; phần còn lại bị tạm dừng và xếp
     // hàng theo thứ tự thêm vào, tự chạy khi có chỗ trống. 0 = không giới hạn. Torrent đã xong (seed) không tính.
@@ -108,6 +116,8 @@ private:
         std::int64_t order = 0;    // nhỏ hơn = ưu tiên hơn
     };
     std::unordered_map<std::string, Entry> sessions_;
+    std::shared_ptr<bench::BandwidthLimiter> global_download_ = std::make_shared<bench::BandwidthLimiter>(0);
+    std::shared_ptr<bench::BandwidthLimiter> global_upload_ = std::make_shared<bench::BandwidthLimiter>(0);
     std::size_t max_active_ = 0;
     std::int64_t next_order_ = 1;
     std::int64_t front_order_ = 0;  // giá trị order nhỏ nhất đã cấp (để đẩy lên đầu hàng)

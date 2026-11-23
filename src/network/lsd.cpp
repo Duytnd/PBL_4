@@ -233,6 +233,21 @@ void LocalServiceDiscovery::stop() {
     }
 }
 
+bool LocalServiceDiscovery::rejoinMulticast() {
+    if (!running_ || socketHandle_ == -1) {
+        return false;
+    }
+    const SocketHandle sock = static_cast<SocketHandle>(socketHandle_);
+    ip_mreq mreq{};
+    mreq.imr_multiaddr.s_addr = inet_addr(kMulticastGroup);
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    // Bỏ tư cách thành viên cũ (lỗi nếu card đó đã biến mất: bỏ qua) rồi tham gia lại trên card hiện tại.
+    setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+               reinterpret_cast<const char*>(&mreq), sizeof(mreq));
+    return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                      reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0;
+}
+
 void LocalServiceDiscovery::receiveLoop() {
     std::vector<char> buffer(2048);
 

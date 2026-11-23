@@ -42,14 +42,24 @@ void StateBridge::setStateDir(const std::filesystem::path& dir) {
         state_dir_ = dir;
         std::ifstream in(dir / "queue.cfg");
         std::string line;
+        std::uint64_t globalDown = 0;
+        std::uint64_t globalUp = 0;
         while (std::getline(in, line)) {
-            if (line.rfind("max=", 0) != 0) continue;
             try {
-                loaded = std::min<unsigned long long>(std::stoull(line.substr(4)), 64);
+                if (line.rfind("max=", 0) == 0) {
+                    loaded = std::min<unsigned long long>(std::stoull(line.substr(4)), 64);
+                } else if (line.rfind("global_down=", 0) == 0) {
+                    globalDown = std::stoull(line.substr(12));
+                } else if (line.rfind("global_up=", 0) == 0) {
+                    globalUp = std::stoull(line.substr(10));
+                }
             } catch (const std::exception&) {
+                // dòng hỏng: giữ mặc định
             }
         }
         max_active_ = loaded;
+        global_download_->set_rate(globalDown);
+        global_upload_->set_rate(globalUp);
     }
     if (loaded != 0) ensureQueueThread();
 }
@@ -59,7 +69,31 @@ void StateBridge::saveQueueConfigLocked() const {
     std::error_code ec;
     std::filesystem::create_directories(state_dir_, ec);
     std::ofstream out(state_dir_ / "queue.cfg", std::ios::trunc);
-    if (out) out << "max=" << max_active_ << "\n";
+    if (out) {
+        out << "max=" << max_active_ << "\n"
+            << "global_down=" << global_download_->rate() << "\n"
+            << "global_up=" << global_upload_->rate() << "\n";
+    }
+}
+
+void StateBridge::setGlobalLimits(std::uint64_t downBytesPerSec, std::uint64_t upBytesPerSec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    global_download_->set_rate(downBytesPerSec);
+    global_upload_->set_rate(upBytesPerSec);
+    saveQueueConfigLocked();
+}
+
+std::uint64_t StateBridge::globalDownloadLimit() const {
+    return global_download_->rate();
+}
+
+std::uint64_t StateBridge::globalUploadLimit() const {
+    return global_upload_->rate();
+}
+
+void StateBridge::applyGlobalLimiters(TorrentSessionConfig& config) const {
+    config.global_download_limiter = global_download_;
+    config.global_upload_limiter = global_upload_;
 }
 
 void StateBridge::ensureQueueThread() {

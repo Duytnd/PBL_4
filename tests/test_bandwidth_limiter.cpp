@@ -5,6 +5,7 @@
 #include "test_framework.h"
 #include "bench/bandwidth_limiter.h"
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -115,6 +116,68 @@ void testConcurrentConsumeNoCrash() {
 }
 
 // ---------------------------------------------------------------------------
+// consume_both: giới hạn riêng + giới hạn tổng. Chỉ trừ khi CẢ HAI đủ; không rút cạn bucket còn lại khi một bên từ chối.
+// ---------------------------------------------------------------------------
+void testConsumeBothRequiresBothBuckets() {
+    BandwidthLimiter local(1000);
+    BandwidthLimiter shared(300);
+    CHECK(BandwidthLimiter::consume_both(local, &shared, 300));   // đủ cả hai
+    CHECK(!BandwidthLimiter::consume_both(local, &shared, 100));  // giới hạn tổng đã cạn
+    // Bucket riêng KHÔNG bị trừ khi lượt bị giới hạn tổng từ chối: còn 700 token.
+    CHECK(local.consume(700));
+    CHECK(!local.consume(1));
+}
+
+void testConsumeBothLocalLimitStillApplies() {
+    BandwidthLimiter local(200);
+    BandwidthLimiter shared(100000);
+    CHECK(BandwidthLimiter::consume_both(local, &shared, 200));
+    CHECK(!BandwidthLimiter::consume_both(local, &shared, 50));  // riêng đã cạn dù tổng còn thừa
+    CHECK(shared.consume(99800));                                // tổng chỉ bị trừ đúng 200 của lượt thành công
+}
+
+void testConsumeBothHandlesUnlimitedNullAndSameObject() {
+    BandwidthLimiter unlimitedLocal(0);
+    BandwidthLimiter shared(100);
+    CHECK(BandwidthLimiter::consume_both(unlimitedLocal, &shared, 100));  // chỉ tổng giới hạn
+    CHECK(!BandwidthLimiter::consume_both(unlimitedLocal, &shared, 1));
+
+    BandwidthLimiter local(100);
+    CHECK(BandwidthLimiter::consume_both(local, nullptr, 100));  // không có giới hạn tổng
+    CHECK(!BandwidthLimiter::consume_both(local, nullptr, 1));
+
+    BandwidthLimiter same(100);
+    CHECK(BandwidthLimiter::consume_both(same, &same, 100));  // cùng một đối tượng: không tự khoá chết, không trừ 2 lần
+    CHECK(!BandwidthLimiter::consume_both(same, &same, 1));
+
+    BandwidthLimiter none1(0);
+    BandwidthLimiter none2(0);
+    CHECK(BandwidthLimiter::consume_both(none1, &none2, 1ULL << 40));
+}
+
+// Nhiều luồng đảo thứ tự (a,b) / (b,a) không được deadlock; tổng lượng qua không vượt quá bucket tổng.
+void testConsumeBothConcurrentNoDeadlockAndBounded() {
+    BandwidthLimiter a(1000000);
+    BandwidthLimiter b(1000000);
+    BandwidthLimiter shared(50000);
+    std::atomic<std::uint64_t> granted{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < 2000; ++i) {
+                BandwidthLimiter& local = (t % 2 == 0) ? a : b;
+                if (BandwidthLimiter::consume_both(local, &shared, 100)) granted += 100;
+                if (BandwidthLimiter::consume_both(shared, &local, 100)) granted += 100;  // thứ tự khoá ngược
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    // Bucket tổng đầy 50000 token + nạp thêm trong lúc chạy (rất ngắn): không thể qua nhiều hơn mức đó đáng kể.
+    CHECK(granted.load() >= 50000);
+    CHECK(granted.load() <= 50000 + 50000);
+}
+
+// ---------------------------------------------------------------------------
 int main() {
     RUN(testUnlimitedAlwaysConsumes);
     RUN(testLimitedExceedsBucketReturnsFalse);
@@ -124,5 +187,9 @@ int main() {
     RUN(testSetRateToZeroBecomesUnlimited);
     RUN(testPacketLargerThanBucketIsEventuallyAllowed);
     RUN(testConcurrentConsumeNoCrash);
+    RUN(testConsumeBothRequiresBothBuckets);
+    RUN(testConsumeBothLocalLimitStillApplies);
+    RUN(testConsumeBothHandlesUnlimitedNullAndSameObject);
+    RUN(testConsumeBothConcurrentNoDeadlockAndBounded);
     return TEST_REPORT();
 }

@@ -2,6 +2,7 @@
 
 #include "core/hash_utils.h"
 #include "network/lan_address.h"
+#include "network/network_monitor.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -188,17 +189,32 @@ bool KademliaNode::start() {
 #endif
 
     socketHandle_ = static_cast<long long>(sock);
-    if (localIp_.empty()) {
-        localIp_ = detectLocalLanIp();
+    const bool autoDetectIp = localIp().empty();
+    if (autoDetectIp) {
+        setLocalIp(detectLocalLanIp());
     }
     running_ = true;
     receiveThread_ = std::thread(&KademliaNode::receiveLoop, this);
+    // IP tự dò thì phải theo kịp khi đổi mạng (WiFi <-> dây, đổi WiFi...). IP đặt tay (setLocalIp trước start) giữ nguyên.
+    if (autoDetectIp) {
+        networkSubscription_ = network::NetworkMonitor::instance().subscribe(
+            [this](const network::NetworkChange& change) {
+                if (!change.after.primary_ip.empty()) {
+                    setLocalIp(change.after.primary_ip);
+                    std::cout << "[DHT] Network changed: local IP is now " << change.after.primary_ip << std::endl;
+                }
+            });
+    }
     return true;
 }
 
 void KademliaNode::stop() {
     if (!running_.exchange(false)) {
         return;
+    }
+    if (networkSubscription_ != 0) {
+        network::NetworkMonitor::instance().unsubscribe(networkSubscription_);  // chờ callback đang chạy xong
+        networkSubscription_ = 0;
     }
     if (receiveThread_.joinable()) {
         receiveThread_.join();
@@ -289,7 +305,8 @@ void KademliaNode::handleQuery(const KrpcMessage& query, const std::string& from
                         std::string peerIp = contact.ip;
                         if ((peerIp == "127.0.0.1" || peerIp.empty() || contact.id == selfId_) &&
                             fromIp != "127.0.0.1" && fromIp != "localhost") {
-                            peerIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+                            const std::string selfIp = localIp();
+                            peerIp = !selfIp.empty() ? selfIp : detectLocalLanIp();
                         }
                         peers.push_back({peerIp, contact.port});
                     }
@@ -491,7 +508,7 @@ std::vector<KrpcPeerInfo> KademliaNode::getPeers(const std::string& infoHash) {
                 if ((p.ip == "127.0.0.1" || p.ip.empty()) && contact.ip != "127.0.0.1") {
                     p.ip = contact.ip;
                 }
-                if (!KademliaNode::should_connect_peer(localIp_, p.ip, false)) {
+                if (!KademliaNode::should_connect_peer(localIp(), p.ip, false)) {
                     continue;
                 }
                 foundPeers.push_back(p);
@@ -508,7 +525,7 @@ std::vector<KrpcPeerInfo> KademliaNode::getPeers(const std::string& infoHash) {
         shortlist = sortedByDistance(shortlist, target, RoutingTable::kBucketSize);
     }
 
-    if (is_private_ipv4(localIp_)) {
+    if (is_private_ipv4(localIp())) {
         const bool has_private_peer = std::any_of(
             foundPeers.begin(), foundPeers.end(), [](const KrpcPeerInfo& peer) {
                 return KademliaNode::is_private_ipv4(peer.ip);
@@ -552,7 +569,8 @@ void KademliaNode::announcePeer(const std::string& infoHash, std::uint16_t annou
     // Tự ghi nhận chính mình đang seed info_hash này để trả lời get_peers từ node khác.
     std::lock_guard<std::mutex> lock(announcedMutex_);
     auto& list = announcedPeers_[infoHash];
-    const std::string myIp = !localIp_.empty() ? localIp_ : detectLocalLanIp();
+    const std::string configuredIp = localIp();
+    const std::string myIp = !configuredIp.empty() ? configuredIp : detectLocalLanIp();
     auto self = std::find_if(list.begin(), list.end(), [&](const DhtContact& contact) {
         return contact.id == selfId_;
     });

@@ -6,6 +6,7 @@
 #include "network/lan_address.h"
 #include "network/lsd.h"
 #include "network/nat_traversal.h"
+#include "network/network_monitor.h"
 #include "network/udp_rendezvous.h"
 #include "network/utp_engine.h"
 
@@ -57,7 +58,7 @@ namespace {
 // Tên miền không biết được là LAN hay không -> coi là ngoài Internet.
 bool announce_targets_lan(const std::string& announce_url) {
     if (announce_url.empty()) {
-        return KademliaNode::is_private_ipv4(network::detect_lan_ip());
+        return KademliaNode::is_private_ipv4(NetworkMonitor::instance().primary_ip());
     }
     const auto scheme_end = announce_url.find("://");
     if (scheme_end == std::string::npos) {
@@ -256,50 +257,23 @@ bool TorrentSession::start() {
                 ~InitGuard() { done.store(true); }
             } guard{nat_mapping_initialization_done_};
 
-            try {
-                auto nat = std::make_unique<pbl4::network::NatTraversal>();
-                if (!nat->discover(std::chrono::milliseconds(600))) {
-                    std::cout << "[NAT] No UPnP/NAT-PMP gateway found; inbound peer connections may require manual port forwarding"
-                              << std::endl;
-                    return;
-                }
-
-                const auto mapping = nat->map_port(
-                    config_.listen_port, 0, pbl4::network::NatProtocol::TCP);
-                if (!mapping.success) {
-                    std::cout << "[NAT] Could not map TCP peer port " << config_.listen_port
-                              << ": " << mapping.message << std::endl;
-                    return;
-                }
-                if (!running_) {
-                    nat->unmap_port(mapping.external_port, pbl4::network::NatProtocol::TCP);
-                    return;
-                }
-
-                // Router có thể đổi cổng ngoài. Peer cùng LAN nối thẳng IP private tới cổng nội bộ
-                // (socket thật chỉ nghe ở listen_port), nên với tracker/mạng nội bộ phải quảng bá
-                // listen_port; cổng ngoài chỉ có nghĩa với peer ngoài Internet.
-                if (mapping.external_port != config_.listen_port && announce_targets_lan(metadata_.announce)) {
-                    std::cout << "[NAT] External port " << mapping.external_port
-                              << " differs from listen port " << config_.listen_port
-                              << "; LAN tracker detected, advertising the listen port to LAN peers" << std::endl;
-                } else {
-                    advertised_port_.store(mapping.external_port);
-                }
-                mapped_tcp_port_ = mapping.external_port;
-                tcp_port_mapped_ = true;
-                next_port_mapping_refresh_ =
-                    std::chrono::steady_clock::now() + std::chrono::minutes(30);
-                nat_traversal_ = std::move(nat);
-                std::cout << "[NAT] TCP peer port mapped: " << config_.listen_port
-                          << " -> " << advertised_port_.load()
-                          << " | external IP=" << mapping.external_ip
-                          << " | " << mapping.message << std::endl;
-            } catch (const std::exception& ex) {
-                std::cout << "[NAT] Port mapping unavailable: " << ex.what() << std::endl;
-            }
+            establish_port_mapping();
         });
     }
+
+    // Theo dõi đổi mạng: chỉ đặt cờ (callback chạy trên luồng monitor), việc nặng làm ở orchestration_loop.
+    network_changed_ = false;
+    network_primary_changed_ = false;
+    network_full_refresh_ = false;
+    network_subscription_ = NetworkMonitor::instance().subscribe([this](const NetworkChange& change) {
+        if (change.primary_changed) {
+            network_primary_changed_ = true;
+        }
+        if (change.primary_changed || change.was_offline) {
+            network_full_refresh_ = true;
+        }
+        network_changed_ = true;
+    });
 
     if (config_.enable_utp && config_.enable_tracker && !metadata_.announce.empty()) {
         try {
@@ -480,6 +454,12 @@ void TorrentSession::stop() {
                 peer->connection->close();
             }
         }
+    }
+
+    // Ngừng nhận sự kiện đổi mạng (chờ callback đang chạy xong) trước khi huỷ bất cứ thứ gì.
+    if (network_subscription_ != 0) {
+        NetworkMonitor::instance().unsubscribe(network_subscription_);
+        network_subscription_ = 0;
     }
 
     if (dht_init_thread_.joinable()) {
@@ -755,8 +735,8 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     // Tắt DHT thì không có localIp từ DHT: tự dò, tránh local_ip rỗng làm bộ lọc coi mọi peer public là rác.
     std::string local_ip = (dht() && !dht()->localIp().empty()) ? dht()->localIp() : "";
     if (local_ip.empty()) {
-        static const std::string detected_lan_ip = network::detect_lan_ip();
-        local_ip = detected_lan_ip;
+        // Không dùng biến static: nó chốt IP của mạng lúc gọi đầu tiên mãi mãi, đổi mạng là lọc peer sai.
+        local_ip = NetworkMonitor::instance().primary_ip();
     }
     const char* allow_public_env = std::getenv("P2P_ALLOW_PUBLIC_PEERS");
     const bool allow_public_peers =
@@ -1064,6 +1044,146 @@ void TorrentSession::on_torrent_finished(TorrentFinishedCallback cb) {
     finished_cb_ = std::move(cb);
 }
 
+void TorrentSession::establish_port_mapping(bool replace_stale_mapping) {
+    try {
+        auto nat = std::make_unique<pbl4::network::NatTraversal>();
+        if (!nat->discover(std::chrono::milliseconds(600))) {
+            std::cout << "[NAT] No UPnP/NAT-PMP gateway found; inbound peer connections may require manual port forwarding"
+                      << std::endl;
+            return;
+        }
+
+        auto mapping = nat->map_port(config_.listen_port, 0, pbl4::network::NatProtocol::TCP);
+        if (!mapping.success && replace_stale_mapping) {
+            // Đổi card mạng nhưng vẫn cùng router: ánh xạ cũ (trỏ về IP cũ của máy này) còn sống trên router, nhiều
+            // router từ chối ghi đè sang IP nội bộ khác (UPnP lỗi 718). Gỡ rồi ánh xạ lại một lần.
+            nat->unmap_port(config_.listen_port, pbl4::network::NatProtocol::TCP);
+            mapping = nat->map_port(config_.listen_port, 0, pbl4::network::NatProtocol::TCP);
+        }
+        if (!mapping.success) {
+            std::cout << "[NAT] Could not map TCP peer port " << config_.listen_port
+                      << ": " << mapping.message << std::endl;
+            return;
+        }
+        if (!running_) {
+            nat->unmap_port(mapping.external_port, pbl4::network::NatProtocol::TCP);
+            return;
+        }
+
+        // Router có thể đổi cổng ngoài. Peer cùng LAN nối thẳng IP private tới cổng nội bộ
+        // (socket thật chỉ nghe ở listen_port), nên với tracker/mạng nội bộ phải quảng bá
+        // listen_port; cổng ngoài chỉ có nghĩa với peer ngoài Internet.
+        if (mapping.external_port != config_.listen_port && announce_targets_lan(metadata_.announce)) {
+            std::cout << "[NAT] External port " << mapping.external_port
+                      << " differs from listen port " << config_.listen_port
+                      << "; LAN tracker detected, advertising the listen port to LAN peers" << std::endl;
+        } else {
+            advertised_port_.store(mapping.external_port);
+        }
+        mapped_tcp_port_ = mapping.external_port;
+        tcp_port_mapped_ = true;
+        next_port_mapping_refresh_ =
+            std::chrono::steady_clock::now() + std::chrono::minutes(30);
+        nat_traversal_ = std::move(nat);
+        std::cout << "[NAT] TCP peer port mapped: " << config_.listen_port
+                  << " -> " << advertised_port_.load()
+                  << " | external IP=" << mapping.external_ip
+                  << " | " << mapping.message << std::endl;
+    } catch (const std::exception& ex) {
+        std::cout << "[NAT] Port mapping unavailable: " << ex.what() << std::endl;
+    }
+}
+
+void TorrentSession::remap_ports_after_network_change() {
+    // KHÔNG gỡ ánh xạ cũ trên router cũ: sang mạng khác thì router cũ không còn với tới, còn nếu router mới trùng địa chỉ
+    // (192.168.1.1 ở cả hai nhà) thì lệnh gỡ sẽ rơi vào router mới. Ánh xạ cũ tự hết hạn (lease 1 giờ).
+    // Bỏ hẳn đối tượng NatTraversal cũ vì nó nhớ router cũ và IP nội bộ cũ.
+    nat_traversal_.reset();
+    tcp_port_mapped_ = false;
+    mapped_tcp_port_ = 0;
+    advertised_port_.store(config_.listen_port);  // mạng mới chưa có ánh xạ: chỉ quảng bá cổng thật
+    establish_port_mapping(/*replace_stale_mapping=*/true);
+}
+
+bool TorrentSession::handle_network_change() {
+    const bool any_change = network_changed_.exchange(false);
+    const bool full_refresh = network_full_refresh_.exchange(false);
+    const bool primary_changed = network_primary_changed_.exchange(false);
+    if (!any_change && !full_refresh) {
+        return false;
+    }
+
+    std::cout << "[NETWORK] Change detected: local IP now " << NetworkMonitor::instance().primary_ip()
+              << (primary_changed ? " (primary address changed)" : full_refresh ? " (network came back)" : " (secondary adapter)")
+              << std::endl;
+
+    // Nhóm multicast LSD gắn với card mạng lúc tham gia: tham gia lại và báo luôn cho máy trong LAN mới.
+    if (config_.enable_lsd && lsd_) {
+        lsd_->rejoinMulticast();
+        lsd_->announce(info_hash_raw_);
+    }
+    if (!full_refresh) {
+        return true;  // chỉ đổi card phụ (VPN, card ảo): kết nối hiện có vẫn dùng được
+    }
+
+    if (primary_changed) {
+        // IP nội bộ của máy đã đổi: mọi kết nối TCP/uTP đang mở gắn với địa chỉ cũ, chờ timeout 30 giây mới biết chết.
+        // Đóng ngay để dựng lại trên mạng mới (tracker/LSD/DHT trả lại peer trong vài giây).
+        std::vector<std::shared_ptr<pbl4::network::PeerConnection>> stale_connections;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            for (const auto& entry : active_peers_) {
+                if (entry.second && entry.second->connection) {
+                    stale_connections.push_back(entry.second->connection);
+                }
+            }
+            // Peer ở dải LAN cũ không còn với tới được, nhưng nếu giữ trong known_peer_endpoints_ thì add_peer tưởng vẫn
+            // còn "peer LAN thay thế" và bỏ qua mọi peer public => không tải được ở mạng mới.
+            const auto is_old_lan_endpoint = [](const std::string& endpoint) {
+                const auto colon = endpoint.rfind(':');
+                return colon != std::string::npos && KademliaNode::is_private_ipv4(endpoint.substr(0, colon));
+            };
+            for (auto it = known_peer_endpoints_.begin(); it != known_peer_endpoints_.end();) {
+                it = is_old_lan_endpoint(*it) ? known_peer_endpoints_.erase(it) : std::next(it);
+            }
+            for (auto it = discovered_tcp_peer_endpoints_.begin(); it != discovered_tcp_peer_endpoints_.end();) {
+                it = is_old_lan_endpoint(*it) ? discovered_tcp_peer_endpoints_.erase(it) : std::next(it);
+            }
+            for (auto it = queued_utp_peer_endpoints_.begin(); it != queued_utp_peer_endpoints_.end();) {
+                it = is_old_lan_endpoint(*it) ? queued_utp_peer_endpoints_.erase(it) : std::next(it);
+            }
+            candidate_peer_endpoints_.erase(
+                std::remove_if(candidate_peer_endpoints_.begin(), candidate_peer_endpoints_.end(), is_old_lan_endpoint),
+                candidate_peer_endpoints_.end());
+            utp_peer_candidates_.erase(
+                std::remove_if(utp_peer_candidates_.begin(), utp_peer_candidates_.end(), is_old_lan_endpoint),
+                utp_peer_candidates_.end());
+        }
+        for (const auto& connection : stale_connections) {
+            try {
+                connection->close();
+            } catch (...) {
+            }
+        }
+    }
+
+    // Router mới (hoặc router cũ khởi động lại): ánh xạ cổng cũ không còn đúng.
+    if (config_.enable_port_mapping && running_) {
+        remap_ports_after_network_change();
+    }
+    if (!running_) {
+        return true;
+    }
+
+    // IP/cổng công khai đổi: tracker và máy rendezvous UDP phải biết địa chỉ mới.
+    send_udp_registration();
+    next_udp_registration_ = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    if (config_.enable_tracker) {
+        process_tracker_announce("");
+    }
+    return true;
+}
+
 void TorrentSession::orchestration_loop() {
     while (running_ && config_.enable_port_mapping &&
            !nat_mapping_initialization_done_.load()) {
@@ -1084,7 +1204,15 @@ void TorrentSession::orchestration_loop() {
 
     while (running_) {
         if (!paused_) {
-            const auto now = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+
+            // 0. Đổi mạng (WiFi <-> dây, đổi WiFi, có lại mạng): làm lại NAT, báo lại tracker/LSD/DHT.
+            if (handle_network_change()) {
+                now = std::chrono::steady_clock::now();  // remap NAT có thể mất vài giây
+                last_tracker_time = now;                 // vừa announce xong
+                last_lsd_time = now;
+                last_dht_time = {};                      // announce DHT lại ngay ở lượt này với IP/cổng mới
+            }
 
             if (nat_traversal_ && tcp_port_mapped_ && now >= next_port_mapping_refresh_) {
                 try {
@@ -1492,6 +1620,26 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
                 request_next_blocks(peer);
             }
 
+            // Hết băng thông mà không còn block nào đang chờ: không có gì để nhận, nên chờ token rồi xin lại. Nếu cứ vào
+            // receive_message thì ngủ tới peer_timeout (30 giây) mới xin lại, làm tốc độ tải bị giật cục theo chu kỳ đó.
+            // Giới hạn 5 giây mỗi lượt để vẫn xử lý được tin nhắn (choke, keep-alive...) của peer.
+            if (peer->throttled) {
+                const auto spin_start = std::chrono::steady_clock::now();
+                while (running_ && !paused_ && peer->connection->is_open() && peer->throttled &&
+                       std::chrono::steady_clock::now() - spin_start < std::chrono::seconds(5)) {
+                    std::size_t in_flight = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(session_mutex_);
+                        for (const auto& pb : pending_blocks_) {
+                            if (pb.peer_endpoint == peer->endpoint_str) ++in_flight;
+                        }
+                    }
+                    if (in_flight != 0) break;  // block đang về: tin nhắn tiếp theo sẽ kích hoạt lần xin kế tiếp
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    request_next_blocks(peer);
+                }
+            }
+
             try {
                 pbl4::network::PeerMessage msg = peer->connection->receive_message();
                 peer->last_active = std::chrono::steady_clock::now();
@@ -1792,7 +1940,7 @@ void TorrentSession::handle_request_block(
     }
 
     if (success && !block_data.empty()) {
-        while (running_ && !upload_limiter_.consume(block_data.size())) {
+        while (running_ && !consume_upload(block_data.size())) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         if (!running_) {
@@ -2018,6 +2166,7 @@ void TorrentSession::apply_peer_bitfield(const std::shared_ptr<ActivePeer>& peer
 bool TorrentSession::request_next_blocks(std::shared_ptr<ActivePeer> peer) {
     BlockRequest request;
     const bool result = request_next_blocks_locked(peer, request);
+    peer->throttled = request.throttled;
     if (request.valid) {
         // Gửi NGOÀI khoá. Gửi lỗi thì bỏ ghi nhận block đang chờ để xin lại từ nơi khác.
         try {
@@ -2089,7 +2238,8 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
                     }
 
                     if (!already_requested) {
-                        if (!download_limiter_.consume(len)) {
+                        if (!consume_download(len)) {
+                            out.throttled = true;
                             return false;  // hết băng thông tải: thử lại ở lượt sau
                         }
                         out = BlockRequest{true, static_cast<std::uint32_t>(piece_idx), begin, len};
@@ -2148,7 +2298,8 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
         const std::uint32_t begin = 0;
         const std::uint32_t len = static_cast<std::uint32_t>(
             std::min<std::size_t>(pbl4::network::kStandardBlockSize, piece_sz));
-        if (!download_limiter_.consume(len)) {
+        if (!consume_download(len)) {
+            out.throttled = true;
             return false;  // hết băng thông tải: chưa đánh dấu piece đang tải, thử lại ở lượt sau
         }
 
@@ -2194,7 +2345,8 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
                     if (requested_by_this_peer || copies == 0 || copies >= max_copies) {
                         continue;
                     }
-                    if (!download_limiter_.consume(len)) {
+                    if (!consume_download(len)) {
+                        out.throttled = true;
                         return false;
                     }
                     out = BlockRequest{true, static_cast<std::uint32_t>(piece_idx), begin, len};

@@ -60,8 +60,16 @@ public:
     [[nodiscard]] const NodeId& selfId() const { return selfId_; }
     [[nodiscard]] std::uint16_t port() const { return port_; }
 
-    void setLocalIp(const std::string& ip) { localIp_ = ip; }
-    [[nodiscard]] const std::string& localIp() const { return localIp_; }
+    // IP quảng bá cho peer khác. Tự cập nhật khi đổi mạng (đăng ký NetworkMonitor trong start()), nên đọc/ghi qua khoá
+    // và trả về bản sao (không trả tham chiếu: luồng monitor có thể đổi giá trị bất cứ lúc nào).
+    void setLocalIp(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(localIpMutex_);
+        localIp_ = ip;
+    }
+    [[nodiscard]] std::string localIp() const {
+        std::lock_guard<std::mutex> lock(localIpMutex_);
+        return localIp_;
+    }
 
     static bool is_private_ipv4(const std::string& ip);
     static bool is_public_ipv4(const std::string& ip);
@@ -81,6 +89,8 @@ private:
     std::uint16_t port_;
     std::string secret_;
     std::string localIp_;
+    mutable std::mutex localIpMutex_;
+    std::uint64_t networkSubscription_ = 0;  // id đăng ký NetworkMonitor, 0 = chưa đăng ký
 
     std::atomic<bool> running_{false};
     std::thread receiveThread_;

@@ -424,6 +424,7 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
 
         // Khởi động TorrentSession chạy ngầm ở chế độ Seeder
         TorrentSessionConfig config;
+        StateBridge::instance().applyGlobalLimiters(config);
         config.download_dir = downloadDir;
         config.listen_port = StateBridge::instance().allocatePort();
         config.enable_tracker = enableTracker;
@@ -487,6 +488,7 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
         std::filesystem::create_directories(downloadDir, ec);
 
         TorrentSessionConfig config;
+        StateBridge::instance().applyGlobalLimiters(config);
         config.download_dir = downloadDir;
         config.listen_port = StateBridge::instance().allocatePort();
         config.enable_tracker = parseBoolField(req.form, "enable_tracker", true);
@@ -535,6 +537,7 @@ void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
         std::filesystem::create_directories(downloadDir, ec);
 
         TorrentSessionConfig config;
+        StateBridge::instance().applyGlobalLimiters(config);
         config.download_dir = downloadDir;
         config.listen_port = StateBridge::instance().allocatePort();
         config.enable_tracker = parseBoolField(req.form, "enable_tracker", true);
@@ -642,6 +645,34 @@ void handleResumeTorrent(const httplib::Request& req, httplib::Response& res) {
     if (!session) return;
     StateBridge::instance().userResume(hash);
     res.set_content("{\"status\":\"ok\",\"paused\":false}", "application/json");
+}
+
+// Giới hạn băng thông tổng của cả ứng dụng, KiB/s (0 = không giới hạn). Tham số vắng mặt thì giữ nguyên.
+void handleGetBandwidthSettings(const httplib::Request& /*req*/, httplib::Response& res) {
+    auto& bridge = StateBridge::instance();
+    res.set_content("{\"down\":" + std::to_string(bridge.globalDownloadLimit() / 1024) +
+                    ",\"up\":" + std::to_string(bridge.globalUploadLimit() / 1024) + "}",
+                    "application/json");
+}
+
+void handleSetBandwidthSettings(const httplib::Request& req, httplib::Response& res) {
+    auto& bridge = StateBridge::instance();
+    constexpr unsigned long long kMaxKiBps = 1024ULL * 1024ULL;  // 1 GiB/s
+    unsigned long long values[2] = {bridge.globalDownloadLimit() / 1024, bridge.globalUploadLimit() / 1024};
+    const char* keys[2] = {"down", "up"};
+    for (int i = 0; i < 2; ++i) {
+        if (!req.has_param(keys[i])) continue;
+        const std::string text = req.get_param_value(keys[i]);
+        if (text.empty() || text.size() > 8 || text.find_first_not_of("0123456789") != std::string::npos ||
+            std::stoull(text) > kMaxKiBps) {
+            res.status = 400;
+            res.set_content(std::string(keys[i]) + " must be a whole number of KiB/s from 0 to 1048576", "text/plain");
+            return;
+        }
+        values[i] = std::stoull(text);
+    }
+    bridge.setGlobalLimits(values[0] * 1024, values[1] * 1024);
+    handleGetBandwidthSettings(req, res);
 }
 
 // Hàng đợi tải: tối đa N torrent tải cùng lúc (0 = không giới hạn).
@@ -758,6 +789,7 @@ void restoreSavedTorrents() {
             if (StateBridge::instance().getSession(hash)) continue;
 
             TorrentSessionConfig config;
+            StateBridge::instance().applyGlobalLimiters(config);
             config.download_dir = downloadDir;
             config.listen_port = StateBridge::instance().allocatePort();
             config.enable_tracker = true;
@@ -1008,6 +1040,14 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Post("/api/torrents/resume", [](const httplib::Request& req, httplib::Response& res) {
         handleResumeTorrent(req, res);
+    });
+
+    server.Get("/api/settings/bandwidth", [](const httplib::Request& req, httplib::Response& res) {
+        handleGetBandwidthSettings(req, res);
+    });
+
+    server.Post("/api/settings/bandwidth", [](const httplib::Request& req, httplib::Response& res) {
+        handleSetBandwidthSettings(req, res);
     });
 
     server.Get("/api/settings/queue", [](const httplib::Request& req, httplib::Response& res) {

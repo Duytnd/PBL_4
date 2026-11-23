@@ -8,6 +8,7 @@
 #include "network/allowed_fast.h"
 #include "network/extension.h"
 #include "network/magnet_resolver.h"
+#include "network/network_monitor.h"
 #include "network/peer_connection.h"
 #include "network/peer_protocol.h"
 #include "network/torrent_session.h"
@@ -20,7 +21,9 @@
 #include <fstream>
 #include <iostream>
 #include <exception>
+#include <functional>
 #include <future>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <vector>
@@ -1574,6 +1577,50 @@ void testFastExtensionLeecherDownloadsAllowedPieceWhileChoked() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+void testGlobalBandwidthLimitIsSharedAndPersisted() {
+    std::cout << "[TEST] global bandwidth limit is shared by sessions and survives restarts..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_global_limit";
+    const std::filesystem::path state_dir = temp_dir / ".p2p_state";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto& bridge = StateBridge::instance();
+    bridge.setStateDir(state_dir);
+    bridge.setGlobalLimits(0, 0);
+    CHECK_EQ(bridge.globalDownloadLimit(), std::uint64_t(0));
+
+    bridge.setGlobalLimits(5 * 1024, 6 * 1024);
+    CHECK_EQ(bridge.globalDownloadLimit(), std::uint64_t(5 * 1024));
+    CHECK_EQ(bridge.globalUploadLimit(), std::uint64_t(6 * 1024));
+
+    // Mọi session tạo sau đó dùng CHUNG một cặp bucket (không phải mỗi session một bản sao).
+    TorrentSessionConfig first;
+    TorrentSessionConfig second;
+    bridge.applyGlobalLimiters(first);
+    bridge.applyGlobalLimiters(second);
+    CHECK(first.global_download_limiter != nullptr);
+    CHECK(first.global_download_limiter == second.global_download_limiter);
+    CHECK(first.global_upload_limiter == second.global_upload_limiter);
+    CHECK_EQ(first.global_download_limiter->rate(), std::uint64_t(5 * 1024));
+    // Đổi giới hạn có hiệu lực ngay với session đã tạo.
+    bridge.setGlobalLimits(7 * 1024, 0);
+    CHECK_EQ(first.global_download_limiter->rate(), std::uint64_t(7 * 1024));
+    CHECK_EQ(first.global_upload_limiter->rate(), std::uint64_t(0));
+    bridge.setGlobalLimits(5 * 1024, 6 * 1024);
+
+    // Sang thư mục trạng thái khác (rỗng) rồi quay lại: giá trị được đọc lại từ đĩa.
+    bridge.setStateDir(temp_dir / "other_state");
+    CHECK_EQ(bridge.globalDownloadLimit(), std::uint64_t(0));
+    bridge.setStateDir(state_dir);
+    CHECK_EQ(bridge.globalDownloadLimit(), std::uint64_t(5 * 1024));
+    CHECK_EQ(bridge.globalUploadLimit(), std::uint64_t(6 * 1024));
+
+    bridge.setGlobalLimits(0, 0);
+    bridge.setStateDir({});
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 void testSessionMultiFileExistingSeeding() {
     std::cout << "[TEST] TorrentSession multi-file existing data (Seeder mode)...\n";
     const std::filesystem::path temp_dir = "./test_multifile_seeder";
@@ -2098,6 +2145,107 @@ void testStatsStaysResponsiveWhenAPeerStopsReading() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+// Đổi mạng khi session đang chạy: phải announce lại tracker NGAY (không chờ chu kỳ), và bỏ peer LAN của mạng cũ khỏi
+// danh sách đã biết (nếu không, add_peer tưởng vẫn còn "peer LAN thay thế" và từ chối mọi peer khác).
+void testNetworkChangeReannouncesAndDropsStaleLanPeers() {
+    std::cout << "[TEST] network change re-announces to the tracker and forgets stale LAN peers..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_network_change";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    asio::io_context tracker_ioc;
+    asio::ip::tcp::acceptor tracker_acceptor(
+        tracker_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const std::uint16_t tracker_port = tracker_acceptor.local_endpoint().port();
+    std::atomic<int> announce_count{0};
+    std::atomic<bool> stop_tracker{false};
+    std::thread tracker_thread([&]() {
+        while (!stop_tracker) {
+            try {
+                asio::ip::tcp::socket socket(tracker_ioc);
+                asio::error_code accept_ec;
+                tracker_acceptor.non_blocking(true);
+                tracker_acceptor.accept(socket, accept_ec);
+                if (accept_ec) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                socket.non_blocking(false);
+                asio::streambuf request;
+                asio::read_until(socket, request, "\r\n\r\n");
+                ++announce_count;
+                const std::string body = TrackerProtocol::encodeSuccessResponse(1800, {});
+                const std::string http = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+                                         "\r\nConnection: close\r\n\r\n" + body;
+                asio::write(socket, asio::buffer(http));
+            } catch (...) {
+            }
+        }
+    });
+
+    // Mạng giả: ban đầu LAN 192.168.77.x, sau đó chuyển sang LAN khác 10.55.0.x.
+    std::mutex net_mutex;
+    network::NetworkSnapshot fake_net;
+    fake_net.primary_ip = "192.168.77.5";
+    fake_net.addresses = {"192.168.77.5"};
+    network::NetworkMonitor::instance().configure_for_testing(
+        [&]() {
+            std::lock_guard<std::mutex> lock(net_mutex);
+            return fake_net;
+        },
+        std::chrono::milliseconds(20), 1);
+
+    auto meta = makeMockMetadata("netchange.bin", {"PieceZeroData!", "PieceOneData!!"}, 14);
+    meta.announce = "http://127.0.0.1:" + std::to_string(tracker_port) + "/announce";
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.listen_port = 7261;
+    config.enable_lsd = false;
+    config.enable_dht = false;
+    config.enable_tracker = true;
+    config.enable_port_mapping = false;
+    config.enable_utp = false;
+    config.max_connections = 0;  // không quay số: ứng viên nằm yên để kiểm tra danh sách peer đã biết
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+
+    const auto wait_until = [](const std::function<bool()>& condition, int max_ms) {
+        for (int waited = 0; waited < max_ms; waited += 20) {
+            if (condition()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return condition();
+    };
+    CHECK(wait_until([&]() { return announce_count.load() >= 1; }, 5000));  // announce "started"
+
+    session.add_peer("192.168.77.9", 7300);  // peer LAN của mạng cũ
+    CHECK_EQ(session.stats().total_peers_known, std::size_t(1));
+
+    // Chờ đủ lâu để chắc chắn announce kế tiếp (nếu có) không phải do chu kỳ/“đói peer” (cần >= 5 giây) mà do đổi mạng.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const int before_change = announce_count.load();
+    {
+        std::lock_guard<std::mutex> lock(net_mutex);
+        fake_net.primary_ip = "10.55.0.9";
+        fake_net.addresses = {"10.55.0.9"};
+    }
+    const auto changed_at = std::chrono::steady_clock::now();
+    CHECK(wait_until([&]() { return announce_count.load() > before_change; }, 4000));
+    CHECK(std::chrono::steady_clock::now() - changed_at < std::chrono::seconds(4));
+    CHECK(wait_until([&]() { return session.stats().total_peers_known == 0; }, 2000));
+
+    // Sau đổi mạng, peer LAN mới được nhận bình thường (bộ lọc dùng IP mới, không dùng IP chốt cũ).
+    session.add_peer("10.55.0.20", 7301);
+    CHECK_EQ(session.stats().total_peers_known, std::size_t(1));
+
+    session.stop();
+    network::NetworkMonitor::instance().configure_for_testing(nullptr, std::chrono::seconds(3), 2);
+    stop_tracker = true;
+    tracker_thread.join();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "fast") {  // chạy riêng nhóm Fast Extension khi gỡ lỗi
         testAllowedFastSetMatchesBep6Vectors();
@@ -2125,6 +2273,8 @@ int main(int argc, char** argv) {
     testSessionRateLimitsAndPauseResume();
     testStateBridgePersistsAndRestoresTorrents();
     testDownloadQueueLimitsActiveTorrents();
+    testGlobalBandwidthLimitIsSharedAndPersisted();
+    testNetworkChangeReannouncesAndDropsStaleLanPeers();
     testAllowedFastSetMatchesBep6Vectors();
     testFastExtensionSeederSendsHaveAllAllowedFastAndRejects();
     testFastExtensionLeecherDownloadsAllowedPieceWhileChoked();

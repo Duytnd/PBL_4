@@ -135,6 +135,10 @@ struct TorrentSessionConfig {
     std::size_t pipeline_depth = 16;
     std::uint64_t max_download_rate = 0;        // byte/s, 0 = không giới hạn
     std::uint64_t max_upload_rate = 0;          // byte/s, 0 = không giới hạn
+    // Giới hạn tổng dùng chung cho mọi session (null = không có). Mỗi block phải đủ token ở CẢ giới hạn riêng của
+    // torrent lẫn giới hạn tổng.
+    std::shared_ptr<bench::BandwidthLimiter> global_download_limiter;
+    std::shared_ptr<bench::BandwidthLimiter> global_upload_limiter;
 };
 
 // Callbacks
@@ -234,6 +238,12 @@ private:
     }
     bench::BandwidthLimiter download_limiter_;
     bench::BandwidthLimiter upload_limiter_;
+    bool consume_download(std::uint64_t bytes) {
+        return bench::BandwidthLimiter::consume_both(download_limiter_, config_.global_download_limiter.get(), bytes);
+    }
+    bool consume_upload(std::uint64_t bytes) {
+        return bench::BandwidthLimiter::consume_both(upload_limiter_, config_.global_upload_limiter.get(), bytes);
+    }
     // Số luồng announce tracker đang chạy nền (detached): destructor phải chờ về 0
     // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
     std::atomic<int> announce_inflight_{0};
@@ -305,6 +315,7 @@ private:
         std::uint64_t remote_uploaded_bytes = 0;
         // BEP 6 Fast Extension: chỉ bật khi CẢ HAI bên đặt bit trong handshake.
         bool fast = false;
+        bool throttled = false;  // lần xin gần nhất bị giới hạn băng thông từ chối (chỉ luồng worker của peer đọc/ghi)
         std::unordered_set<std::uint32_t> allowed_fast_to_us;     // peer cho ta xin dù đang choke ta (ghi dưới session_mutex_)
         std::unordered_set<std::uint32_t> allowed_fast_for_peer;  // ta cho peer xin dù đang choke họ (chỉ luồng worker của peer)
         std::unordered_set<std::uint32_t> rejected_pieces;        // peer đã Reject: không xin lại piece này từ họ (dưới session_mutex_)
@@ -361,6 +372,19 @@ private:
     std::uint16_t mapped_tcp_port_{0};
     std::chrono::steady_clock::time_point next_port_mapping_refresh_;
 
+    // Đổi mạng khi đang chạy (NetworkMonitor đặt cờ, orchestration_loop xử lý)
+    std::uint64_t network_subscription_{0};
+    std::atomic<bool> network_changed_{false};          // có đổi gì đó (kể cả card phụ)
+    std::atomic<bool> network_primary_changed_{false};  // IP chính đổi: kết nối + ánh xạ cũ vô hiệu
+    std::atomic<bool> network_full_refresh_{false};     // IP chính đổi hoặc mạng vừa có lại
+    // Dò router + ánh xạ cổng TCP; điền nat_traversal_/mapped_tcp_port_/advertised_port_. Chỉ một luồng gọi tại một
+    // thời điểm (luồng khởi tạo lúc start, sau đó là orchestration_loop). replace_stale_mapping: nếu router từ chối vì
+    // cổng còn ánh xạ cũ thì gỡ rồi ánh xạ lại một lần.
+    void establish_port_mapping(bool replace_stale_mapping = false);
+    void remap_ports_after_network_change();
+    // Xử lý cờ đổi mạng. Trả true nếu đã làm gì đó (đã announce lại tracker/LSD).
+    bool handle_network_change();
+
     // DHT (BEP 5)
     std::shared_ptr<KademliaNode> dht_shared_;
     std::unique_ptr<KademliaNode> dht_;
@@ -406,6 +430,7 @@ private:
         std::uint32_t piece = 0;
         std::uint32_t begin = 0;
         std::uint32_t length = 0;
+        bool throttled = false;  // không xin được vì hết băng thông (không phải vì hết việc để xin)
     };
     bool request_next_blocks(std::shared_ptr<ActivePeer> peer);
     // Áp bitfield của peer (Bitfield / HaveAll / HaveNone), bật "interested" nếu họ có piece ta cần.
