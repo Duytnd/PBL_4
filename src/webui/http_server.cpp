@@ -12,6 +12,11 @@ HttpServer::HttpServer(std::filesystem::path staticRoot)
     : staticRoot_(std::move(staticRoot)), server_(new httplib::Server()) {
     // Chỉ phục vụ file tĩnh; API được api_routes.cpp đăng ký thêm vào raw().
     server_->set_mount_point("/", staticRoot_.string());
+    // Buộc trình duyệt hỏi lại server (ETag/Last-Modified) cho mỗi file giao diện, nếu không HTML mới có thể ghép
+    // với CSS/JS cũ trong cache và vỡ bố cục sau khi cập nhật.
+    server_->set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache");
+    });
 
     // Chấp nhận localhost và IP nội bộ (loopback, RFC1918, 100.64/10) dạng IP literal. Không chấp nhận tên miền:
     // trước đây so tiền tố chuỗi nên "10.evil.com" qua được kiểm tra (DNS rebinding).

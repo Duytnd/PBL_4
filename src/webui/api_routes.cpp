@@ -12,10 +12,13 @@
 #include "network/tracker_client.h"
 #include "webui/state_bridge.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -205,7 +208,15 @@ std::string jsonEscape(const std::string& value) {
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default: out.push_back(ch); break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(ch)));
+                    out += buf;
+                } else {
+                    out.push_back(ch);
+                }
+                break;
         }
     }
     return out;
@@ -859,27 +870,133 @@ std::string getMimeType(const std::string& extension) {
     return "application/octet-stream";
 }
 
+// Đường dẫn tương đối (dạng "a/b/c.png") của một file đã tải, nằm dưới thư mục tải về. Chỉ nhận file thường:
+// không đường dẫn tuyệt đối, không "..", không đi qua symlink ở bất kỳ cấp nào.
+std::optional<std::filesystem::path> resolveDownloadedFile(const std::string& relativePath) {
+    if (relativePath.empty() || relativePath.size() > 1024 || !PathSanitizer::isSafeRelativePath(relativePath)) {
+        return std::nullopt;
+    }
+    const std::filesystem::path root = resolveDownloadDir();
+    const std::filesystem::path relative = std::filesystem::u8path(relativePath);
+    std::filesystem::path current = root;
+    for (const auto& part : relative) {
+        current /= part;
+        std::error_code ec;
+        const auto status = std::filesystem::symlink_status(current, ec);
+        if (ec || !std::filesystem::exists(status) || std::filesystem::is_symlink(status)) {
+            return std::nullopt;
+        }
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(current, ec) || ec) {
+        return std::nullopt;
+    }
+    return current;
+}
+
+// Liệt kê MỌI file thật trong thư mục tải về (kể cả torrent đã Remove): đường dẫn tương đối, kích thước, thời điểm
+// sửa cuối (= lúc tải xong). Bỏ file ẩn và file tạm .part (đang tải dở, xem ở trang Torrents).
+void handleFileList(const httplib::Request& /*req*/, httplib::Response& res) {
+    constexpr std::size_t kMaxEntries = 10000;
+    const std::filesystem::path root = resolveDownloadDir();
+
+    struct Entry {
+        std::string path;
+        std::string name;
+        std::uint64_t size = 0;
+        long long mtime = 0;
+    };
+    std::vector<Entry> entries;
+    bool truncated = false;
+
+    std::error_code ec;
+    if (std::filesystem::is_directory(root, ec)) {
+        std::filesystem::recursive_directory_iterator it(
+            root, std::filesystem::directory_options::skip_permission_denied, ec);
+        const std::filesystem::recursive_directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code entryEc;
+            const auto status = it->symlink_status(entryEc);
+            if (entryEc || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+                continue;
+            }
+            const std::filesystem::path relative = std::filesystem::relative(it->path(), root, entryEc);
+            if (entryEc || relative.empty()) continue;
+
+            bool hidden = false;
+            for (const auto& part : relative) {
+                const std::string segment = part.u8string();
+                if (!segment.empty() && segment[0] == '.') hidden = true;
+            }
+            const std::string name = relative.filename().u8string();
+            const bool partial = name.size() > 5 && name.compare(name.size() - 5, 5, ".part") == 0;
+            if (hidden || partial) continue;
+
+            Entry entry;
+            entry.path = relative.generic_u8string();
+            entry.name = name;
+            entry.size = static_cast<std::uint64_t>(it->file_size(entryEc));
+            if (entryEc) continue;
+            const auto fileTime = it->last_write_time(entryEc);
+            if (!entryEc) {
+                const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    fileTime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+                entry.mtime = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch()).count();
+            }
+            if (entries.size() >= kMaxEntries) {
+                truncated = true;
+                break;
+            }
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    std::ostringstream out;
+    out << "{\"truncated\":" << (truncated ? "true" : "false") << ",\"files\":[";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (i != 0) out << ",";
+        out << "{\"path\":\"" << jsonEscape(entries[i].path) << "\",\"name\":\"" << jsonEscape(entries[i].name)
+            << "\",\"size\":" << entries[i].size << ",\"mtime\":" << entries[i].mtime << "}";
+    }
+    out << "]}";
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(out.str(), "application/json");
+}
+
 void handleFileContent(const httplib::Request& req, httplib::Response& res) {
-    std::string name;
-    if (req.has_param("name")) {
-        name = req.get_param_value("name");
-    } else if (req.has_param("file")) {
-        name = req.get_param_value("file");
-    }
-    if (name.empty()) {
-        res.status = 400;
-        res.set_content("Missing file name", "text/plain");
-        return;
-    }
+    std::filesystem::path safeName;
+    std::filesystem::path filePath;
+    if (req.has_param("path")) {
+        // File nằm trong thư mục con (torrent nhiều file): đi theo đường dẫn tương đối đã kiểm tra.
+        const auto resolved = resolveDownloadedFile(req.get_param_value("path"));
+        if (!resolved) {
+            res.status = 404;
+            res.set_content("File not found", "text/plain");
+            return;
+        }
+        filePath = *resolved;
+        safeName = filePath.filename();
+    } else {
+        std::string name;
+        if (req.has_param("name")) {
+            name = req.get_param_value("name");
+        } else if (req.has_param("file")) {
+            name = req.get_param_value("file");
+        }
+        if (name.empty()) {
+            res.status = 400;
+            res.set_content("Missing file name", "text/plain");
+            return;
+        }
 
-    const std::filesystem::path safeName = safeFileName(name);
-    const std::filesystem::path downloadDir = resolveDownloadDir();
-    const std::filesystem::path filePath = downloadDir / safeName;
+        safeName = safeFileName(name);
+        filePath = resolveDownloadDir() / safeName;
 
-    if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
-        res.status = 404;
-        res.set_content("File not found", "text/plain");
-        return;
+        if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+            res.status = 404;
+            res.set_content("File not found", "text/plain");
+            return;
+        }
     }
 
     const std::string ext = filePath.extension().string();
@@ -938,6 +1055,21 @@ void handleFileOpen(const httplib::Request& req, httplib::Response& res) {
 
     if (req.has_param("folder") && req.get_param_value("folder") == "1") {
         targetPath = downloadDir;
+    } else if (req.has_param("path")) {
+        const auto resolved = resolveDownloadedFile(req.get_param_value("path"));
+        if (!resolved) {
+            res.status = 404;
+            res.set_content("{\"status\":\"error\",\"message\":\"File does not exist on disk\"}", "application/json");
+            return;
+        }
+        // Cùng luật với mở theo tên: tên file do người lạ đặt, chỉ mở loại không thực thi được.
+        if (!webui::isOpenableFileName(resolved->filename().string())) {
+            res.status = 403;
+            res.set_content("{\"status\":\"error\",\"message\":\"This file type cannot be opened from the web UI. "
+                            "Open the download folder instead.\"}", "application/json");
+            return;
+        }
+        targetPath = *resolved;
     } else {
         std::string name;
         if (req.has_param("name")) {
@@ -1072,6 +1204,10 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Get("/api/torrents", [](const httplib::Request& /*req*/, httplib::Response& res) {
         res.set_content(StateBridge::instance().toJsonString(), "application/json");
+    });
+
+    server.Get("/api/files/list", [](const httplib::Request& req, httplib::Response& res) {
+        handleFileList(req, res);
     });
 
     server.Get("/api/files/content", [](const httplib::Request& req, httplib::Response& res) {
