@@ -31,7 +31,11 @@ void StateBridge::addSession(std::shared_ptr<TorrentSession> session, const std:
             return;
         }
         sessions_[hash] = Entry{std::move(session), magnetUri, false, next_order_++};
-        saveEntryLocked(hash, sessions_[hash]);
+        Entry& added = sessions_[hash];
+        if (default_picker_strategy_ != "rarest_first" && added.session->set_piece_strategy(default_picker_strategy_)) {
+            added.picker_strategy = default_picker_strategy_;
+        }
+        saveEntryLocked(hash, added);
     }
     rebalanceQueue();  // torrent mới vượt giới hạn thì xếp hàng ngay
 }
@@ -45,9 +49,13 @@ void StateBridge::setStateDir(const std::filesystem::path& dir) {
         std::string line;
         std::uint64_t globalDown = 0;
         std::uint64_t globalUp = 0;
+        std::string defaultStrategy = "rarest_first";
         while (std::getline(in, line)) {
             try {
-                if (line.rfind("max=", 0) == 0) {
+                if (line.rfind("strategy=", 0) == 0) {
+                    // Chỉ nhận giá trị hợp lệ; dòng lạ giữ mặc định rarest_first.
+                    if (line.substr(9) == "sequential") defaultStrategy = "sequential";
+                } else if (line.rfind("max=", 0) == 0) {
                     loaded = std::min<unsigned long long>(std::stoull(line.substr(4)), 64);
                 } else if (line.rfind("global_down=", 0) == 0) {
                     globalDown = std::stoull(line.substr(12));
@@ -59,6 +67,7 @@ void StateBridge::setStateDir(const std::filesystem::path& dir) {
             }
         }
         max_active_ = loaded;
+        default_picker_strategy_ = defaultStrategy;
         global_download_->set_rate(globalDown);
         global_upload_->set_rate(globalUp);
     }
@@ -73,7 +82,8 @@ void StateBridge::saveQueueConfigLocked() const {
     if (out) {
         out << "max=" << max_active_ << "\n"
             << "global_down=" << global_download_->rate() << "\n"
-            << "global_up=" << global_upload_->rate() << "\n";
+            << "global_up=" << global_upload_->rate() << "\n"
+            << "strategy=" << default_picker_strategy_ << "\n";
     }
 }
 
@@ -500,22 +510,36 @@ std::string StateBridge::toJsonString() {
 // ---- Chiến lược chọn piece ----
 
 bool StateBridge::setPickerStrategy(const std::string& infoHashHex, const std::string& strategy) {
-    // Tạo picker mới dựa trên tên chiến lược
-    std::unique_ptr<strategy::PiecePicker> picker;
-    if (strategy == "sequential") {
-        picker = std::make_unique<strategy::SequentialPicker>();
-    } else {
-        // Mặc định: rarest_first
-        picker = std::make_unique<strategy::RarestFirstPicker>();
-    }
-
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(infoHashHex);
     if (it == sessions_.end() || !it->second.session) return false;
 
-    it->second.session->set_piece_picker(std::move(picker));
-    it->second.picker_strategy = (strategy == "sequential") ? "sequential" : "rarest_first";
+    // set_piece_strategy giữ pipeline_depth của session; tên lạ bị từ chối thay vì lặng lẽ về rarest_first.
+    if (!it->second.session->set_piece_strategy(strategy)) return false;
+    it->second.picker_strategy = strategy;
     return true;
+}
+
+std::string StateBridge::defaultPickerStrategy() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return default_picker_strategy_;
+}
+
+int StateBridge::setAllPickerStrategies(const std::string& strategy) {
+    if (strategy != "rarest_first" && strategy != "sequential") return -1;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    default_picker_strategy_ = strategy;
+    saveQueueConfigLocked();
+
+    int changed = 0;
+    for (auto& [hash, entry] : sessions_) {
+        if (entry.session && entry.session->set_piece_strategy(strategy)) {
+            entry.picker_strategy = strategy;
+            ++changed;
+        }
+    }
+    return changed;
 }
 
 std::string StateBridge::getPickerStrategy(const std::string& infoHashHex) const {

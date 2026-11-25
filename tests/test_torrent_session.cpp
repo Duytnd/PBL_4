@@ -1171,6 +1171,75 @@ void testStateBridgePersistsAndRestoresTorrents() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+void testStateBridgePickerStrategyPerTorrentAndForAll() {
+    std::cout << "[TEST] StateBridge sets piece strategy per torrent and for all, keeps pipeline depth..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_picker_strategy";
+    const std::filesystem::path state_dir = temp_dir / ".p2p_state";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.enable_lsd = false;
+    config.enable_dht = false;
+    config.enable_tracker = false;
+    config.pipeline_depth = 12;  // khác mặc định 4 của picker để bắt lỗi rơi về cấu hình mặc định
+
+    auto& bridge = StateBridge::instance();
+    bridge.setStateDir(state_dir);
+    CHECK_EQ(bridge.defaultPickerStrategy(), std::string("rarest_first"));
+
+    auto sessionA = std::make_shared<TorrentSession>(makeMockMetadata("strategy_a.bin", {"PieceA1", "PieceA2"}, 7), config);
+    auto sessionB = std::make_shared<TorrentSession>(makeMockMetadata("strategy_b.bin", {"PieceB1", "PieceB2"}, 7), config);
+    bridge.addSession(sessionA, "magnet:?xt=urn:btih:a");
+    bridge.addSession(sessionB, "magnet:?xt=urn:btih:b");
+    const std::string hashA = sessionA->info_hash_hex();
+    const std::string hashB = sessionB->info_hash_hex();
+    CHECK_EQ(sessionA->piece_pipeline_depth(), std::size_t(12));
+
+    // Từng torrent: chỉ torrent được chọn đổi, pipeline_depth không tụt về 4.
+    CHECK(bridge.setPickerStrategy(hashA, "sequential"));
+    CHECK_EQ(bridge.getPickerStrategy(hashA), std::string("sequential"));
+    CHECK_EQ(bridge.getPickerStrategy(hashB), std::string("rarest_first"));
+    CHECK_EQ(sessionA->piece_pipeline_depth(), std::size_t(12));
+    CHECK(bridge.setPickerStrategy(hashA, "rarest_first"));
+    CHECK_EQ(sessionA->piece_pipeline_depth(), std::size_t(12));
+
+    // Tên lạ hoặc torrent không tồn tại: từ chối, không đổi gì.
+    CHECK(!bridge.setPickerStrategy(hashA, "bogus"));
+    CHECK_EQ(bridge.getPickerStrategy(hashA), std::string("rarest_first"));
+    CHECK(!bridge.setPickerStrategy("0000000000000000000000000000000000000000", "sequential"));
+
+    // Tất cả: đổi mọi torrent đang có và đặt mặc định.
+    CHECK_EQ(bridge.setAllPickerStrategies("sequential"), 2);
+    CHECK_EQ(bridge.getPickerStrategy(hashA), std::string("sequential"));
+    CHECK_EQ(bridge.getPickerStrategy(hashB), std::string("sequential"));
+    CHECK_EQ(bridge.defaultPickerStrategy(), std::string("sequential"));
+    CHECK_EQ(sessionB->piece_pipeline_depth(), std::size_t(12));
+    CHECK_EQ(bridge.setAllPickerStrategies("bogus"), -1);
+    CHECK_EQ(bridge.defaultPickerStrategy(), std::string("sequential"));
+
+    // Torrent thêm sau nhận chiến lược mặc định.
+    auto sessionC = std::make_shared<TorrentSession>(makeMockMetadata("strategy_c.bin", {"PieceC1", "PieceC2"}, 7), config);
+    bridge.addSession(sessionC, "magnet:?xt=urn:btih:c");
+    CHECK_EQ(bridge.getPickerStrategy(sessionC->info_hash_hex()), std::string("sequential"));
+    CHECK_EQ(sessionC->piece_pipeline_depth(), std::size_t(12));
+
+    // Mặc định được lưu: đọc lại thư mục trạng thái vẫn thấy "sequential".
+    bridge.setStateDir(state_dir);
+    CHECK_EQ(bridge.defaultPickerStrategy(), std::string("sequential"));
+
+    CHECK_EQ(bridge.setAllPickerStrategies("rarest_first"), 3);
+    CHECK_EQ(bridge.defaultPickerStrategy(), std::string("rarest_first"));
+
+    bridge.removeSession(sessionA->info_hash_hex());
+    bridge.removeSession(sessionB->info_hash_hex());
+    bridge.removeSession(sessionC->info_hash_hex());
+    bridge.setStateDir({});
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 void testDownloadQueueLimitsActiveTorrents() {
     std::cout << "[TEST] download queue keeps at most N torrents downloading and promotes waiting ones..." << std::endl;
     const std::filesystem::path temp_dir = "./test_queue";
@@ -2272,6 +2341,7 @@ int main(int argc, char** argv) {
     testSessionLoopbackDownloadWithUnreachableTracker();
     testSessionRateLimitsAndPauseResume();
     testStateBridgePersistsAndRestoresTorrents();
+    testStateBridgePickerStrategyPerTorrentAndForAll();
     testDownloadQueueLimitsActiveTorrents();
     testGlobalBandwidthLimitIsSharedAndPersisted();
     testNetworkChangeReannouncesAndDropsStaleLanPeers();

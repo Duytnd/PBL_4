@@ -98,6 +98,11 @@ public:
     bool setPickerStrategy(const std::string& infoHashHex, const std::string& strategy);
     // Lấy chiến lược hiện tại của torrent. Trả chuỗi rỗng nếu không tìm thấy.
     std::string getPickerStrategy(const std::string& infoHashHex) const;
+    // Chiến lược MẶC ĐỊNH cho torrent thêm sau này (tạo, thêm, khôi phục sau khi mở lại app). Lưu cùng thư mục trạng thái.
+    [[nodiscard]] std::string defaultPickerStrategy() const;
+    // Đặt chiến lược cho TẤT CẢ torrent đang có và làm mặc định cho torrent mới. Trả số torrent đã đổi,
+    // hoặc -1 nếu tên chiến lược không hợp lệ.
+    int setAllPickerStrategies(const std::string& strategy);
 
     // Cấp phát cổng kế tiếp cho session mới
     std::uint16_t allocatePort();
@@ -128,6 +133,7 @@ private:
     std::shared_ptr<bench::BandwidthLimiter> global_download_ = std::make_shared<bench::BandwidthLimiter>(0);
     std::shared_ptr<bench::BandwidthLimiter> global_upload_ = std::make_shared<bench::BandwidthLimiter>(0);
     std::size_t max_active_ = 0;
+    std::string default_picker_strategy_ = "rarest_first";
     std::int64_t next_order_ = 1;
     std::int64_t front_order_ = 0;  // giá trị order nhỏ nhất đã cấp (để đẩy lên đầu hàng)
     std::mutex rebalance_mutex_;    // tuần tự hoá rebalanceQueue (thực thi pause/resume ngoài mutex_)
