@@ -715,17 +715,20 @@ void handleGetStrategy(const httplib::Request& req, httplib::Response& res) {
         return;
     }
     const std::string hash = req.get_param_value("hash");
-    const std::string strat = StateBridge::instance().getPickerStrategy(hash);
+    // "all": chiến lược mặc định đang áp cho mọi torrent (kể cả torrent thêm sau này).
+    const std::string strat = hash == "all" ? StateBridge::instance().defaultPickerStrategy()
+                                            : StateBridge::instance().getPickerStrategy(hash);
     if (strat.empty()) {
         res.status = 404;
         res.set_content("{\"status\":\"error\",\"message\":\"Torrent not found\"}", "application/json");
         return;
     }
-    res.set_content("{\"hash\":\"" + hash + "\",\"strategy\":\"" + strat + "\"}", "application/json");
+    res.set_content("{\"hash\":\"" + jsonEscape(hash) + "\",\"strategy\":\"" + strat + "\"}", "application/json");
 }
 
-// POST /api/settings/strategy  body (form): hash=<infohash>&strategy=rarest_first|sequential
+// POST /api/settings/strategy  body (form): hash=<infohash>|all&strategy=rarest_first|sequential
 // Áp dụng picker mới cho session đang chạy. Trả về {"status":"ok","strategy":"..."} khi thành công.
+// hash=all: áp cho mọi torrent, làm mặc định cho torrent mới, thêm trường "applied" (số torrent đã đổi).
 void handleSetStrategy(const httplib::Request& req, httplib::Response& res) {
     if (!req.has_param("hash")) {
         res.status = 400;
@@ -749,6 +752,15 @@ void handleSetStrategy(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
+    // hash=all: áp cho mọi torrent đang có và làm mặc định cho torrent thêm sau.
+    if (hash == "all") {
+        const int applied = StateBridge::instance().setAllPickerStrategies(strategy);
+        res.set_content("{\"status\":\"ok\",\"hash\":\"all\",\"strategy\":\"" + strategy +
+                            "\",\"applied\":" + std::to_string(applied) + "}",
+                        "application/json");
+        return;
+    }
+
     const bool ok = StateBridge::instance().setPickerStrategy(hash, strategy);
     if (!ok) {
         res.status = 404;
@@ -756,7 +768,7 @@ void handleSetStrategy(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    res.set_content("{\"status\":\"ok\",\"hash\":\"" + hash + "\",\"strategy\":\"" + strategy + "\"}",
+    res.set_content("{\"status\":\"ok\",\"hash\":\"" + jsonEscape(hash) + "\",\"strategy\":\"" + strategy + "\"}",
                     "application/json");
 }
 

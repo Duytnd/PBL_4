@@ -1022,6 +1022,29 @@ void TorrentSession::set_piece_picker(std::unique_ptr<strategy::PiecePicker> pic
     }
 }
 
+bool TorrentSession::set_piece_strategy(const std::string& name) {
+    const std::size_t depth = std::max<std::size_t>(1, config_.pipeline_depth);
+    std::unique_ptr<strategy::PiecePicker> picker;
+    if (name == "sequential") {
+        strategy::SequentialConfig cfg;
+        cfg.pipeline_depth = depth;
+        picker = std::make_unique<strategy::SequentialPicker>(cfg);
+    } else if (name == "rarest_first") {
+        strategy::RarestFirstConfig cfg;
+        cfg.pipeline_depth = depth;
+        picker = std::make_unique<strategy::RarestFirstPicker>(cfg);
+    } else {
+        return false;
+    }
+    set_piece_picker(std::move(picker));
+    return true;
+}
+
+std::size_t TorrentSession::piece_pipeline_depth() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return piece_picker_ ? piece_picker_->pipeline_depth() : 0;
+}
+
 void TorrentSession::set_choker(std::unique_ptr<strategy::Choker> choker) {
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (choker) {

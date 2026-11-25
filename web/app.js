@@ -1367,7 +1367,8 @@
       if (!strategySelect) return;
       // Giữ lại giá trị đang chọn nếu còn hợp lệ
       const prev = strategySelect.value;
-      strategySelect.innerHTML = '<option value="">— Select torrent —</option>';
+      strategySelect.innerHTML = '<option value="">— Select torrent —</option>' +
+        '<option value="all">All torrents (and new ones)</option>';
       for (const t of torrentList) {
         const opt = document.createElement('option');
         opt.value = t.infoHash;
@@ -1414,14 +1415,23 @@
         }
         const radio = document.querySelector('input[name="picker-strategy"]:checked');
         const strategy = radio ? radio.value : 'rarest_first';
+        const label = strategy === 'sequential' ? 'Sequential' : 'Rarest-First';
         try {
           const body = new URLSearchParams({ hash, strategy });
           const res = await fetch('/api/settings/strategy', { method: 'POST', body });
           if (res.ok) {
-            const found = torrentList.find(item => item.infoHash === hash);
-            if (found) found.pickerStrategy = strategy;
+            let message = '✓ Switched to ' + label;
+            if (hash === 'all') {
+              for (const item of torrentList) item.pickerStrategy = strategy;
+              let applied = torrentList.length;
+              try { applied = (await res.json()).applied ?? applied; } catch (_) { /* giữ số đếm cục bộ */ }
+              message = `✓ ${label} set for ${applied} torrent(s) and all new ones`;
+            } else {
+              const found = torrentList.find(item => item.infoHash === hash);
+              if (found) found.pickerStrategy = strategy;
+            }
             if (strategyStatus) {
-              strategyStatus.textContent = strategy === 'sequential' ? '✓ Switched to Sequential' : '✓ Switched to Rarest-First';
+              strategyStatus.textContent = message;
               strategyStatus.className = 'strategy-status ok';
             }
           } else {

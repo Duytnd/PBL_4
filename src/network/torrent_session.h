@@ -205,6 +205,11 @@ public:
 
     // Thay đổi chiến lược (Piece Picker & Choker)
     void set_piece_picker(std::unique_ptr<strategy::PiecePicker> picker);
+    // Đổi chiến lược chọn piece theo tên ("rarest_first" hoặc "sequential") nhưng GIỮ pipeline_depth của session
+    // (picker tạo bằng cấu hình mặc định sẽ tụt từ 16 xuống 4 request song song). false nếu tên không hợp lệ.
+    bool set_piece_strategy(const std::string& name);
+    // Số request song song mỗi peer của picker hiện tại (dùng cho test và chẩn đoán).
+    [[nodiscard]] std::size_t piece_pipeline_depth() const;
     void set_choker(std::unique_ptr<strategy::Choker> choker);
 
     // Callbacks
