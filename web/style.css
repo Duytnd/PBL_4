@@ -286,7 +286,7 @@ select {
 
 /* Tab dạng thanh phân đoạn (segmented control). */
 .settings-tabs {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
   margin: 0 26px; padding: 4px; border-radius: 12px; background: var(--surface-alt);
 }
 .settings-tab {
@@ -889,3 +889,59 @@ select {
   .topbar { gap: 10px; padding: 0 12px; }
 }
 .files-error { color: #991b1b; background: #fef2f2; border-color: #fecaca; }
+
+/* ---- Strategy Selector ---- */
+.strategy-select-row {
+  margin-bottom: 12px;
+}
+.strategy-select {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.strategy-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.strategy-radio-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.strategy-radio-label:has(input:checked) {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+.strategy-radio-label input[type="radio"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+  accent-color: #2563eb;
+}
+.strategy-radio-label span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.strategy-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.strategy-status {
+  font-size: 13px;
+  color: var(--muted);
+}
+.strategy-status.ok  { color: #16a34a; }
+.strategy-status.err { color: #dc2626; }

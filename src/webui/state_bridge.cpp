@@ -1,6 +1,7 @@
 #include "webui/state_bridge.h"
 
 #include "core/torrent_file.h"
+#include "strategy/piece_picker.h"
 
 #include <algorithm>
 #include <chrono>
@@ -362,6 +363,7 @@ std::vector<TorrentViewInfo> StateBridge::getAllTorrents() {
         info.paused = entry.session->is_paused() && !entry.queued;
         info.download_limit = entry.session->download_limit();
         info.upload_limit = entry.session->upload_limit();
+        info.picker_strategy = entry.picker_strategy;
         list.push_back(std::move(info));
     }
     return list;
@@ -487,11 +489,40 @@ std::string StateBridge::toJsonString() {
              << "\"queued\":" << (t.queued ? "true" : "false") << ","
              << "\"download_limit\":" << t.download_limit << ","
              << "\"upload_limit\":" << t.upload_limit << ","
+             << "\"picker_strategy\":\"" << t.picker_strategy << "\","
              << "\"error\":\"" << escapeJsonString(t.error_message) << "\""
              << "}";
     }
     json << "]";
     return json.str();
+}
+
+// ---- Chiến lược chọn piece ----
+
+bool StateBridge::setPickerStrategy(const std::string& infoHashHex, const std::string& strategy) {
+    // Tạo picker mới dựa trên tên chiến lược
+    std::unique_ptr<strategy::PiecePicker> picker;
+    if (strategy == "sequential") {
+        picker = std::make_unique<strategy::SequentialPicker>();
+    } else {
+        // Mặc định: rarest_first
+        picker = std::make_unique<strategy::RarestFirstPicker>();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = sessions_.find(infoHashHex);
+    if (it == sessions_.end() || !it->second.session) return false;
+
+    it->second.session->set_piece_picker(std::move(picker));
+    it->second.picker_strategy = (strategy == "sequential") ? "sequential" : "rarest_first";
+    return true;
+}
+
+std::string StateBridge::getPickerStrategy(const std::string& infoHashHex) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = sessions_.find(infoHashHex);
+    if (it == sessions_.end()) return "";
+    return it->second.picker_strategy;
 }
 
 }  // namespace p2p

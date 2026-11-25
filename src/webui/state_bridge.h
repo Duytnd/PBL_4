@@ -35,6 +35,7 @@ struct TorrentViewInfo {
     bool queued = false;  // đang chờ lượt trong hàng đợi (bị tạm dừng bởi giới hạn số torrent tải cùng lúc)
     std::uint64_t download_limit = 0;  // byte/s, 0 = không giới hạn
     std::uint64_t upload_limit = 0;
+    std::string picker_strategy = "rarest_first";  // chiến lược chọn piece hiện tại
 };
 
 // Torrent đã lưu trên đĩa, dùng để dựng lại session khi mở lại ứng dụng.
@@ -91,6 +92,13 @@ public:
     std::vector<TorrentViewInfo> getAllTorrents();
     std::string toJsonString();
 
+    // ---- Chiến lược chọn piece (piece picker strategy) ----
+    // Đặt chiến lược cho torrent theo info_hash. Trả false nếu không tìm thấy session.
+    // strategy: "rarest_first" hoặc "sequential"
+    bool setPickerStrategy(const std::string& infoHashHex, const std::string& strategy);
+    // Lấy chiến lược hiện tại của torrent. Trả chuỗi rỗng nếu không tìm thấy.
+    std::string getPickerStrategy(const std::string& infoHashHex) const;
+
     // Cấp phát cổng kế tiếp cho session mới
     std::uint16_t allocatePort();
 
@@ -114,6 +122,7 @@ private:
         std::string magnet_uri;
         bool queued = false;       // bị hàng đợi tạm dừng (không phải người dùng)
         std::int64_t order = 0;    // nhỏ hơn = ưu tiên hơn
+        std::string picker_strategy = "rarest_first";  // chiến lược chọn piece: "rarest_first" hoặc "sequential"
     };
     std::unordered_map<std::string, Entry> sessions_;
     std::shared_ptr<bench::BandwidthLimiter> global_download_ = std::make_shared<bench::BandwidthLimiter>(0);

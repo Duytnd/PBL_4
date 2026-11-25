@@ -152,6 +152,16 @@ add_executable(test_torrent_file
 target_include_directories(test_torrent_file PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_torrent_file COMMAND test_torrent_file)
 
+# Malformed .torrent samples (Nguoi 3): kiem thu do ben va bao mat parser
+add_executable(test_malformed_torrent
+    tests/test_malformed_torrent.cpp
+    src/core/bencode.cpp
+    src/core/torrent_file.cpp
+    src/core/path_sanitizer.cpp
+)
+target_include_directories(test_malformed_torrent PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_malformed_torrent COMMAND test_malformed_torrent)
+
 add_executable(test_path_sanitizer
     tests/test_path_sanitizer.cpp
     src/core/path_sanitizer.cpp

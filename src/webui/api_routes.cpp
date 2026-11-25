@@ -10,6 +10,7 @@
 #include "webui/request_guard.h"
 #include "network/magnet_resolver.h"
 #include "network/tracker_client.h"
+#include "strategy/piece_picker.h"
 #include "webui/state_bridge.h"
 
 #include <algorithm>
@@ -704,6 +705,61 @@ void handleSetQueueSettings(const httplib::Request& req, httplib::Response& res)
     handleGetQueueSettings(req, res);
 }
 
+// ---- Chiến lược chọn piece (Piece Picker Strategy) ----
+// GET /api/settings/strategy?hash=<infohash>
+// Trả về {"hash":"...","strategy":"rarest_first"} hoặc 404 nếu không có hash.
+void handleGetStrategy(const httplib::Request& req, httplib::Response& res) {
+    if (!req.has_param("hash")) {
+        res.status = 400;
+        res.set_content("{\"status\":\"error\",\"message\":\"Missing hash parameter\"}", "application/json");
+        return;
+    }
+    const std::string hash = req.get_param_value("hash");
+    const std::string strat = StateBridge::instance().getPickerStrategy(hash);
+    if (strat.empty()) {
+        res.status = 404;
+        res.set_content("{\"status\":\"error\",\"message\":\"Torrent not found\"}", "application/json");
+        return;
+    }
+    res.set_content("{\"hash\":\"" + hash + "\",\"strategy\":\"" + strat + "\"}", "application/json");
+}
+
+// POST /api/settings/strategy  body (form): hash=<infohash>&strategy=rarest_first|sequential
+// Áp dụng picker mới cho session đang chạy. Trả về {"status":"ok","strategy":"..."} khi thành công.
+void handleSetStrategy(const httplib::Request& req, httplib::Response& res) {
+    if (!req.has_param("hash")) {
+        res.status = 400;
+        res.set_content("{\"status\":\"error\",\"message\":\"Missing hash parameter\"}", "application/json");
+        return;
+    }
+    if (!req.has_param("strategy")) {
+        res.status = 400;
+        res.set_content("{\"status\":\"error\",\"message\":\"Missing strategy parameter\"}", "application/json");
+        return;
+    }
+
+    const std::string hash     = req.get_param_value("hash");
+    const std::string strategy = req.get_param_value("strategy");
+
+    // Chỉ chấp nhận hai giá trị hợp lệ
+    if (strategy != "rarest_first" && strategy != "sequential") {
+        res.status = 400;
+        res.set_content("{\"status\":\"error\",\"message\":\"strategy must be rarest_first or sequential\"}",
+                        "application/json");
+        return;
+    }
+
+    const bool ok = StateBridge::instance().setPickerStrategy(hash, strategy);
+    if (!ok) {
+        res.status = 404;
+        res.set_content("{\"status\":\"error\",\"message\":\"Torrent not found\"}", "application/json");
+        return;
+    }
+
+    res.set_content("{\"status\":\"ok\",\"hash\":\"" + hash + "\",\"strategy\":\"" + strategy + "\"}",
+                    "application/json");
+}
+
 // down / up tính bằng KiB/s; 0 = không giới hạn. Tham số vắng mặt thì giữ nguyên giá trị cũ.
 void handleLimitTorrent(const httplib::Request& req, httplib::Response& res) {
     std::string hash;
@@ -1188,6 +1244,14 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Post("/api/settings/queue", [](const httplib::Request& req, httplib::Response& res) {
         handleSetQueueSettings(req, res);
+    });
+
+    server.Get("/api/settings/strategy", [](const httplib::Request& req, httplib::Response& res) {
+        handleGetStrategy(req, res);
+    });
+
+    server.Post("/api/settings/strategy", [](const httplib::Request& req, httplib::Response& res) {
+        handleSetStrategy(req, res);
     });
 
     server.Get("/api/torrents/files", [](const httplib::Request& req, httplib::Response& res) {

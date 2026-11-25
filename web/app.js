@@ -1084,6 +1084,7 @@
             queued: !!item.queued,
             downloadLimit: item.download_limit || 0,
             uploadLimit: item.upload_limit || 0,
+            pickerStrategy: item.picker_strategy || 'rarest_first',
             uploadRate: item.upload_rate,
             pieceCount: item.total_pieces,
             completedPieces: item.completed_pieces,
@@ -1355,6 +1356,100 @@
     document.getElementById('queue-apply-btn').addEventListener('click', async () => {
       if (!(await saveQueue(queueMax.value.trim() || '0')) ) await refreshLimits();
     });
+
+    // ---- Strategy Selector ----
+    const strategySelect   = document.getElementById('strategy-torrent-select');
+    const strategyStatus   = document.getElementById('strategy-status');
+    const strategyApplyBtn = document.getElementById('strategy-apply-btn');
+
+    // Điền danh sách torrent vào dropdown khi mở pane Strategy
+    function populateStrategyTorrents() {
+      if (!strategySelect) return;
+      // Giữ lại giá trị đang chọn nếu còn hợp lệ
+      const prev = strategySelect.value;
+      strategySelect.innerHTML = '<option value="">— Select torrent —</option>';
+      for (const t of torrentList) {
+        const opt = document.createElement('option');
+        opt.value = t.infoHash;
+        opt.textContent = t.name || t.infoHash.slice(0, 12) + '…';
+        strategySelect.appendChild(opt);
+      }
+      if (prev && strategySelect.querySelector(`option[value="${prev}"]`)) {
+        strategySelect.value = prev;
+      } else if (torrentList.length > 0) {
+        // Tự động chọn torrent đầu tiên nếu chưa chọn
+        strategySelect.value = torrentList[0].infoHash;
+        const current = torrentList[0].pickerStrategy || 'rarest_first';
+        const radio = document.querySelector(`input[name="picker-strategy"][value="${current}"]`);
+        if (radio) radio.checked = true;
+      }
+    }
+
+    // Khi chọn torrent: tải chiến lược hiện tại và cập nhật radio
+    if (strategySelect) {
+      strategySelect.addEventListener('change', async () => {
+        const hash = strategySelect.value;
+        if (!hash) return;
+        try {
+          const res = await fetch(`/api/settings/strategy?hash=${encodeURIComponent(hash)}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          const current = data.strategy || 'rarest_first';
+          const radio = document.querySelector(`input[name="picker-strategy"][value="${current}"]`);
+          if (radio) radio.checked = true;
+        } catch (_) { /* bỏ qua lỗi mạng */ }
+      });
+    }
+
+    // Áp dụng chiến lược
+    if (strategyApplyBtn) {
+      strategyApplyBtn.addEventListener('click', async () => {
+        const hash = strategySelect ? strategySelect.value : '';
+        if (!hash) {
+          if (strategyStatus) {
+            strategyStatus.textContent = 'Please select a torrent first.';
+            strategyStatus.className = 'strategy-status err';
+          }
+          return;
+        }
+        const radio = document.querySelector('input[name="picker-strategy"]:checked');
+        const strategy = radio ? radio.value : 'rarest_first';
+        try {
+          const body = new URLSearchParams({ hash, strategy });
+          const res = await fetch('/api/settings/strategy', { method: 'POST', body });
+          if (res.ok) {
+            const found = torrentList.find(item => item.infoHash === hash);
+            if (found) found.pickerStrategy = strategy;
+            if (strategyStatus) {
+              strategyStatus.textContent = strategy === 'sequential' ? '✓ Switched to Sequential' : '✓ Switched to Rarest-First';
+              strategyStatus.className = 'strategy-status ok';
+            }
+          } else {
+            const text = await res.text();
+            if (strategyStatus) {
+              strategyStatus.textContent = 'Error: ' + text;
+              strategyStatus.className = 'strategy-status err';
+            }
+          }
+        } catch (e) {
+          if (strategyStatus) {
+            strategyStatus.textContent = 'Connection error.';
+            strategyStatus.className = 'strategy-status err';
+          }
+        }
+        // Xóa thông báo sau 4 giây
+        setTimeout(() => {
+          if (strategyStatus) { strategyStatus.textContent = ''; strategyStatus.className = 'strategy-status'; }
+        }, 4000);
+      });
+    }
+
+    // Cập nhật danh sách torrent khi mở tab strategy
+    for (const tab of dialog.querySelectorAll('.settings-tab')) {
+      if (tab.dataset.pane === 'strategy') {
+        tab.addEventListener('click', populateStrategyTorrents);
+      }
+    }
 
     openButton.addEventListener('click', () => {
       showPane('connect');
