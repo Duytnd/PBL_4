@@ -2,7 +2,10 @@
 
 #include "core/path_sanitizer.h"
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 
 namespace p2p {
@@ -38,6 +41,35 @@ std::vector<std::string> parsePieces(const std::string& rawPieces) {
     return pieces;
 }
 
+// Giới hạn piece length: 64 MiB (torrent thật thường 16 KiB - 16 MiB).
+constexpr std::int64_t kMaxPieceLength = std::int64_t(1) << 26;
+
+std::string toLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+// Từ chối các đường dẫn trùng nhau không phân biệt hoa/thường, hoặc một file nằm đúng chỗ của
+// thư mục chứa file khác (file "a" cạnh "a/b"): ghi ra đĩa sẽ đè lên nhau hoặc thất bại.
+void rejectCollidingPaths(const std::vector<std::string>& paths) {
+    std::set<std::string> seen;
+    for (const auto& path : paths) {
+        if (!seen.insert(toLowerAscii(path)).second) {
+            throw std::invalid_argument("Torrent metadata: duplicate file path");
+        }
+    }
+    for (const auto& lowered : seen) {
+        for (std::size_t slash = lowered.find('/'); slash != std::string::npos;
+             slash = lowered.find('/', slash + 1)) {
+            if (seen.count(lowered.substr(0, slash)) > 0) {
+                throw std::invalid_argument("Torrent metadata: file path conflicts with a directory");
+            }
+        }
+    }
+}
+
 }  // namespace
 
 TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
@@ -70,7 +102,16 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
         throw std::invalid_argument("Torrent metadata: info must be a dictionary");
     }
 
-    metadata.infoRaw = encodeBencode(infoIt->second);
+    // info-hash phải tính từ ĐÚNG byte gốc của giá trị "info" (không mã hóa lại,
+    // vì mã hóa lại sắp xếp khóa và gộp khóa trùng nên cho hash khác bầy đàn).
+    {
+        std::size_t infoBegin = 0;
+        std::size_t infoEnd = 0;
+        if (!findDictValueSpan(encodedData, "info", infoBegin, infoEnd)) {
+            throw std::invalid_argument("Torrent metadata: missing info dictionary");
+        }
+        metadata.infoRaw = encodedData.substr(infoBegin, infoEnd - infoBegin);
+    }
 
     const auto nameIt = infoDict->find("name");
     if (nameIt == infoDict->end()) {
@@ -96,6 +137,9 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
     }
     if (*pieceLengthValue <= 0) {
         throw std::invalid_argument("Torrent metadata: info.piece length must be positive");
+    }
+    if (*pieceLengthValue > kMaxPieceLength) {
+        throw std::invalid_argument("Torrent metadata: info.piece length is too large");
     }
     metadata.pieceLength = *pieceLengthValue;
 
@@ -164,16 +208,29 @@ TorrentFileMetadata TorrentFile::parse(const std::string& encodedData) {
                 throw std::invalid_argument("Torrent metadata: file length must be a non-negative integer");
             }
             const auto len = static_cast<std::uint64_t>(*fileLength);
-            if (totalLength > UINT64_MAX - len) {
+            if (len > static_cast<std::uint64_t>(INT64_MAX) ||
+                totalLength > static_cast<std::uint64_t>(INT64_MAX) - len) {
                 throw std::invalid_argument("Torrent metadata: total length overflow");
             }
             totalLength += len;
             metadata.filePaths.push_back(pathValue);
             metadata.files.push_back(FileEntry{pathValue, len});
         }
+        rejectCollidingPaths(metadata.filePaths);
         if (!metadata.files.empty()) {
             metadata.length = totalLength;
         }
+    }
+
+    // Kiểm tra nhất quán: tổng dung lượng > 0 và số hash khớp ceil(length / pieceLength).
+    // Nếu không, tải sẽ bị kẹt (piece size 0) hoặc đọc ra ngoài phạm vi.
+    if (metadata.length == 0) {
+        throw std::invalid_argument("Torrent metadata: total length must be positive");
+    }
+    const auto pieceLength = static_cast<std::uint64_t>(metadata.pieceLength);
+    const std::uint64_t expectedPieces = metadata.length / pieceLength + (metadata.length % pieceLength != 0 ? 1 : 0);
+    if (metadata.pieces.size() != expectedPieces) {
+        throw std::invalid_argument("Torrent metadata: piece count does not match length and piece length");
     }
 
     return metadata;

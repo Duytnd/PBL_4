@@ -96,7 +96,10 @@ std::string computePieceHashesStreaming(
         if (file.size == 0) continue;
 
         std::ifstream in(file.absolutePath, std::ios::binary);
-        if (!in) continue;
+        if (!in) {
+            // Bỏ qua file sẽ làm mọi hash piece phía sau lệch so với danh sách "files".
+            throw std::runtime_error("TorrentBuilder: cannot read file: " + file.absolutePath.string());
+        }
 
         while (in) {
             in.read(buf.data(), static_cast<std::streamsize>(kReadBuf));
@@ -134,12 +137,22 @@ std::string computePieceHashesStreaming(
 }  // namespace
 
 BencodeDict TorrentBuilder::buildInfoDict(
-    const std::filesystem::path& sourcePath,
+    const std::filesystem::path& rawSourcePath,
     std::size_t pieceLength,
     const std::string& nameOverride) {
 
+    // Piece length phải là luỹ thừa của 2 và tối thiểu 16 KiB (nhỏ hơn sẽ sinh quá nhiều hash).
+    static constexpr std::size_t kMinPieceLength = 16384;
     if (pieceLength == 0 || (pieceLength & (pieceLength - 1)) != 0) {
         pieceLength = 262144;
+    } else if (pieceLength < kMinPieceLength) {
+        pieceLength = kMinPieceLength;
+    }
+
+    // Bỏ dấu phân cách cuối của đường dẫn nguồn (dạng "dir/") để filename() không rỗng.
+    std::filesystem::path sourcePath = rawSourcePath.lexically_normal();
+    if (!sourcePath.empty() && !sourcePath.has_filename()) {
+        sourcePath = sourcePath.parent_path();
     }
 
     const std::string name = makeName(sourcePath, nameOverride);
@@ -170,12 +183,13 @@ BencodeDict TorrentBuilder::buildInfoDict(
         info["files"] = BencodeValue(fileList);
     } else {
         totalLength = files[0].size;
+        // BEP 3: "length" chỉ có ở torrent đơn file; torrent nhiều file chỉ có "files".
+        info["length"] = BencodeValue(static_cast<int64_t>(totalLength));
     }
 
     // Hash piece streaming — không load toàn bộ dữ liệu vào RAM
     const std::string piecesBinary = computePieceHashesStreaming(files, pieceLength);
 
-    info["length"] = BencodeValue(static_cast<int64_t>(totalLength));
     info["pieces"] = BencodeValue(piecesBinary);
     return info;
 }

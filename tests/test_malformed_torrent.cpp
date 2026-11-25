@@ -75,6 +75,18 @@ std::vector<Sample> schemaSamples() {
         {"pieces_bad_length.torrent",
          torrentWithInfo(kLength + kName + kPieceLength + bstr("pieces") + bstr(std::string(25, 'a')))},
         {"negative_length.torrent", torrentWithInfo(bstr("length") + bint(-1) + kName + kPieceLength + kPieces)},
+        {"piece_count_mismatch.torrent",
+         torrentWithInfo(bstr("length") + bint(100) + kName + bstr("piece length") + bint(16384) +
+                         bstr("pieces") + bstr(std::string(100, 'a')))},
+        {"piece_length_too_large.torrent",
+         torrentWithInfo(kLength + kName + bstr("piece length") + bint(1LL << 27) + kPieces)},
+        {"zero_total_length.torrent",
+         torrentWithInfo(bstr("length") + bint(0) + kName + kPieceLength + bstr("pieces") + bstr(""))},
+        {"multi_file_length_overflow.torrent",
+         torrentWithInfo(bstr("files") + "l" +
+                         "d" + bstr("length") + bint(9223372036854775807LL) + bstr("path") + "l" + bstr("a") + "ee" +
+                         "d" + bstr("length") + bint(9223372036854775807LL) + bstr("path") + "l" + bstr("b") + "ee" +
+                         "e" + kName + kPieceLength + kPieces)},
     };
 }
 
@@ -85,6 +97,18 @@ std::vector<Sample> securitySamples() {
     // Multi-file: một phần tử path là "..".
     const std::string traversalEntry = "d" + bstr("length") + bint(1) + bstr("path") + "l" + bstr("..") +
                                        bstr("evil") + "ee";
+    auto fileEntry = [](const std::vector<std::string>& parts) {
+        std::string path = "l";
+        for (const auto& part : parts) path += bstr(part);
+        path += "e";
+        return "d" + bstr("length") + bint(1) + bstr("path") + path + "e";
+    };
+    auto multi = [&](const std::vector<std::vector<std::string>>& paths) {
+        std::string files = "l";
+        for (const auto& parts : paths) files += fileEntry(parts);
+        files += "e";
+        return torrentWithInfo(bstr("files") + files + kName + kPieceLength + kPieces);
+    };
     return {
         {"path_traversal_name.torrent", withName("../../evil.txt")},
         {"path_traversal_absolute.torrent", withName("/etc/passwd")},
@@ -93,6 +117,14 @@ std::vector<Sample> securitySamples() {
         {"path_traversal_ads.torrent", withName("file.txt:stream")},
         {"path_traversal_multi_file.torrent",
          torrentWithInfo(bstr("files") + "l" + traversalEntry + "e" + kName + kPieceLength + kPieces)},
+        {"device_name_with_extension.torrent", withName("CON.txt")},
+        {"device_name_in_file_path.torrent", multi({{"dir", "nul.x"}})},
+        {"trailing_dot_name.torrent", withName("evil.")},
+        {"trailing_space_file_path.torrent", multi({{"dir", "evil "}})},
+        {"forbidden_char_name.torrent", withName("a|b")},
+        {"control_char_name.torrent", withName(std::string("a") + '\x01' + "b")},
+        {"duplicate_paths_case_insensitive.torrent", multi({{"Readme"}, {"README"}})},
+        {"file_and_directory_collision.torrent", multi({{"a"}, {"a", "b"}})},
     };
 }
 
@@ -180,8 +212,8 @@ void testNonExistentFileThrows() {
 
 void testSampleSetIsComplete() {
     CHECK(syntaxSamples().size() == 7);
-    CHECK(schemaSamples().size() == 13);
-    CHECK(securitySamples().size() == 6);
+    CHECK(schemaSamples().size() == 17);
+    CHECK(securitySamples().size() == 14);
 }
 
 void testSyntaxMalformedSamples() {

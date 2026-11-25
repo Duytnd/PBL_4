@@ -103,6 +103,69 @@ void testRoundTripNestedStructure() {
     CHECK_EQ(encodeBencode(decoded), encoded);
 }
 
+void testIntegerStrictFormat() {
+    // Chỉ chấp nhận -?[1-9][0-9]* hoặc 0.
+    CHECK(decodeBencode("i0e") == BencodeValue(int64_t(0)));
+    CHECK(decodeBencode("i-5e") == BencodeValue(int64_t(-5)));
+    CHECK(decodeBencode("i123e") == BencodeValue(int64_t(123)));
+    const char* bad[] = {"i+5e", "i 5e", "i5 e", "i12abce", "i-012e", "i-0e",
+                         "i042e", "ie", "i-e", "i--5e", "i5.0e", "i0x10e"};
+    for (const char* text : bad) {
+        bool threw = false;
+        try {
+            decodeBencode(text);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::cerr << "  not rejected: " << text << std::endl;
+        }
+        CHECK(threw);
+    }
+    // Vượt int64 vẫn là lỗi (out of range).
+    CHECK_THROWS(decodeBencode("i99999999999999999999e"));
+}
+
+std::string nestedLists(std::size_t depth) {
+    return std::string(depth, 'l') + std::string(depth, 'e');
+}
+
+void testNestingDepthLimit() {
+    CHECK(decodeBencode(nestedLists(63)).get_if<BencodeList>() != nullptr);
+    CHECK(decodeBencode(nestedLists(64)).get_if<BencodeList>() != nullptr);
+    const std::size_t bad[] = {65, 10000, 200000};
+    for (std::size_t depth : bad) {
+        bool threw = false;
+        try {
+            decodeBencode(nestedLists(depth));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    // Chỉ có phần mở, không đóng, cũng không được crash.
+    CHECK_THROWS(decodeBencode(std::string(200000, 'l')));
+    // Dict lồng nhau: d1:ad1:a...
+    std::string nestedDict;
+    for (int i = 0; i < 100000; ++i) nestedDict += "d1:a";
+    CHECK_THROWS(decodeBencode(nestedDict));
+}
+
+void testStringLengthOverflow() {
+    CHECK_THROWS(decodeBencode("4:ab"));
+    CHECK_THROWS(decodeBencode("99999999999999999999:x"));
+    CHECK_THROWS(decodeBencode("18446744073709551615:x"));
+    CHECK_THROWS(decodeBencode("18446744073709551595:x"));
+    // Phải kết thúc nhanh và ném invalid_argument (trên code cũ: treo).
+    bool threw = false;
+    try {
+        decodeBencode("l18446744073709551595:x");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 int main() {
     RUN(testEncodeDecodeInteger);
     RUN(testEncodeDecodeString);
@@ -113,5 +176,9 @@ int main() {
     RUN(testDecodePrefixReturnsTrailingPayloadOffset);
     RUN(testDecodeRejectsMalformedInput);
     RUN(testRoundTripNestedStructure);
+    RUN(testIntegerStrictFormat);
+    RUN(testNestingDepthLimit);
+    // Cuối cùng: trên code cũ ca này treo.
+    RUN(testStringLengthOverflow);
     return TEST_REPORT();
 }

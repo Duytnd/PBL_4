@@ -1,5 +1,7 @@
 #include "test_framework.h"
 
+#include <limits>
+
 #include "core/hash_utils.h"
 #include "core/piece_manager.h"
 
@@ -142,6 +144,17 @@ void testMultiFileRejectsMismatchedLayoutAndMissingFiles() {
     CHECK(!manager.writePieceToFiles(0, root, {{"x", 3}}));
 }
 
+void testPieceSizeDoesNotOverflowWithHugePieceLength() {
+    // pieceIndex * pieceLength tràn size_t: piece 3 phải nằm ngoài tổng độ dài (size 0).
+    const std::size_t hugePieceLength = (std::numeric_limits<std::size_t>::max() >> 1);
+    const std::size_t total = hugePieceLength + 1;
+    PieceManager manager(4, hugePieceLength, total);
+    CHECK_EQ(manager.pieceSize(0), hugePieceLength);
+    CHECK_EQ(manager.pieceSize(1), std::size_t(1));
+    CHECK_EQ(manager.pieceSize(2), std::size_t(0));
+    CHECK_EQ(manager.pieceSize(3), std::size_t(0));
+}
+
 int main() {
     RUN(testOffsetsAndSizesWithUnevenLastPiece);
     RUN(testWriteBlockThenCompleteAndVerify);
@@ -153,5 +166,6 @@ int main() {
     RUN(testAssembleFileSkipsIncompletePieces);
     RUN(testMultiFileRoundTrip);
     RUN(testMultiFileRejectsMismatchedLayoutAndMissingFiles);
+    RUN(testPieceSizeDoesNotOverflowWithHugePieceLength);
     return TEST_REPORT();
 }
