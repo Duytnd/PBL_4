@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -76,7 +77,8 @@ private:
     std::string cookie_;           // chuỗi ngẫu nhiên để lọc echo của chính mình
     std::atomic<bool> running_{false};
     std::thread receiveThread_;
-    long long socketHandle_ = -1;  // tránh include winsock/socket trong header
+    std::atomic<long long> socketHandle_{-1};  // tránh include winsock/socket trong header
+    std::mutex stopMutex_;  // stop() gọi lặp/đồng thời: lần sau chờ lần đầu dọn xong
 
     LsdCallback callback_;
 

@@ -7,6 +7,7 @@
 #include "core/torrent_builder.h"
 #include "network/allowed_fast.h"
 #include "network/extension.h"
+#include "network/lsd.h"
 #include "network/magnet_resolver.h"
 #include "network/network_monitor.h"
 #include "network/peer_connection.h"
@@ -2660,6 +2661,313 @@ void testPexMessageAcceptsAtMost50NewPeers() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Nhóm E: luồng, khoá, vòng đời
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+
+std::string rawInfoHash(const std::string& hex) {
+    std::string raw;
+    for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+        raw.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+    }
+    return raw;
+}
+
+// Chạy `body` ở luồng phụ; trả false nếu quá hạn (không bao giờ treo vô hạn trong test). Luồng quá hạn bị detach.
+bool runWithin(std::chrono::seconds limit, std::function<void()> body) {
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    std::thread([done, body = std::move(body)]() {
+        try {
+            body();
+        } catch (...) {
+        }
+        done->set_value();
+    }).detach();
+    return future.wait_for(limit) == std::future_status::ready;
+}
+
+}  // namespace
+
+// E1: hai kết nối VÀO cùng lúc: một peer bắt tay rồi im lặng, peer kia xin block liên tục. Trước đây hai worker chung một io_context
+// (restart()/run() chồng nhau) nên worker thứ hai bị treo hơn 9 giây.
+void testTwoInboundPeersDoNotBlockEachOther() {
+    std::cout << "[TEST] two concurrent inbound peers are served independently (no shared io_context)..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_inbound_two";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    const std::vector<std::string> pieces = {"AlphaPiece123456", "BetaPiece1234567"};
+    auto meta = makeMockMetadata("inbound_two.bin", pieces, 16);
+    meta.announce = "";
+    {
+        std::ofstream out(temp_dir / meta.name, std::ios::binary);
+        for (const auto& piece : pieces) out << piece;
+    }
+    auto config = inboundTestConfig(temp_dir, 7230);
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+    CHECK(session.is_complete());
+
+    const std::string hex = session.info_hash_hex();
+    std::atomic<int> succeeded{0};
+    std::atomic<long long> slowest_ms{0};
+    auto worker = [&](bool idle) {
+        try {
+            asio::io_context ioc;
+            auto socket = connectTo(ioc, 7230);
+            setReceiveTimeout(*socket, 8000);
+            const auto start = std::chrono::steady_clock::now();
+            std::array<std::uint8_t, 8> reserved{};
+            if (!rawHandshake(*socket, hex, false, reserved)) return;
+            if (idle) {
+                // Peer này bắt tay xong rồi im lặng: worker của nó nằm trong receive_message (ioc.run) suốt thời gian đó.
+                std::this_thread::sleep_for(std::chrono::seconds(4));
+                ++succeeded;
+                return;
+            }
+            asio::write(*socket, asio::buffer(rawMessage(2, {})));  // interested
+            RawFrame frame;
+            bool unchoked = false;
+            for (int i = 0; i < 20 && !unchoked; ++i) {
+                if (!readFrame(*socket, frame)) return;
+                unchoked = !frame.keep_alive && frame.id == 1;
+            }
+            if (!unchoked) return;
+            for (int round = 0; round < 15; ++round) {
+                asio::write(*socket, asio::buffer(rawMessage(6, {static_cast<std::uint32_t>(round % 2), 0, 16})));
+                bool got = false;
+                for (int i = 0; i < 20 && !got; ++i) {
+                    if (!readFrame(*socket, frame)) return;
+                    got = !frame.keep_alive && frame.id == 7 && frame.payload.size() == 8 + 16;
+                }
+                if (!got) return;
+            }
+            const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            slowest_ms = std::max<long long>(slowest_ms, ms);
+            ++succeeded;
+        } catch (...) {
+        }
+    };
+    std::thread first(worker, true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // worker của peer thứ nhất đã vào receive_message
+    std::thread second(worker, false);
+    first.join();
+    second.join();
+    std::cout << "  peers served: " << succeeded.load() << "/2, slowest " << slowest_ms.load() << " ms" << std::endl;
+    CHECK_EQ(succeeded.load(), 2);
+    CHECK(slowest_ms.load() < 2000);  // code cũ: ~3,5 giây vì chờ worker kia nhả io_context
+
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+// E2: stop() giữ session_mutex_ trong lúc join luồng LSD, còn callback LSD cần session_mutex_ (add_peer): deadlock.
+void testStopDoesNotDeadlockWithLsd() {
+    std::cout << "[TEST] start/add_peer/stop loop with LSD enabled never deadlocks..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_lsd_stop";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("lsd_stop.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.announce = "";
+    auto config = inboundTestConfig(temp_dir, 7233);
+    config.enable_lsd = true;
+
+    std::atomic<int> cycles{0};
+    std::atomic<bool> finished_loop{false};
+    const bool in_time = runWithin(std::chrono::seconds(60), [&]() {
+        TorrentSession session(meta, config);
+        const std::string raw_hash = rawInfoHash(session.info_hash_hex());
+        // Luồng phát announce LSD liên tục để callback của session chạy đúng lúc stop().
+        std::atomic<bool> stop_announcer{false};
+        std::thread announcer([&]() {
+            p2p::LocalServiceDiscovery other(9);
+            while (!stop_announcer) {
+                other.announce(raw_hash);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        });
+        for (int i = 0; i < 200; ++i) {
+            if (!session.start()) break;
+            std::thread adder([&]() {
+                for (int k = 0; k < 5; ++k) session.add_peer("127.0.0.1", static_cast<std::uint16_t>(9100 + k));
+            });
+            session.stop();
+            adder.join();
+            ++cycles;
+        }
+        stop_announcer = true;
+        announcer.join();
+        finished_loop = true;
+    });
+    std::cout << "  completed cycles: " << cycles.load() << "/200" << std::endl;
+    CHECK(in_time);
+    CHECK(finished_loop.load());
+    CHECK_EQ(cycles.load(), 200);
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+// E3: add_peer tới địa chỉ không phản hồi rồi stop() ngay: không crash/terminate, dừng nhanh, không còn luồng nào dùng
+// session sau khi nó bị huỷ.
+void testStopWhileConnectingToDeadPeersIsFastAndSafe() {
+    std::cout << "[TEST] stop() right after add_peer to dead addresses is fast and safe..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_stop_connecting";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("stop_connecting.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.announce = "";
+    auto config = inboundTestConfig(temp_dir, 7234);
+
+    std::atomic<long long> worst_stop_ms{0};
+    std::atomic<int> iterations{0};
+    const bool in_time = runWithin(std::chrono::seconds(120), [&]() {
+        for (int i = 0; i < 50; ++i) {
+            TorrentSession session(meta, config);
+            if (!session.start()) break;
+            session.add_peer("10.255.255.1", 6881);  // không phản hồi
+            session.add_peer("10.255.255.2", 6881);
+            session.add_peer("127.0.0.1", 9);        // cổng loopback đóng
+            const auto start = std::chrono::steady_clock::now();
+            session.stop();
+            const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            worst_stop_ms = std::max<long long>(worst_stop_ms, ms);
+            ++iterations;
+        }  // ~TorrentSession ngay sau stop()
+    });
+    std::cout << "  iterations: " << iterations.load() << "/50, worst stop(): " << worst_stop_ms.load() << " ms" << std::endl;
+    CHECK(in_time);
+    CHECK_EQ(iterations.load(), 50);
+    CHECK(worst_stop_ms.load() < 3000);
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+// E4: send_interested không được gửi khi đang giữ session_mutex_: peer ngừng đọc + thao tác gây send_interested
+// (set_file_selection) mà stats() vẫn trả lời nhanh.
+void testSendInterestedDoesNotHoldSessionMutex() {
+    std::cout << "[TEST] interested messages to a stalled peer do not freeze stats()..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_interested_stall";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("stall_interested.bin", {"AlphaPiece123456", "BetaPiece1234567", "GammaPiece123456"}, 16);
+    meta.announce = "";
+    auto config = inboundTestConfig(temp_dir, 7235);
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+
+    asio::io_context ioc;
+    auto peer = connectTo(ioc, 7235);
+    std::array<std::uint8_t, 8> reserved{};
+    CHECK(rawHandshake(*peer, session.info_hash_hex(), false, reserved));
+    // Peer giả báo có đủ piece (bitfield 3 bit) rồi không đọc nữa.
+    std::string bitfield = rawMessage(5, {}, std::string(1, static_cast<char>(0xE0)));
+    asio::write(*peer, asio::buffer(bitfield));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    long long worst_ms = 0;
+    for (int i = 0; i < 20; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        (void)session.stats();
+        (void)session.set_file_selection({true});
+        worst_ms = std::max<long long>(worst_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::cout << "  worst stats()+set_file_selection latency: " << worst_ms << " ms" << std::endl;
+    CHECK(worst_ms < 1000);
+
+    asio::error_code ignored;
+    peer->close(ignored);
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+// E5: ứng viên chết không được chặn vòng điều phối và không được làm seeder thật bị kết nối muộn.
+void testDeadCandidatesDoNotBlockOrchestrationOrDownload() {
+    std::cout << "[TEST] dead candidates do not block the orchestration loop or the real seeder..." << std::endl;
+    const std::filesystem::path seed_dir = "./test_dead_cand_seed";
+    const std::filesystem::path leech_dir = "./test_dead_cand_leech";
+    std::error_code ec;
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+    std::filesystem::create_directories(seed_dir);
+    std::filesystem::create_directories(leech_dir);
+
+    const std::vector<std::string> pieces = {"AlphaPiece123456", "BetaPiece1234567"};
+    auto meta = makeMockMetadata("dead_cand.bin", pieces, 16);
+    meta.announce = "";
+    {
+        std::ofstream out(seed_dir / meta.name, std::ios::binary);
+        for (const auto& piece : pieces) out << piece;
+    }
+
+    auto seed_config = inboundTestConfig(seed_dir, 7236);
+    TorrentSession seeder(meta, seed_config);
+    CHECK(seeder.start());
+    CHECK(seeder.is_complete());
+
+    auto leech_config = inboundTestConfig(leech_dir, 7237);
+    TorrentSession leecher(meta, leech_config);
+    CHECK(leecher.start());
+
+    for (int i = 1; i <= 8; ++i) {  // 8 x 5 giây nếu kết nối đồng bộ
+        leecher.add_peer("10.255.255." + std::to_string(i), 6881);
+    }
+    leecher.add_peer("127.0.0.1", 7236);
+
+    // Vòng điều phối vẫn chạy trong lúc đang thử các ứng viên chết (mỗi vòng ~250 ms).
+    const auto ticks_before = leecher.orchestration_tick_count();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    const auto ticks = leecher.orchestration_tick_count() - ticks_before;
+    std::cout << "  orchestration ticks in 2s: " << ticks << std::endl;
+    CHECK(ticks >= 4);
+
+    const auto start = std::chrono::steady_clock::now();
+    while (!leecher.is_complete() && std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(leecher.is_complete());
+
+    leecher.stop();
+    seeder.stop();
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+}
+
+// E6: stop() gọi lặp/đồng thời an toàn.
+void testStopIsIdempotentAndSafeConcurrently() {
+    std::cout << "[TEST] stop() is idempotent and safe when called concurrently..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_stop_twice";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("stop_twice.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.announce = "";
+    auto config = inboundTestConfig(temp_dir, 7238);
+    const bool in_time = runWithin(std::chrono::seconds(30), [&]() {
+        for (int i = 0; i < 20; ++i) {
+            TorrentSession session(meta, config);
+            if (!session.start()) break;
+            std::thread other([&]() { session.stop(); });
+            session.stop();
+            other.join();
+            session.stop();
+        }
+    });
+    CHECK(in_time);
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "groupd") {  // chạy riêng nhóm D (logic phiên tải)
         testPeerRatesReachPeerInfoForChoker();
@@ -2668,6 +2976,19 @@ int main(int argc, char** argv) {
         testPeerSendingCorruptDataIsBanned();
         testKnownPeerListIsCapped();
         testPexMessageAcceptsAtMost50NewPeers();
+        return TEST_REPORT();
+    }
+    if (argc > 1 && std::string(argv[1]) == "e1") {
+        testTwoInboundPeersDoNotBlockEachOther();
+        return TEST_REPORT();
+    }
+    if (argc > 1 && std::string(argv[1]) == "groupe") {  // chạy riêng nhóm E (luồng, khoá, vòng đời)
+        testTwoInboundPeersDoNotBlockEachOther();
+        testStopDoesNotDeadlockWithLsd();
+        testStopWhileConnectingToDeadPeersIsFastAndSafe();
+        testSendInterestedDoesNotHoldSessionMutex();
+        testDeadCandidatesDoNotBlockOrchestrationOrDownload();
+        testStopIsIdempotentAndSafeConcurrently();
         return TEST_REPORT();
     }
     if (argc > 1 && std::string(argv[1]) == "fast") {  // chạy riêng nhóm Fast Extension khi gỡ lỗi
@@ -2718,6 +3039,12 @@ int main(int argc, char** argv) {
     testPeerSendingCorruptDataIsBanned();
     testKnownPeerListIsCapped();
     testPexMessageAcceptsAtMost50NewPeers();
+    testTwoInboundPeersDoNotBlockEachOther();
+    testStopDoesNotDeadlockWithLsd();
+    testStopWhileConnectingToDeadPeersIsFastAndSafe();
+    testSendInterestedDoesNotHoldSessionMutex();
+    testDeadCandidatesDoNotBlockOrchestrationOrDownload();
+    testStopIsIdempotentAndSafeConcurrently();
 
     return TEST_REPORT();
 }

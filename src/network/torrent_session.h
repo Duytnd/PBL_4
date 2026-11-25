@@ -12,6 +12,7 @@
 #include "network/dht/kademlia_node.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>                             
@@ -205,8 +206,11 @@ public:
     [[nodiscard]] std::string info_hash_hex() const;
     [[nodiscard]] const std::string& peer_id() const noexcept;
     [[nodiscard]] std::filesystem::path save_path() const;
-    [[nodiscard]] KademliaNode* dht() noexcept { return dht_shared_ ? dht_shared_.get() : dht_.get(); }
-    [[nodiscard]] const KademliaNode* dht() const noexcept { return dht_shared_ ? dht_shared_.get() : dht_.get(); }
+    // Con trỏ thô chỉ an toàn khi session chưa dừng; mã nội bộ dùng dht_ptr() (bản sao shared_ptr dưới khoá).
+    [[nodiscard]] KademliaNode* dht() noexcept { return dht_ptr().get(); }
+    [[nodiscard]] const KademliaNode* dht() const noexcept { return dht_ptr().get(); }
+    // Số vòng điều phối đã chạy (chẩn đoán/test: vòng điều phối không được bị kết nối đồng bộ chặn).
+    [[nodiscard]] std::uint64_t orchestration_tick_count() const noexcept { return orchestration_ticks_.load(); }
 
     // Thay đổi chiến lược (Piece Picker & Choker)
     void set_piece_picker(std::unique_ptr<strategy::PiecePicker> picker);
@@ -257,6 +261,23 @@ private:
     // Số luồng announce tracker đang chạy nền (detached): destructor phải chờ về 0
     // trước khi huỷ session, nếu không luồng đó sẽ dùng `this` đã bị giải phóng.
     std::atomic<int> announce_inflight_{0};
+    // start()/stop() chạy tuần tự (stop thứ hai chờ stop thứ nhất xong, không trả về sớm khi còn đang dọn).
+    std::mutex lifecycle_mutex_;
+    std::atomic<std::uint64_t> orchestration_ticks_{0};
+    // Đánh thức vòng điều phối khi stop(): nó không phải ngủ hết nhịp 250 ms.
+    std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
+    // Luồng nền DUY NHẤT kết nối tới ứng viên (không chạy chồng; stop() hủy + join). connector_mutex_ bảo vệ
+    // connector_thread_/connector_running_/connector_pending_ và việc kiểm tra running_ trước khi tạo luồng.
+    std::mutex connector_mutex_;
+    std::thread connector_thread_;
+    bool connector_running_ = false;
+    bool connector_pending_ = false;
+    std::atomic<bool> connect_cancel_{false};
+    // Luồng nền truy vấn DHT định kỳ (getPeers có thể chạy hàng chục giây), không chạy trong vòng điều phối.
+    std::thread dht_poll_thread_;
+    std::atomic<bool> dht_poll_running_{false};
+    std::chrono::steady_clock::time_point last_pick_warn_ = std::chrono::steady_clock::now();
     std::thread dht_init_thread_;
     std::thread nat_init_thread_;
     std::atomic<bool> nat_mapping_initialization_done_{false};
@@ -419,8 +440,13 @@ private:
     bool handle_network_change();
 
     // DHT (BEP 5)
+    mutable std::mutex dht_mutex_;  // bảo vệ việc đổi/đọc dht_shared_ và dht_ (stop() reset trong khi luồng khác đang đọc)
     std::shared_ptr<KademliaNode> dht_shared_;
-    std::unique_ptr<KademliaNode> dht_;
+    std::shared_ptr<KademliaNode> dht_;
+    [[nodiscard]] std::shared_ptr<KademliaNode> dht_ptr() const {
+        std::lock_guard<std::mutex> lock(dht_mutex_);
+        return dht_shared_ ? dht_shared_ : dht_;
+    }
 
     // Các hàm nội bộ
     void set_state(SessionState new_state);
@@ -432,7 +458,13 @@ private:
 
     void process_tracker_announce(const std::string& event);
     void perform_choker_update();
+    // Không chặn: đánh thức luồng kết nối nền (tạo nếu chưa có). Việc kết nối thật nằm ở connector_loop().
     void connect_candidate_peers();
+    void connector_loop();
+    // Lấy một ứng viên và kết nối (có thể mất tới 5 giây). false nếu không còn ứng viên.
+    bool connect_next_candidate();
+    // Đăng ký peer mới + tạo worker dưới session_mutex_, sau khi kiểm tra lại running_; false nếu session đã dừng.
+    bool register_peer_and_spawn_locked(const std::shared_ptr<ActivePeer>& peer);
     void connect_utp_candidates();
     void send_udp_registration();
     void request_peer_holepunch(const std::string& ip, std::uint16_t tcp_port);

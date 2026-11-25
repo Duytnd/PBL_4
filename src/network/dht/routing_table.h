@@ -30,12 +30,15 @@ struct DhtContact {
 class RoutingTable {
 public:
     static constexpr std::size_t kBucketSize = 8;
+    static constexpr std::size_t kMaxPerSubnet = 2;      // contact công khai cùng /24 trong một bucket
+    static constexpr std::size_t kMaxReplacements = 3;   // danh sách thay thế mỗi bucket
 
     explicit RoutingTable(NodeId selfId, std::size_t bucketSize = kBucketSize);
 
-    // Thêm/refresh 1 contact. Không thêm chính mình. Khi bucket đầy, loại bỏ
-    // contact cũ nhất (ít hoạt động nhất) để nhường chỗ (đơn giản hoá: không
-    // ping lại contact cũ trước khi loại, khác hành vi Kademlia đầy đủ).
+    // Thêm/refresh 1 contact. Không thêm chính mình. Theo BEP 5, bucket đầy thì GIỮ contact cũ (node sống lâu
+    // đáng tin hơn node mới) và bỏ contact mới vào danh sách thay thế nhỏ; contact thay thế được đôn lên khi
+    // một contact trong bucket bị remove(). Với IP công khai, mỗi bucket nhận tối đa kMaxPerSubnet contact cùng /24
+    // (chặn một máy/mạng nhồi đầy bucket); IP private/loopback (LAN, test) không bị giới hạn này.
     void insert(const DhtContact& contact);
     void remove(const NodeId& nodeId);
 
@@ -52,6 +55,7 @@ private:
     std::size_t bucketSize_;
     // index = commonPrefixLength(selfId_, contact.id), 0..NodeId::kBitLength
     std::vector<std::vector<DhtContact>> buckets_;
+    std::vector<std::vector<DhtContact>> replacements_;  // contact mới gặp khi bucket đầy (mới nhất ở cuối)
 };
 
 }  // namespace p2p

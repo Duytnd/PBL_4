@@ -83,7 +83,19 @@ private:
     struct PendingCall {
         bool done = false;
         KrpcMessage response;
+        // Địa chỉ ĐÍCH của truy vấn: chỉ phản hồi từ đúng địa chỉ này mới được nhận (chống giả mạo transaction id).
+        std::string expectedIp;
+        std::uint16_t expectedPort = 0;
     };
+
+    // Peer đã announce tới node này, kèm thời điểm để hết hạn.
+    struct AnnouncedPeer {
+        DhtContact contact;
+        std::chrono::steady_clock::time_point at;
+    };
+    static constexpr std::size_t kMaxAnnouncedTotal = 20000;     // trần tổng số peer đã announce
+    static constexpr std::size_t kMaxAnnouncedPerHash = 200;     // trần theo info_hash
+    static constexpr std::chrono::minutes kAnnounceTtl{30};      // peer không announce lại sau 30 phút thì bỏ
 
     NodeId selfId_;
     std::uint16_t port_;
@@ -94,7 +106,9 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread receiveThread_;
-    long long socketHandle_ = -1;  // tránh include winsock trong header
+    std::atomic<long long> socketHandle_{-1};  // tránh include winsock trong header
+    std::mutex socketMutex_;  // sendRaw giữ khi gửi, stop() giữ khi đóng: không đóng socket giữa lúc đang gửi
+    std::mutex stopMutex_;    // stop() gọi lặp/đồng thời: lần sau chờ lần đầu dọn xong
 
     RoutingTable routingTable_;
 
@@ -103,7 +117,10 @@ private:
     std::map<std::string, PendingCall> pendingCalls_;
 
     std::mutex announcedMutex_;
-    std::map<std::string, std::vector<DhtContact>> announcedPeers_;  // info_hash -> peer đã announce tới node này
+    std::map<std::string, std::vector<AnnouncedPeer>> announcedPeers_;  // info_hash -> peer đã announce tới node này
+    std::size_t announcedTotal_ = 0;                                   // tổng số phần tử trong announcedPeers_
+    std::chrono::steady_clock::time_point lastAnnouncedPrune_{};
+    void pruneAnnouncedLocked(std::chrono::steady_clock::time_point now);  // giữ announcedMutex_
 
     // Node gần nhất tìm được lần getPeers() gần nhất, để announcePeer() biết
     // gửi announce_peer kèm token tới đâu.
@@ -121,7 +138,8 @@ private:
         std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
     void sendRaw(const std::string& host, std::uint16_t port, const std::string& payload);
-    static std::string makeTransactionId();
+    // Sinh transaction id 2 byte chưa dùng và đặt chỗ ngay trong pendingCalls_ (hai truy vấn song song không trùng id).
+    std::string makeTransactionId();
 
     [[nodiscard]] std::string tokenFor(const std::string& ip, std::uint16_t port) const;
 };
