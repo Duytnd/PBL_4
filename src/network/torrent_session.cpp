@@ -216,12 +216,16 @@ void TorrentSession::check_existing_files() {
 }
 
 bool TorrentSession::start() {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (running_) {
         return true;
     }
+    connect_cancel_ = false;
 
     try {
+        // start() sau stop(): acceptor cũ tham chiếu io_context cũ, phải huỷ acceptor TRƯỚC khi thay io_context.
+        acceptor_.reset();
         acceptor_ioc_ = std::make_unique<asio::io_context>();
         // Không dùng constructor (endpoint) của asio: nó bật SO_REUSEADDR, mà trên Windows
         // cờ này cho phép bind chồng lên port đang có process khác listen, nên start()
@@ -350,25 +354,43 @@ bool TorrentSession::start() {
     // có thể chậm và khóa request tạo torrent.
     if (config_.enable_dht) {
         try {
+            std::shared_ptr<KademliaNode> node;
             if (config_.shared_dht) {
                 // Dùng shared DHT node từ StateBridge (tất cả sessions dùng chung 1 node)
-                dht_shared_ = config_.shared_dht;
-                std::cout << "[DHT] Using shared Kademlia node on UDP port " << dht_shared_->port() << std::endl;
+                node = config_.shared_dht;
+                {
+                    std::lock_guard<std::mutex> dht_lock(dht_mutex_);
+                    dht_shared_ = node;
+                }
+                std::cout << "[DHT] Using shared Kademlia node on UDP port " << node->port() << std::endl;
+            } else {
+                // Tạo node DHT riêng cho session này
+                const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
+                auto own = std::make_shared<KademliaNode>(NodeId::random(), dport);
+                if (own->start()) {
+                    std::cout << "[DHT] Kademlia node started on UDP port " << own->port() << std::endl;
+                    {
+                        std::lock_guard<std::mutex> dht_lock(dht_mutex_);
+                        dht_ = own;
+                    }
+                    node = own;
+                } else {
+                    std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
+                }
+            }
 
-                dht_init_thread_ = std::thread([this]() {
+            if (node) {
+                // Luồng giữ bản sao shared_ptr: stop() reset dht_/dht_shared_ không làm node bị huỷ giữa chừng.
+                dht_init_thread_ = std::thread([this, node]() {
                     if (!running_) return;
 
-                    // Announce bản thân + lấy peers từ DHT
-                    auto* d = dht();
-                    if (!d) return;
-
                     if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
-                        d->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
+                        node->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
                     }
 
                     if (!running_) return;
 
-                    const auto dht_peers = d->getPeers(info_hash_raw_);
+                    const auto dht_peers = node->getPeers(info_hash_raw_);
                     for (const auto& peer : dht_peers) {
                         if (running_) {
                             add_peer(peer.ip, peer.port);
@@ -380,46 +402,12 @@ bool TorrentSession::start() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     }
                     if (running_) {
-                        d->announcePeer(info_hash_raw_, advertised_port_.load());
+                        node->announcePeer(info_hash_raw_, advertised_port_.load());
                     }
                 });
-            } else {
-                // Tạo node DHT riêng cho session này
-                const std::uint16_t dport = config_.dht_port != 0 ? config_.dht_port : config_.listen_port;
-                dht_ = std::make_unique<KademliaNode>(NodeId::random(), dport);
-                if (dht_->start()) {
-                    std::cout << "[DHT] Kademlia node started on UDP port " << dht_->port() << std::endl;
-
-                    dht_init_thread_ = std::thread([this]() {
-                        if (!running_) return;
-
-                        if (!config_.dht_bootstrap_host.empty() && config_.dht_bootstrap_port != 0) {
-                            dht_->bootstrap(config_.dht_bootstrap_host, config_.dht_bootstrap_port);
-                        }
-
-                        if (!running_) return;
-
-                        const auto dht_peers = dht_->getPeers(info_hash_raw_);
-                        for (const auto& peer : dht_peers) {
-                            if (running_) {
-                                add_peer(peer.ip, peer.port);
-                            }
-                        }
-
-                        while (running_ && config_.enable_port_mapping &&
-                               !nat_mapping_initialization_done_.load()) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                        }
-                        if (running_) {
-                            dht_->announcePeer(info_hash_raw_, advertised_port_.load());
-                        }
-                    });
-                } else {
-                    std::cout << "[DHT] Could not bind Kademlia node on port " << dport << ", continuing without DHT" << std::endl;
-                    dht_.reset();
-                }
             }
         } catch (...) {
+            std::lock_guard<std::mutex> dht_lock(dht_mutex_);
             dht_.reset();
             dht_shared_.reset();
         }
@@ -435,6 +423,10 @@ bool TorrentSession::start() {
 }
 
 void TorrentSession::stop() {
+    // stop() thứ hai (hoặc gọi đồng thời với start()) chờ ở đây tới khi lần đầu dọn xong, không trả về sớm.
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+
+    p2p::LocalServiceDiscovery* lsd_to_stop = nullptr;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (!running_) {
@@ -444,15 +436,41 @@ void TorrentSession::stop() {
         paused_ = false;
         set_state(SessionState::Stopped);
 
-        if (lsd_) {
-            lsd_->stop();
-        }
+        // Chỉ lấy con trỏ: lsd_->stop() join luồng nhận LSD, mà callback LSD cần session_mutex_ (add_peer),
+        // nên KHÔNG được gọi stop() khi đang giữ khoá. lsd_ chỉ bị huỷ ở cuối stop() (dưới lifecycle_mutex_).
+        lsd_to_stop = lsd_.get();
 
         // Đóng các kết nối peer để giải phóng thread
         for (auto& [ep, peer] : active_peers_) {
             if (peer && peer->connection) {
                 peer->connection->close();
             }
+        }
+    }
+    connect_cancel_ = true;  // hủy các lệnh connect_to đang chờ (kết nối TCP đang dở thoát trong ~100 ms)
+    {
+        std::lock_guard<std::mutex> wake_lock(wake_mutex_);  // khoá để không lỡ thông báo giữa lúc kiểm tra điều kiện
+    }
+    wake_cv_.notify_all();
+
+    if (lsd_to_stop) {
+        lsd_to_stop->stop();
+    }
+
+    // Dừng uTP sớm: việc đó đánh thức các lệnh connect_utp_to đang chờ để luồng kết nối nền thoát nhanh.
+    if (utp_engine_) {
+        utp_engine_->stop();
+    }
+
+    // Luồng kết nối nền: sau khi running_ = false nó không tạo peer mới (kiểm tra lại dưới session_mutex_).
+    {
+        std::thread connector;
+        {
+            std::lock_guard<std::mutex> lock(connector_mutex_);
+            connector = std::move(connector_thread_);
+        }
+        if (connector.joinable()) {
+            connector.join();
         }
     }
 
@@ -465,14 +483,17 @@ void TorrentSession::stop() {
     if (dht_init_thread_.joinable()) {
         dht_init_thread_.join();
     }
-
     {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (dht_) {
-            dht_->stop();
+        std::shared_ptr<KademliaNode> own_dht;
+        {
+            std::lock_guard<std::mutex> lock(dht_mutex_);
+            own_dht = dht_;
+            // shared_dht không stop ở đây — do StateBridge quản lý lifecycle
+            dht_shared_.reset();
         }
-        // shared_dht không stop ở đây — do StateBridge quản lý lifecycle
-        dht_shared_.reset();
+        if (own_dht) {
+            own_dht->stop();
+        }
     }
 
     // Đóng Inbound Acceptor ngay lập tức
@@ -498,12 +519,12 @@ void TorrentSession::stop() {
     if (nat_init_thread_.joinable()) {
         nat_init_thread_.join();
     }
-
-    if (utp_engine_) {
-        utp_engine_->stop();
+    if (dht_poll_thread_.joinable()) {
+        dht_poll_thread_.join();
     }
 
-    // Đợi và dọn dẹp các worker threads của peer
+    // Đợi và dọn dẹp các worker threads của peer. Mọi chỗ tạo peer đều kiểm tra running_ dưới session_mutex_
+    // và tạo worker trong cùng đoạn khoá, nên sau running_ = false danh sách này không tăng nữa.
     std::unordered_map<std::string, std::shared_ptr<ActivePeer>> peers_to_join;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -537,6 +558,9 @@ void TorrentSession::stop() {
         lsd_.reset();
         nat_traversal_.reset();
         utp_engine_.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(dht_mutex_);
         dht_.reset();
     }
 }
@@ -603,6 +627,7 @@ bool TorrentSession::set_file_selection(const std::vector<bool>& wanted) {
         }
     }
 
+    std::vector<std::shared_ptr<pbl4::network::PeerConnection>> interested_targets;  // gửi sau khi nhả khoá
     if (running_ && !paused_) {
         if (all_wanted_done_locked()) {
             set_state(SessionState::Seeding);
@@ -619,11 +644,8 @@ bool TorrentSession::set_file_selection(const std::vector<bool>& wanted) {
                 }
                 for (std::size_t i = 0; i < peer->bitfield.size() && i < my_bitfield_.size(); ++i) {
                     if (peer->bitfield[i] && !my_bitfield_[i] && piece_wanted_[i]) {
-                        try {
-                            peer->connection->send_interested();
-                            peer->am_interested = true;
-                        } catch (...) {
-                        }
+                        peer->am_interested = true;
+                        interested_targets.push_back(peer->connection);
                         break;
                     }
                 }
@@ -631,6 +653,13 @@ bool TorrentSession::set_file_selection(const std::vector<bool>& wanted) {
         }
     }
     lock.unlock();
+    // Gửi qua socket NGOÀI session_mutex_: peer ngừng đọc không được làm stats()/UI chờ tới io_timeout.
+    for (const auto& connection : interested_targets) {
+        try {
+            connection->send_interested();
+        } catch (...) {
+        }
+    }
     // Lấy lại peer ngay thay vì chờ chu kỳ tracker. Dọn peer đã chết trước, nếu không announce sẽ bỏ qua
     // chúng vì "đã biết" (vòng bảo trì chỉ dọn mỗi giây một lần).
     if (need_peers) {
@@ -733,7 +762,8 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
     if (ip.empty() || port == 0) return;
 
     // Tắt DHT thì không có localIp từ DHT: tự dò, tránh local_ip rỗng làm bộ lọc coi mọi peer public là rác.
-    std::string local_ip = (dht() && !dht()->localIp().empty()) ? dht()->localIp() : "";
+    const auto dht_node = dht_ptr();
+    std::string local_ip = dht_node ? dht_node->localIp() : "";
     if (local_ip.empty()) {
         // Không dùng biến static: nó chốt IP của mạng lúc gọi đầu tiên mãi mãi, đổi mạng là lọc peer sai.
         local_ip = NetworkMonitor::instance().primary_ip();
@@ -962,7 +992,10 @@ TorrentSessionStats TorrentSession::stats() const {
     s.completed_pieces = completed_pieces_count_;
     s.connected_peers = active_peers_.size();
     s.total_peers_known = known_peer_endpoints_.size();
-    s.dht_nodes_count = dht() ? dht()->routingTable().size() : 0;
+    {
+        const auto dht_node = dht_ptr();
+        s.dht_nodes_count = dht_node ? dht_node->routingTable().size() : 0;
+    }
     s.download_rate = current_download_rate_;
     s.upload_rate = current_upload_rate_;
     s.error_message = error_message_;
@@ -1296,8 +1329,7 @@ void TorrentSession::orchestration_loop() {
             // 1. Cập nhật tốc độ & bảo trì kết nối mỗi giây
             update_rates();
             cleanup_disconnected_peers();
-            connect_candidate_peers();
-            connect_utp_candidates();
+            connect_candidate_peers();  // không chặn: việc kết nối (TCP + uTP) chạy ở luồng nền
 
             if (utp_engine_ && now >= next_udp_registration_) {
                 send_udp_registration();
@@ -1339,24 +1371,46 @@ void TorrentSession::orchestration_loop() {
 
             // 5. Announce và truy vấn định kỳ DHT (mỗi 10 giây nếu chưa có peer, 60 giây nếu đã có)
             {
-                auto* d = dht();
+                auto d = dht_ptr();
                 const bool has_peers = [this]() {
                     std::lock_guard<std::mutex> lk(session_mutex_);
                     return !active_peers_.empty();
                 }();
                 const auto dht_interval = has_peers ? std::chrono::seconds(60) : std::chrono::seconds(10);
-                if (config_.enable_dht && d && now - last_dht_time >= dht_interval) {
-                    const auto dht_peers = d->getPeers(info_hash_raw_);
-                    for (const auto& p : dht_peers) {
-                        add_peer(p.ip, p.port);
+                // getPeers có thể chạy hàng chục giây (8 vòng x 2 giây mỗi node): chạy ở luồng riêng, không chồng nhau.
+                if (running_ && config_.enable_dht && d && now - last_dht_time >= dht_interval && !dht_poll_running_.load()) {
+                    if (dht_poll_thread_.joinable()) {
+                        dht_poll_thread_.join();  // lượt trước đã xong (cờ chạy đã hạ)
                     }
-                    d->announcePeer(info_hash_raw_, advertised_port_.load());
+                    dht_poll_running_ = true;
                     last_dht_time = now;
+                    try {
+                        dht_poll_thread_ = std::thread([this, d]() {
+                            struct Done {
+                                std::atomic<bool>& flag;
+                                ~Done() { flag = false; }
+                            } done{dht_poll_running_};
+                            const auto dht_peers = d->getPeers(info_hash_raw_);
+                            for (const auto& p : dht_peers) {
+                                if (!running_) return;
+                                add_peer(p.ip, p.port);
+                            }
+                            if (running_) {
+                                d->announcePeer(info_hash_raw_, advertised_port_.load());
+                            }
+                        });
+                    } catch (...) {
+                        dht_poll_running_ = false;
+                    }
                 }
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        orchestration_ticks_.fetch_add(1);
+        {
+            std::unique_lock<std::mutex> wake_lock(wake_mutex_);
+            wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(250), [this]() { return !running_.load(); });
+        }
     }
 }
 
@@ -1402,7 +1456,11 @@ void TorrentSession::acceptor_loop() {
             }
 
             asio::error_code ec;
-            asio::ip::tcp::socket socket = acceptor_->accept(ec);
+            // Mỗi kết nối vào có io_context riêng: các worker không được dùng chung io_context
+            // (restart()/run() đồng thời làm worker thứ hai bị treo).
+            auto conn_ioc = std::make_unique<asio::io_context>();
+            asio::ip::tcp::socket socket(*conn_ioc);
+            acceptor_->accept(socket, ec);
             if (ec || !running_) {
                 break;
             }
@@ -1424,16 +1482,17 @@ void TorrentSession::acceptor_loop() {
                 peer->endpoint_str = ep;
                 // Chưa bắt tay thì chỉ cho thời gian ngắn: kết nối im lặng không được giữ chỗ lâu.
                 peer->connection = std::make_shared<pbl4::network::PeerConnection>(
-                    std::move(socket), std::min(config_.handshake_timeout, config_.peer_timeout));
+                    std::move(socket), std::move(conn_ioc),
+                    std::min(config_.handshake_timeout, config_.peer_timeout));
                 peer->bitfield.assign(metadata_.pieces.size(), false);
                 peer->last_active = std::chrono::steady_clock::now();
                 peer->worker_active = true;
 
-                active_peers_[ep] = peer;
+                if (!register_peer_and_spawn_locked(peer)) {
+                    continue;
+                }
                 known_peer_endpoints_.insert(ep);
             }
-
-            peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
         }
     } catch (...) {
         // Cổng có thể bị chiếm hoặc phiên đã dừng
@@ -1463,22 +1522,99 @@ void TorrentSession::accept_utp_stream(std::shared_ptr<pbl4::network::UtpStream>
             peer->connection->close();
             return;
         }
-        active_peers_[peer->endpoint_str] = peer;
+        if (!register_peer_and_spawn_locked(peer)) {
+            return;
+        }
     }
-    peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
     std::cout << "[uTP] Accepted peer stream from " << peer->endpoint_str << std::endl;
 }
 
 void TorrentSession::connect_candidate_peers() {
-    std::vector<std::string> to_connect;
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (active_peers_.size() >= config_.max_connections) {
-            return;
+    std::lock_guard<std::mutex> lock(connector_mutex_);
+    // Kiểm tra running_ TRONG connector_mutex_: stop() lấy luồng này ra sau khi hạ running_, nên không thể có
+    // luồng kết nối mới nào xuất hiện sau khi stop() đã chụp connector_thread_.
+    if (!running_) {
+        return;
+    }
+    if (connector_running_) {
+        connector_pending_ = true;  // luồng đang chạy sẽ quay lại xem ứng viên mới
+        return;
+    }
+    if (connector_thread_.joinable()) {
+        connector_thread_.join();  // lượt trước đã xong (connector_running_ đã hạ)
+    }
+    connector_running_ = true;
+    connector_pending_ = false;
+    try {
+        connector_thread_ = std::thread(&TorrentSession::connector_loop, this);
+    } catch (...) {
+        connector_running_ = false;
+    }
+}
+
+void TorrentSession::connector_loop() {
+    for (;;) {
+        // Kết nối TUẦN TỰ từng ứng viên (mỗi lần tới 5 giây) ở luồng nền: vòng điều phối/choker/announce không bị chặn.
+        while (running_ && !connect_cancel_.load()) {
+            if (!connect_next_candidate()) {
+                break;
+            }
+        }
+        if (running_ && !connect_cancel_.load()) {
+            connect_utp_candidates();
         }
 
-        while (!candidate_peer_endpoints_.empty() &&
-               active_peers_.size() + to_connect.size() < config_.max_connections) {
+        std::lock_guard<std::mutex> lock(connector_mutex_);
+        if (connector_pending_ && running_ && !connect_cancel_.load()) {
+            connector_pending_ = false;
+            continue;
+        }
+        connector_running_ = false;
+        return;
+    }
+}
+
+bool TorrentSession::register_peer_and_spawn_locked(const std::shared_ptr<ActivePeer>& peer) {
+    // Gọi khi đang giữ session_mutex_. Kiểm tra lại running_ ngay trước khi chèn và tạo worker: stop() có thể đã
+    // chụp danh sách peer, nếu chèn muộn thì worker dùng `this` sau stop() hoặc ~ActivePeer chạy với thread còn joinable.
+    if (!running_) {
+        if (peer->connection) {
+            peer->connection->close();
+        }
+        peer->worker_active = false;
+        return false;
+    }
+    const auto existing = active_peers_.find(peer->endpoint_str);
+    if (existing != active_peers_.end() && existing->second && existing->second->worker_thread.joinable()) {
+        // Ghi đè sẽ huỷ một std::thread còn joinable (std::terminate): bỏ kết nối mới.
+        if (peer->connection) {
+            peer->connection->close();
+        }
+        peer->worker_active = false;
+        return false;
+    }
+    active_peers_[peer->endpoint_str] = peer;
+    try {
+        peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
+    } catch (...) {
+        active_peers_.erase(peer->endpoint_str);
+        if (peer->connection) {
+            peer->connection->close();
+        }
+        peer->worker_active = false;
+        return false;
+    }
+    return true;
+}
+
+bool TorrentSession::connect_next_candidate() {
+    std::string ep_str;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (!running_ || active_peers_.size() >= config_.max_connections) {
+            return false;
+        }
+        while (!candidate_peer_endpoints_.empty()) {
             std::string candidate = candidate_peer_endpoints_.back();
             candidate_peer_endpoints_.pop_back();
             const auto candidate_colon = candidate.find(':');
@@ -1488,52 +1624,61 @@ void TorrentSession::connect_candidate_peers() {
                 continue;
             }
             if (active_peers_.find(candidate) == active_peers_.end()) {
-                to_connect.push_back(candidate);
+                ep_str = std::move(candidate);
+                break;
             }
         }
     }
-
-    for (const auto& ep_str : to_connect) {
-        const auto colon = ep_str.find(':');
-        if (colon == std::string::npos) continue;
-        const std::string ip = ep_str.substr(0, colon);
-        const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(ep_str.substr(colon + 1)));
-
-        std::cout << "[CONNECT] Attempting TCP connect to " << ep_str << std::endl;
-        try {
-            auto conn = pbl4::network::PeerConnection::connect_to(
-                ip, port, std::chrono::seconds(5));
-
-            std::cout << "[CONNECT] TCP connected to " << ep_str << std::endl;
-            auto peer = std::make_shared<ActivePeer>();
-            peer->ip = ip;
-            peer->port = port;
-            peer->outbound = true;  // do mình chủ động mở: không tính vào hạn mức kết nối vào
-            peer->endpoint_str = ep_str;
-            peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(conn));
-            peer->bitfield.assign(metadata_.pieces.size(), false);
-            peer->last_active = std::chrono::steady_clock::now();
-            peer->worker_active = true;
-
-            {
-                std::lock_guard<std::mutex> lock(session_mutex_);
-                active_peers_[ep_str] = peer;
-                peer_retry_.erase(ep_str);  // nối được: xoá trạng thái lùi
-            }
-
-            peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
-        } catch (const std::exception& ex) {
-            std::cout << "[CONNECT] Failed to connect to " << ep_str << ": " << ex.what() << std::endl;
-            request_peer_holepunch(ip, port);
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            note_connect_failure_locked(ep_str);
-        } catch (...) {
-            std::cout << "[CONNECT] Failed to connect to " << ep_str << " (unknown error)" << std::endl;
-            request_peer_holepunch(ip, port);
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            note_connect_failure_locked(ep_str);
-        }
+    if (ep_str.empty()) {
+        return false;
     }
+
+    const auto colon = ep_str.find(':');
+    if (colon == std::string::npos) {
+        return true;
+    }
+    const std::string ip = ep_str.substr(0, colon);
+    std::uint16_t port = 0;
+    try {
+        port = static_cast<std::uint16_t>(std::stoi(ep_str.substr(colon + 1)));
+    } catch (...) {
+        return true;
+    }
+
+    std::cout << "[CONNECT] Attempting TCP connect to " << ep_str << std::endl;
+    try {
+        auto conn = pbl4::network::PeerConnection::connect_to(
+            ip, port, std::chrono::seconds(5), &connect_cancel_);
+
+        std::cout << "[CONNECT] TCP connected to " << ep_str << std::endl;
+        auto peer = std::make_shared<ActivePeer>();
+        peer->ip = ip;
+        peer->port = port;
+        peer->outbound = true;  // do mình chủ động mở: không tính vào hạn mức kết nối vào
+        peer->endpoint_str = ep_str;
+        peer->connection = std::make_shared<pbl4::network::PeerConnection>(std::move(conn));
+        peer->bitfield.assign(metadata_.pieces.size(), false);
+        peer->last_active = std::chrono::steady_clock::now();
+        peer->worker_active = true;
+
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        peer_retry_.erase(ep_str);  // nối được: xoá trạng thái lùi
+        register_peer_and_spawn_locked(peer);  // false nếu session đã dừng: kết nối đã được đóng
+    } catch (const std::exception& ex) {
+        if (connect_cancel_.load() || !running_) {
+            return false;  // đang dừng: không tính là lỗi kết nối
+        }
+        std::cout << "[CONNECT] Failed to connect to " << ep_str << ": " << ex.what() << std::endl;
+        request_peer_holepunch(ip, port);
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        note_connect_failure_locked(ep_str);
+    } catch (...) {
+        std::cout << "[CONNECT] Failed to connect to " << ep_str << " (unknown error)" << std::endl;
+        request_peer_holepunch(ip, port);
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        note_connect_failure_locked(ep_str);
+    }
+    return true;
 }
 
 void TorrentSession::note_connect_failure_locked(const std::string& endpoint) {
@@ -1607,9 +1752,11 @@ void TorrentSession::connect_utp_candidates() {
                     queued_utp_peer_endpoints_.erase(endpoint);
                     continue;
                 }
-                active_peers_[endpoint] = peer;
+                if (!register_peer_and_spawn_locked(peer)) {
+                    queued_utp_peer_endpoints_.erase(endpoint);
+                    continue;
+                }
             }
-            peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
             std::cout << "[uTP] Connected to peer " << endpoint << std::endl;
         } catch (const std::exception& ex) {
             std::cout << "[uTP] Connection to " << endpoint << " failed: " << ex.what() << std::endl;
@@ -1692,20 +1839,24 @@ void TorrentSession::peer_worker_loop(std::shared_ptr<ActivePeer> peer) {
         }
 
         // Gửi Port message (BEP 5 - ID 9) thông báo DHT port nếu bật DHT
-        if (auto* d = dht(); d && peer->connection->is_open()) {
+        if (auto d = dht_ptr(); d && peer->connection->is_open()) {
             try {
                 peer->connection->send_port(d->port());
             } catch (...) {}
         }
 
-        // Bày tỏ quan tâm nếu đang tải
+        // Bày tỏ quan tâm nếu đang tải (gửi ngoài khoá)
+        bool send_interest_now = false;
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
             if (state_ == SessionState::Downloading || state_ == SessionState::Waiting) {
-                peer->connection->send_interested();
                 peer->am_interested = true;
-                std::cout << "[PEER-WIRE] Sent INTERESTED to " << peer->endpoint_str << std::endl;
+                send_interest_now = true;
             }
+        }
+        if (send_interest_now) {
+            peer->connection->send_interested();
+            std::cout << "[PEER-WIRE] Sent INTERESTED to " << peer->endpoint_str << std::endl;
         }
 
         // Vòng lặp nhận và xử lý message
@@ -1825,15 +1976,21 @@ void TorrentSession::handle_peer_message(
         }
         case pbl4::network::PeerMessageId::Have: {
             auto have = pbl4::network::peer_protocol::parse_have(msg);
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            if (have.index < peer->bitfield.size()) {
-                peer->bitfield[have.index] = true;
-            }
-            if (have.index < my_bitfield_.size() && !my_bitfield_[have.index] && piece_wanted_[have.index]) {
-                if (!peer->am_interested) {
-                    peer->connection->send_interested();
-                    peer->am_interested = true;
+            bool send_interest_now = false;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                if (have.index < peer->bitfield.size()) {
+                    peer->bitfield[have.index] = true;
                 }
+                if (have.index < my_bitfield_.size() && !my_bitfield_[have.index] && piece_wanted_[have.index]) {
+                    if (!peer->am_interested) {
+                        peer->am_interested = true;
+                        send_interest_now = true;
+                    }
+                }
+            }
+            if (send_interest_now) {
+                peer->connection->send_interested();
             }
             break;
         }
@@ -2005,7 +2162,7 @@ void TorrentSession::handle_peer_message(
         case pbl4::network::PeerMessageId::Port: {
             const auto remote_dht_port = pbl4::network::peer_protocol::parse_port(msg);
             std::cout << "[DHT] Peer " << peer->endpoint_str << " sent DHT Port: " << remote_dht_port << std::endl;
-            if (auto* d = dht(); d && remote_dht_port != 0) {
+            if (auto d = dht_ptr(); d && remote_dht_port != 0) {
                 d->ping(peer->ip, remote_dht_port);
                 // Announce ngay để peer kia biết mình qua DHT
                 d->announcePeer(info_hash_raw_, advertised_port_.load());
@@ -2267,6 +2424,7 @@ void TorrentSession::handle_piece_block(
 
 void TorrentSession::apply_peer_bitfield(const std::shared_ptr<ActivePeer>& peer, const std::vector<bool>& bits) {
     bool should_request = false;
+    bool send_interest_now = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         peer->bitfield = bits;
@@ -2278,12 +2436,15 @@ void TorrentSession::apply_peer_bitfield(const std::shared_ptr<ActivePeer>& peer
             }
         }
         if (interested && !peer->am_interested) {
-            peer->connection->send_interested();
             peer->am_interested = true;
+            send_interest_now = true;
         }
         // Nếu đã được unchoke từ trước (race: unchoke đến trước bitfield) hoặc peer Fast đã cho piece "allowed fast",
         // gửi request ngay sau khi nhả khoá.
         should_request = peer->can_request();
+    }
+    if (send_interest_now) {
+        peer->connection->send_interested();  // ngoài session_mutex_
     }
     if (should_request) {
         request_next_blocks(peer);
@@ -2486,16 +2647,16 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
             }
         }
 
-        static auto last_warn = std::chrono::steady_clock::now();
+        // Đang giữ session_mutex_: mốc log là thành viên của session (không dùng chung giữa các session).
         auto now = std::chrono::steady_clock::now();
-        if (now - last_warn > std::chrono::seconds(5)) {
+        if (now - last_pick_warn_ > std::chrono::seconds(5)) {
             std::cout << "[DOWNLOAD-REQ] Cannot pick piece! picker_result=" << next_piece
                       << " | peer_bitfield_size=" << peer->bitfield.size()
                       << " | our_unavail_pieces=";
             std::size_t unavail = 0;
             for (bool b : unavailable_or_in_progress) if (b) unavail++;
             std::cout << unavail << "/" << unavailable_or_in_progress.size() << std::endl;
-            last_warn = now;
+            last_pick_warn_ = now;
         }
     }
 

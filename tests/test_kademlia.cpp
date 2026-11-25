@@ -12,6 +12,7 @@
 #include "network/lan_address.h"
 
 #include <chrono>
+#include <future>
 #include <thread>
 
 using namespace p2p;
@@ -127,8 +128,8 @@ void testRoutingTableRefreshMoveToEnd() {
     CHECK_EQ(table.size(), std::size_t(1));
 }
 
-void testRoutingTableBucketEvictOldestWhenFull() {
-    // bucketSize = 2; thêm 3 node vào cùng 1 bucket -> node đầu tiên bị đẩy ra.
+void testRoutingTableBucketKeepsOldContactsWhenFull() {
+    // bucketSize = 2; thêm 3 node vào cùng 1 bucket -> BEP 5: giữ node cũ, node mới không được chen vào.
     const NodeId self = NodeId::fromString(std::string(20, '\x00'));
     RoutingTable table(self, /*bucketSize=*/2);
 
@@ -141,12 +142,37 @@ void testRoutingTableBucketEvictOldestWhenFull() {
 
     table.insert(c1);
     table.insert(c2);
-    table.insert(c3);  // bucket đầy, c1 (cũ nhất) bị đuổi
+    table.insert(c3);  // bucket đầy: c3 vào danh sách thay thế, c1 và c2 (sống lâu) được giữ
 
     CHECK_EQ(table.size(), std::size_t(2));
-    CHECK(!table.contains(c1.id));
+    CHECK(table.contains(c1.id));
     CHECK(table.contains(c2.id));
+    CHECK(!table.contains(c3.id));
+
+    // Khi một contact trong bucket bị bỏ (không phản hồi), contact thay thế được đôn lên.
+    table.remove(c1.id);
+    CHECK_EQ(table.size(), std::size_t(2));
+    CHECK(!table.contains(c1.id));
     CHECK(table.contains(c3.id));
+}
+
+void testRoutingTableLimitsPublicContactsPerSubnet() {
+    const NodeId self = NodeId::fromString(std::string(20, '\x00'));
+    RoutingTable table(self);
+    // Cùng bucket 0 (bit cao nhất = 1). 4 contact cùng /24 công khai: chỉ nhận 2.
+    for (int i = 0; i < 4; ++i) {
+        table.insert(makeContact(std::string(1, static_cast<char>(0xFF - i)) + std::string(19, '\x00'),
+                                 "8.8.8." + std::to_string(10 + i), static_cast<uint16_t>(100 + i)));
+    }
+    CHECK_EQ(table.size(), std::size_t(2));
+    // IP khác /24 vẫn vào được; IP private (LAN) không bị giới hạn /24.
+    table.insert(makeContact(std::string(1, '\xF0') + std::string(19, '\x00'), "1.1.1.1", 200));
+    CHECK_EQ(table.size(), std::size_t(3));
+    for (int i = 0; i < 4; ++i) {
+        table.insert(makeContact(std::string(1, static_cast<char>(0xE0 - i)) + std::string(19, '\x00'),
+                                 "192.168.1." + std::to_string(10 + i), static_cast<uint16_t>(300 + i)));
+    }
+    CHECK_EQ(table.size(), std::size_t(7));
 }
 
 void testRoutingTableClosestTo() {
@@ -492,6 +518,125 @@ void testResolvePeerIpReplacesLoopbackWithTrackerLanIp() {
     CHECK_EQ(resolve_peer_ip("127.0.0.1", ""), std::string("127.0.0.1"));
 }
 
+// ============================================================
+// E6: phản hồi giả mạo + trần announcedPeers_ (cần socket UDP thô)
+// ============================================================
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using RawSock = SOCKET;
+static void closeRaw(RawSock s) { closesocket(s); }
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using RawSock = int;
+static void closeRaw(RawSock s) { close(s); }
+#endif
+
+namespace {
+
+struct RawUdp {
+    RawSock sock;
+    uint16_t port = 0;
+    RawUdp() {
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        socklen_t len = sizeof(addr);
+        getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len);
+        port = ntohs(addr.sin_port);
+#ifdef _WIN32
+        DWORD ms = 3000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+#else
+        timeval tv{3, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+    ~RawUdp() { closeRaw(sock); }
+    void sendTo(uint16_t destPort, const std::string& data) {
+        sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dest.sin_port = htons(destPort);
+        sendto(sock, data.data(), static_cast<int>(data.size()), 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    }
+    bool recv(std::string& out, uint16_t* fromPort = nullptr) {
+        char buf[4096];
+        sockaddr_in from{};
+        socklen_t len = sizeof(from);
+        const int n = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &len);
+        if (n <= 0) return false;
+        out.assign(buf, static_cast<size_t>(n));
+        if (fromPort) *fromPort = ntohs(from.sin_port);
+        return true;
+    }
+};
+
+}  // namespace
+
+void testResponseFromWrongAddressIsIgnored() {
+    std::cout << "[TEST] DHT ignores a response with the right transaction id from a different port...\n";
+    KademliaNode node(NodeId::random(), 17910);
+    CHECK(node.start());
+
+    RawUdp target;   // địa chỉ được hỏi
+    RawUdp spoofer;  // kẻ giả mạo từ cổng khác
+    const NodeId spoofId = NodeId::random();
+    const NodeId realId = NodeId::random();
+
+    auto pingResult = std::async(std::launch::async, [&]() { return node.ping("127.0.0.1", target.port); });
+
+    std::string query;
+    CHECK(target.recv(query));
+    const KrpcMessage decoded = Krpc::decode(query);
+    CHECK(decoded.type == KrpcType::Query);
+
+    spoofer.sendTo(node.port(), Krpc::encodePingResponse(decoded.transactionId, spoofId));
+    CHECK(pingResult.wait_for(std::chrono::milliseconds(400)) == std::future_status::timeout);  // phản hồi giả bị bỏ qua
+    CHECK(!node.routingTable().contains(spoofId));
+
+    target.sendTo(node.port(), Krpc::encodePingResponse(decoded.transactionId, realId));  // phản hồi thật
+    CHECK(pingResult.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    CHECK(pingResult.get());
+    CHECK(node.routingTable().contains(realId));
+    node.stop();
+}
+
+void testAnnouncedPeersArePerInfoHashCapped() {
+    std::cout << "[TEST] DHT caps stored announced peers per info_hash...\n";
+    KademliaNode node(NodeId::random(), 17911);
+    CHECK(node.start());
+    RawUdp client;
+    const NodeId clientId = NodeId::random();
+    const std::string infoHash(20, '\x42');
+
+    std::string reply;
+    client.sendTo(node.port(), Krpc::encodeGetPeers("aa", clientId, infoHash));
+    CHECK(client.recv(reply));
+    const std::string token = Krpc::decode(reply).token;
+    CHECK(!token.empty());
+
+    // Cùng một nguồn (cùng token) announce tới 300 cổng khác nhau.
+    for (int i = 0; i < 300; ++i) {
+        client.sendTo(node.port(), Krpc::encodeAnnouncePeer("bb", clientId, infoHash, static_cast<uint16_t>(2000 + i), token));
+        CHECK(client.recv(reply));
+    }
+
+    client.sendTo(node.port(), Krpc::encodeGetPeers("cc", clientId, infoHash));
+    CHECK(client.recv(reply));
+    const auto peers = Krpc::decode(reply).values;
+    std::cout << "  stored peers for the info_hash: " << peers.size() << "\n";
+    CHECK(peers.size() <= 200);
+    CHECK(peers.size() >= 100);
+    node.stop();
+}
+
 int main() {
     // NodeId
     RUN(testPickLanIpPrefersPrivateRouteAddress);
@@ -513,8 +658,11 @@ int main() {
     RUN(testRoutingTableDoesNotInsertSelf);
     RUN(testRoutingTableRemove);
     RUN(testRoutingTableRefreshMoveToEnd);
-    RUN(testRoutingTableBucketEvictOldestWhenFull);
+    RUN(testRoutingTableBucketKeepsOldContactsWhenFull);
+    RUN(testRoutingTableLimitsPublicContactsPerSubnet);
     RUN(testRoutingTableClosestTo);
+    RUN(testResponseFromWrongAddressIsIgnored);
+    RUN(testAnnouncedPeersArePerInfoHashCapped);
 
     // Krpc
     RUN(testKrpcPingRoundTrip);

@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <sstream>
@@ -204,40 +206,43 @@ bool LocalServiceDiscovery::start(LsdCallback callback) {
     setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                reinterpret_cast<const char*>(&mreq), sizeof(mreq));
 
-    // Timeout nhận để running_ có thể kiểm tra được
+    // Timeout nhận để running_ có thể kiểm tra được (ngắn để stop() không phải chờ lâu)
 #ifdef _WIN32
-    DWORD timeoutMs = 500;
+    DWORD timeoutMs = 100;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 #else
-    timeval tv{0, 500000};
+    timeval tv{0, 100000};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-    socketHandle_ = static_cast<long long>(sock);
+    socketHandle_.store(static_cast<long long>(sock));
     running_ = true;
     receiveThread_ = std::thread(&LocalServiceDiscovery::receiveLoop, this);
     return true;
 }
 
 void LocalServiceDiscovery::stop() {
+    // Lần gọi thứ hai (kể cả đồng thời) chờ ở đây tới khi lần đầu dọn xong, không trả về sớm.
+    std::lock_guard<std::mutex> stopLock(stopMutex_);
     if (!running_.exchange(false)) {
         return;
     }
     if (receiveThread_.joinable()) {
         receiveThread_.join();
     }
-    if (socketHandle_ != -1) {
-        closeSocket(static_cast<SocketHandle>(socketHandle_));
-        socketHandle_ = -1;
+    const long long handle = socketHandle_.exchange(-1);
+    if (handle != -1) {
+        closeSocket(static_cast<SocketHandle>(handle));
     }
 }
 
 bool LocalServiceDiscovery::rejoinMulticast() {
-    if (!running_ || socketHandle_ == -1) {
+    const long long handle = socketHandle_.load();
+    if (!running_ || handle == -1) {
         return false;
     }
-    const SocketHandle sock = static_cast<SocketHandle>(socketHandle_);
+    const SocketHandle sock = static_cast<SocketHandle>(handle);
     ip_mreq mreq{};
     mreq.imr_multiaddr.s_addr = inet_addr(kMulticastGroup);
     mreq.imr_interface.s_addr = INADDR_ANY;
@@ -250,6 +255,7 @@ bool LocalServiceDiscovery::rejoinMulticast() {
 
 void LocalServiceDiscovery::receiveLoop() {
     std::vector<char> buffer(2048);
+    auto errorBackoff = std::chrono::milliseconds(100);  // lỗi thật liên tục: ngủ 100 ms, lùi dần tới 1 giây
 
     while (running_) {
         sockaddr_in fromAddr{};
@@ -258,14 +264,32 @@ void LocalServiceDiscovery::receiveLoop() {
 #else
         socklen_t fromLen = sizeof(fromAddr);
 #endif
+        const long long handle = socketHandle_.load();
+        if (handle == -1) {
+            break;
+        }
         const auto received = recvfrom(
-            static_cast<SocketHandle>(socketHandle_),
+            static_cast<SocketHandle>(handle),
             buffer.data(), static_cast<int>(buffer.size()), 0,
             reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
 
         if (received <= 0) {
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            // Timeout là chủ đích; ECONNRESET trên UDP chỉ là ICMP "cổng đóng" của một lần gửi trước.
+            const bool benign = err == WSAETIMEDOUT || err == WSAECONNRESET || err == WSAEINTR || err == WSAEMSGSIZE;
+#else
+            const int err = errno;
+            const bool benign = err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == ECONNREFUSED;
+#endif
+            if (!benign && running_) {
+                // Lỗi cứng liên tục (vd. WSAENETDOWN): ngủ thay vì đốt CPU.
+                std::this_thread::sleep_for(errorBackoff);
+                errorBackoff = std::min(errorBackoff * 2, std::chrono::milliseconds(1000));
+            }
             continue;
         }
+        errorBackoff = std::chrono::milliseconds(100);
 
         char ipStr[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));

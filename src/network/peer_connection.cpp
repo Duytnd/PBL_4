@@ -15,6 +15,16 @@ PeerConnection::PeerConnection(asio::ip::tcp::socket socket,
 	update_endpoint_info();
 }
 
+PeerConnection::PeerConnection(asio::ip::tcp::socket socket,
+							   std::unique_ptr<asio::io_context> owned_ioc,
+							   std::chrono::milliseconds io_timeout)
+	: owned_ioc_(std::move(owned_ioc)), socket_(std::move(socket)), io_timeout_(io_timeout) {
+	if (io_timeout_.count() < 0) {
+		throw std::invalid_argument("I/O timeout cannot be negative");
+	}
+	update_endpoint_info();
+}
+
 PeerConnection::PeerConnection(
 	std::shared_ptr<UtpStream> stream,
 	std::chrono::milliseconds io_timeout)
@@ -78,7 +88,8 @@ PeerConnection& PeerConnection::operator=(PeerConnection&& other) noexcept {
 }
 
 PeerConnection PeerConnection::connect_to(const std::string& host, std::uint16_t port,
-										  std::chrono::milliseconds io_timeout) {
+										  std::chrono::milliseconds io_timeout,
+										  const std::atomic<bool>* cancel) {
 	if (io_timeout.count() < 0) {
 		throw std::invalid_argument("I/O timeout cannot be negative");
 	}
@@ -114,8 +125,22 @@ PeerConnection PeerConnection::connect_to(const std::string& host, std::uint16_t
 							timer.cancel();
 						});
 
+	// Chạy theo lát 100 ms để hủy được giữa chừng (stop() không phải chờ hết timeout kết nối).
 	ioc->restart();
-	ioc->run();
+	bool cancelled = false;
+	while (!ioc->stopped()) {
+		ioc->run_for(std::chrono::milliseconds(100));
+		if (!cancelled && cancel != nullptr && cancel->load()) {
+			cancelled = true;
+			asio::error_code ignored;
+			socket.close(ignored);
+			timer.cancel();
+		}
+	}
+	if (cancelled) {
+		throw PeerConnectionClosedError("connection to " + host + ":" + std::to_string(port) +
+										" cancelled");
+	}
 
 	if (timed_out) {
 		throw PeerTimeoutError("connection to " + host + ":" + std::to_string(port) +
@@ -370,14 +395,16 @@ void PeerConnection::send_all(const Byte* data, std::size_t size) {
 		return;
 	}
 
-	Bytes encrypted_buf;
-	const Byte* send_ptr = data;
-	if (mse_ && mse_->is_active()) {
-		encrypted_buf.assign(data, data + size);
-		mse_->encrypt_send(encrypted_buf.data(), size);
-		send_ptr = encrypted_buf.data();
-	}
 	if (utp_stream_) {
+		// uTP: UtpStream::send_all đã có khóa ghi riêng; io_mutex_ giữ thứ tự mã hóa MSE khớp thứ tự gửi.
+		std::lock_guard<std::mutex> lock(io_mutex_);
+		Bytes encrypted_buf;
+		const Byte* send_ptr = data;
+		if (mse_ && mse_->is_active()) {
+			encrypted_buf.assign(data, data + size);
+			mse_->encrypt_send(encrypted_buf.data(), size);
+			send_ptr = encrypted_buf.data();
+		}
 		try {
 			utp_stream_->send_all(reinterpret_cast<const char*>(send_ptr), size, io_timeout_);
 		} catch (...) {
@@ -385,6 +412,48 @@ void PeerConnection::send_all(const Byte* data, std::size_t size) {
 			throw;
 		}
 		return;
+	}
+
+	{
+		// Worker chủ sở hữu đang ở trong receive_exact: chỉ xếp khung vào hàng đợi và quay về ngay,
+		// worker sẽ xả giữa các lát đọc (<= 200 ms). Không chạm socket/io_context từ luồng này.
+		std::lock_guard<std::mutex> qlock(queue_mutex_);
+		if (reader_active_) {
+			send_queue_.emplace_back(data, data + size);
+			return;
+		}
+	}
+
+	std::lock_guard<std::mutex> lock(io_mutex_);
+	drain_send_queue_locked();
+	write_tcp_locked(data, size);
+}
+
+void PeerConnection::drain_send_queue_locked() {
+	for (;;) {
+		Bytes frame;
+		{
+			std::lock_guard<std::mutex> qlock(queue_mutex_);
+			if (send_queue_.empty()) {
+				return;
+			}
+			frame = std::move(send_queue_.front());
+			send_queue_.pop_front();
+		}
+		write_tcp_locked(frame.data(), frame.size());
+	}
+}
+
+void PeerConnection::write_tcp_locked(const Byte* data, std::size_t size) {
+	if (!socket_.is_open()) {
+		throw PeerConnectionClosedError("connection is closed");
+	}
+	Bytes encrypted_buf;
+	const Byte* send_ptr = data;
+	if (mse_ && mse_->is_active()) {
+		encrypted_buf.assign(data, data + size);
+		mse_->encrypt_send(encrypted_buf.data(), size);
+		send_ptr = encrypted_buf.data();
 	}
 
 	auto& ioc = static_cast<asio::io_context&>(socket_.get_executor().context());
@@ -445,39 +514,92 @@ void PeerConnection::receive_exact(Byte* data, std::size_t size) {
 	}
 
 	auto& ioc = static_cast<asio::io_context&>(socket_.get_executor().context());
-	asio::steady_timer timer(socket_.get_executor());
-	timer.expires_after(io_timeout_);
-	bool timed_out = false;
-	asio::error_code read_ec;
+	constexpr auto kSlice = std::chrono::milliseconds(200);
 
-	timer.async_wait([&](const asio::error_code& ec) {
-		if (!ec) {
-			timed_out = true;
-			asio::error_code ignored;
-			socket_.cancel(ignored);
+	{
+		std::lock_guard<std::mutex> qlock(queue_mutex_);
+		reader_active_ = true;
+	}
+	// Khi rời hàm (kể cả do ngoại lệ) phải xả nốt hàng đợi rồi hạ cờ trong cùng một bước khóa,
+	// để khung nào xếp vào hàng đợi cũng được ghi trước khi một luồng khác tự ghi trực tiếp.
+	struct ReaderGuard {
+		PeerConnection& self;
+		~ReaderGuard() {
+			for (;;) {
+				bool closed = !self.socket_.is_open();
+				{
+					std::lock_guard<std::mutex> qlock(self.queue_mutex_);
+					if (closed || self.send_queue_.empty()) {
+						if (closed) {
+							self.send_queue_.clear();
+						}
+						self.reader_active_ = false;
+						return;
+					}
+				}
+				try {
+					std::lock_guard<std::mutex> lock(self.io_mutex_);
+					self.drain_send_queue_locked();
+				} catch (...) {
+					// Lỗi ghi đã đóng kết nối; vòng sau sẽ dọn hàng đợi.
+				}
+			}
 		}
-	});
+	} guard{*this};
 
-	asio::async_read(socket_, asio::buffer(data, size),
-					 [&](const asio::error_code& ec, std::size_t) {
-						 read_ec = ec;
-						 timer.cancel();
-					 });
+	const auto deadline = std::chrono::steady_clock::now() + io_timeout_;
+	std::size_t done = 0;
+	while (done < size) {
+		{
+			std::lock_guard<std::mutex> lock(io_mutex_);
+			drain_send_queue_locked();
+			if (!socket_.is_open()) {
+				throw PeerConnectionClosedError("connection is closed");
+			}
 
-	ioc.restart();
-	ioc.run();
+			const auto now = std::chrono::steady_clock::now();
+			auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero());
+			const auto slice = std::min<std::chrono::milliseconds>(remaining, kSlice);
 
-	if (timed_out) {
-		close();
-		throw PeerTimeoutError("I/O timed out while reading");
-	}
-	if (read_ec == asio::error::eof || read_ec == asio::error::connection_reset) {
-		close();
-		throw PeerConnectionClosedError("peer closed the connection");
-	}
-	if (read_ec) {
-		close();
-		throw std::runtime_error("read failed: " + read_ec.message());
+			asio::steady_timer timer(socket_.get_executor());
+			timer.expires_after(slice);
+			bool slice_over = false;
+			asio::error_code read_ec;
+			std::size_t got = 0;
+
+			timer.async_wait([&](const asio::error_code& ec) {
+				if (!ec) {
+					slice_over = true;
+					asio::error_code ignored;
+					socket_.cancel(ignored);
+				}
+			});
+
+			asio::async_read(socket_, asio::buffer(data + done, size - done),
+							 [&](const asio::error_code& ec, std::size_t n) {
+								 read_ec = ec;
+								 got = n;
+								 timer.cancel();
+							 });
+
+			ioc.restart();
+			ioc.run();
+			done += got;
+
+			if (read_ec == asio::error::eof || read_ec == asio::error::connection_reset) {
+				close();
+				throw PeerConnectionClosedError("peer closed the connection");
+			}
+			if (read_ec && !(slice_over && read_ec == asio::error::operation_aborted)) {
+				close();
+				throw std::runtime_error("read failed: " + read_ec.message());
+			}
+		}
+		if (done < size && std::chrono::steady_clock::now() >= deadline) {
+			close();
+			throw PeerTimeoutError("I/O timed out while reading");
+		}
 	}
 
 	if (mse_ && mse_->is_active()) {

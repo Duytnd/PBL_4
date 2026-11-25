@@ -192,7 +192,7 @@ bool KademliaNode::start() {
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-    socketHandle_ = static_cast<long long>(sock);
+    socketHandle_.store(static_cast<long long>(sock));
     const bool autoDetectIp = localIp().empty();
     if (autoDetectIp) {
         setLocalIp(detectLocalLanIp());
@@ -213,6 +213,8 @@ bool KademliaNode::start() {
 }
 
 void KademliaNode::stop() {
+    // Lần gọi thứ hai (kể cả đồng thời) chờ ở đây tới khi lần đầu dọn xong, không trả về sớm.
+    std::lock_guard<std::mutex> stopLock(stopMutex_);
     if (!running_.exchange(false)) {
         return;
     }
@@ -223,9 +225,11 @@ void KademliaNode::stop() {
     if (receiveThread_.joinable()) {
         receiveThread_.join();
     }
-    if (socketHandle_ != -1) {
-        closeSocketHandle(static_cast<SocketHandle>(socketHandle_));
-        socketHandle_ = -1;
+    // Đợi sendRaw đang gửi dở (luồng khác) xong rồi mới đóng; sau đó handle = -1 nên sendRaw không gửi nữa.
+    std::lock_guard<std::mutex> socketLock(socketMutex_);
+    const long long handle = socketHandle_.exchange(-1);
+    if (handle != -1) {
+        closeSocketHandle(static_cast<SocketHandle>(handle));
     }
 }
 
@@ -236,6 +240,7 @@ void KademliaNode::receiveLoop() {
     constexpr std::size_t kMaxLoggedSenders = 256;
     std::set<std::string> loggedSenders;
     std::size_t malformedCount = 0;
+    auto errorBackoff = std::chrono::milliseconds(100);  // lỗi thật liên tục: ngủ 100 ms, lùi dần tới 1 giây
 
     while (running_) {
         sockaddr_in fromAddr{};
@@ -244,13 +249,32 @@ void KademliaNode::receiveLoop() {
 #else
         socklen_t fromLen = sizeof(fromAddr);
 #endif
+        const long long handle = socketHandle_.load();
+        if (handle == -1) {
+            break;
+        }
         const auto received = recvfrom(
-            static_cast<SocketHandle>(socketHandle_), buffer.data(), static_cast<int>(buffer.size()), 0,
+            static_cast<SocketHandle>(handle), buffer.data(), static_cast<int>(buffer.size()), 0,
             reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
 
         if (received <= 0) {
-            continue;  // timeout hoặc không có gì - vòng lại kiểm tra running_
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            // Timeout là chủ đích (500 ms, để kiểm tra running_). WSAECONNRESET trên UDP chỉ là ICMP "cổng đóng"
+            // của một lần gửi trước, không phải lỗi socket.
+            const bool benign = err == WSAETIMEDOUT || err == WSAECONNRESET || err == WSAEINTR || err == WSAEMSGSIZE;
+#else
+            const int err = errno;
+            const bool benign = err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == ECONNREFUSED;
+#endif
+            if (!benign && running_) {
+                // Lỗi cứng liên tục (vd. WSAENETDOWN): ngủ thay vì đốt CPU trong vòng lặp.
+                std::this_thread::sleep_for(errorBackoff);
+                errorBackoff = std::min(errorBackoff * 2, std::chrono::milliseconds(1000));
+            }
+            continue;
         }
+        errorBackoff = std::chrono::milliseconds(100);
 
         char ipStr[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
@@ -279,19 +303,22 @@ void KademliaNode::receiveLoop() {
 void KademliaNode::handleIncoming(const std::string& payload, const std::string& fromIp, std::uint16_t fromPort) {
     const KrpcMessage message = Krpc::decode(payload);
 
-    routingTable_.insert(DhtContact{message.nodeId, fromIp, fromPort});
-
     if (message.type == KrpcType::Query) {
+        routingTable_.insert(DhtContact{message.nodeId, fromIp, fromPort});
         handleQuery(message, fromIp, fromPort);
         return;
     }
 
     std::lock_guard<std::mutex> lock(pendingMutex_);
     const auto it = pendingCalls_.find(message.transactionId);
-    if (it != pendingCalls_.end()) {
+    // Chỉ nhận phản hồi từ đúng địa chỉ đã được hỏi: transaction id chỉ 2 byte nên người ngoài đoán/giả mạo được.
+    if (it != pendingCalls_.end() && !it->second.done && it->second.expectedPort != 0 &&
+        it->second.expectedIp == fromIp && it->second.expectedPort == fromPort) {
         it->second.response = message;
         it->second.done = true;
         pendingCv_.notify_all();
+        // Phản hồi giả/không được hỏi (sai địa chỉ) không được chen vào routing table.
+        routingTable_.insert(DhtContact{message.nodeId, fromIp, fromPort});
     }
 }
 
@@ -318,9 +345,14 @@ void KademliaNode::handleQuery(const KrpcMessage& query, const std::string& from
             std::vector<KrpcPeerInfo> peers;
             {
                 std::lock_guard<std::mutex> lock(announcedMutex_);
+                const auto now = std::chrono::steady_clock::now();
                 const auto it = announcedPeers_.find(query.infoHash);
                 if (it != announcedPeers_.end()) {
-                    for (const auto& contact : it->second) {
+                    for (const auto& entry : it->second) {
+                        const DhtContact& contact = entry.contact;
+                        if (contact.id != selfId_ && now - entry.at > kAnnounceTtl) {
+                            continue;  // hết hạn, sẽ được dọn ở lần announce kế tiếp
+                        }
                         std::string peerIp = contact.ip;
                         if ((peerIp == "127.0.0.1" || peerIp.empty() || contact.id == selfId_) &&
                             fromIp != "127.0.0.1" && fromIp != "localhost") {
@@ -360,12 +392,32 @@ void KademliaNode::handleQuery(const KrpcMessage& query, const std::string& from
             const std::uint16_t announcePort = query.impliedPort ? fromPort : query.port;
             {
                 std::lock_guard<std::mutex> lock(announcedMutex_);
+                const auto now = std::chrono::steady_clock::now();
+                pruneAnnouncedLocked(now);
                 auto& list = announcedPeers_[query.infoHash];
-                const bool exists = std::any_of(list.begin(), list.end(), [&](const DhtContact& contact) {
-                    return contact.ip == fromIp && contact.port == announcePort;
+                const auto existing = std::find_if(list.begin(), list.end(), [&](const AnnouncedPeer& entry) {
+                    return entry.contact.ip == fromIp && entry.contact.port == announcePort;
                 });
-                if (!exists) {
-                    list.push_back(DhtContact{query.nodeId, fromIp, announcePort});
+                if (existing != list.end()) {
+                    existing->at = now;  // announce lại: gia hạn
+                } else if (announcedTotal_ < kMaxAnnouncedTotal) {
+                    if (list.size() >= kMaxAnnouncedPerHash) {
+                        // Đầy theo info_hash: bỏ peer cũ nhất (trừ bản ghi của chính node này) để nhường chỗ.
+                        const auto oldest = std::find_if(list.begin(), list.end(), [&](const AnnouncedPeer& entry) {
+                            return entry.contact.id != selfId_;
+                        });
+                        if (oldest != list.end()) {
+                            list.erase(oldest);
+                            --announcedTotal_;
+                        }
+                    }
+                    if (list.size() < kMaxAnnouncedPerHash) {
+                        list.push_back(AnnouncedPeer{DhtContact{query.nodeId, fromIp, announcePort}, now});
+                        ++announcedTotal_;
+                    }
+                }
+                if (list.empty()) {
+                    announcedPeers_.erase(query.infoHash);
                 }
             }
             sendRaw(fromIp, fromPort, Krpc::encodeAnnouncePeerResponse(query.transactionId, selfId_));
@@ -377,8 +429,27 @@ void KademliaNode::handleQuery(const KrpcMessage& query, const std::string& from
     }
 }
 
+void KademliaNode::pruneAnnouncedLocked(std::chrono::steady_clock::time_point now) {
+    // Dọn tối đa mỗi 10 giây (không quét toàn bộ ở mỗi lần chèn). Bản ghi của chính node này không hết hạn.
+    if (lastAnnouncedPrune_ != std::chrono::steady_clock::time_point{} &&
+        now - lastAnnouncedPrune_ < std::chrono::seconds(10)) {
+        return;
+    }
+    lastAnnouncedPrune_ = now;
+    for (auto it = announcedPeers_.begin(); it != announcedPeers_.end();) {
+        auto& list = it->second;
+        const auto before = list.size();
+        list.erase(std::remove_if(list.begin(), list.end(), [&](const AnnouncedPeer& entry) {
+                       return entry.contact.id != selfId_ && now - entry.at > kAnnounceTtl;
+                   }),
+                   list.end());
+        announcedTotal_ -= before - list.size();
+        it = list.empty() ? announcedPeers_.erase(it) : std::next(it);
+    }
+}
+
 void KademliaNode::sendRaw(const std::string& host, std::uint16_t port, const std::string& payload) {
-    if (socketHandle_ == -1) {
+    if (socketHandle_.load() == -1) {
         return;
     }
 
@@ -394,9 +465,18 @@ void KademliaNode::sendRaw(const std::string& host, std::uint16_t port, const st
         return;
     }
 
-    const auto sent = sendto(static_cast<SocketHandle>(socketHandle_), payload.data(),
-                             static_cast<int>(payload.size()), 0, result->ai_addr,
-                             static_cast<int>(result->ai_addrlen));
+    long long sent = -1;
+    {
+        std::lock_guard<std::mutex> socketLock(socketMutex_);
+        const long long handle = socketHandle_.load();
+        if (handle == -1) {
+            freeaddrinfo(result);
+            return;
+        }
+        sent = sendto(static_cast<SocketHandle>(handle), payload.data(),
+                      static_cast<int>(payload.size()), 0, result->ai_addr,
+                      static_cast<int>(result->ai_addrlen));
+    }
     if (sent < 0) {
 #ifdef _WIN32
         const int err = WSAGetLastError();
@@ -409,12 +489,20 @@ void KademliaNode::sendRaw(const std::string& host, std::uint16_t port, const st
 }
 
 std::string KademliaNode::makeTransactionId() {
-    std::random_device rd;
-    std::mt19937 rng(rd());
+    thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<int> dist(0, 255);
     std::string id(2, '\0');
-    id[0] = static_cast<char>(dist(rng));
-    id[1] = static_cast<char>(dist(rng));
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    // Tránh id đang được truy vấn khác dùng; đặt chỗ ngay để hai luồng không cùng lấy một id.
+    // Không gian id chỉ 65536: nếu gần cạn thì chấp nhận id trùng (sendAndWait sẽ ghi đè) thay vì lặp mãi.
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        id[0] = static_cast<char>(dist(rng));
+        id[1] = static_cast<char>(dist(rng));
+        if (pendingCalls_.find(id) == pendingCalls_.end()) {
+            break;
+        }
+    }
+    pendingCalls_[id] = PendingCall{};
     return id;
 }
 
@@ -425,12 +513,34 @@ std::string KademliaNode::tokenFor(const std::string& ip, std::uint16_t port) co
 bool KademliaNode::sendAndWait(
     const std::string& host, std::uint16_t port, const std::string& transactionId,
     const std::string& payload, KrpcMessage& outResponse, std::chrono::milliseconds timeout) {
+    // Phân giải đích thành IPv4 một lần: phản hồi phải đến từ đúng địa chỉ này (xem handleIncoming).
+    std::string targetIp = host;
+    if (!is_valid_ipv4(targetIp)) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* result = nullptr;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0 || result == nullptr) {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            pendingCalls_.erase(transactionId);
+            std::cerr << "[DHT] cannot resolve " << host << ":" << port << " (need an IPv4 address or hostname)"
+                      << std::endl;
+            return false;
+        }
+        char ipStr[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr, ipStr, sizeof(ipStr));
+        freeaddrinfo(result);
+        targetIp = ipStr;
+    }
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
-        pendingCalls_[transactionId] = PendingCall{};
+        PendingCall call;
+        call.expectedIp = targetIp;
+        call.expectedPort = port;
+        pendingCalls_[transactionId] = std::move(call);
     }
 
-    sendRaw(host, port, payload);
+    sendRaw(targetIp, port, payload);
 
     std::unique_lock<std::mutex> lock(pendingMutex_);
     const bool arrived = pendingCv_.wait_for(lock, timeout, [&]() {
@@ -609,18 +719,27 @@ void KademliaNode::announcePeer(const std::string& infoHash, std::uint16_t annou
 
     // Tự ghi nhận chính mình đang seed info_hash này để trả lời get_peers từ node khác.
     std::lock_guard<std::mutex> lock(announcedMutex_);
+    const auto now = std::chrono::steady_clock::now();
+    pruneAnnouncedLocked(now);
     auto& list = announcedPeers_[infoHash];
     const std::string configuredIp = localIp();
     const std::string myIp = !configuredIp.empty() ? configuredIp : detectLocalLanIp();
-    auto self = std::find_if(list.begin(), list.end(), [&](const DhtContact& contact) {
-        return contact.id == selfId_;
+    auto self = std::find_if(list.begin(), list.end(), [&](const AnnouncedPeer& entry) {
+        return entry.contact.id == selfId_;
     });
     if (self == list.end()) {
-        list.push_back(DhtContact{selfId_, myIp, announcePort});
+        // Bản ghi của chính mình luôn được nhận (nhường chỗ nếu info_hash đã đầy bởi peer ngoài).
+        if (list.size() >= kMaxAnnouncedPerHash && !list.empty()) {
+            list.erase(list.begin());
+            --announcedTotal_;
+        }
+        list.push_back(AnnouncedPeer{DhtContact{selfId_, myIp, announcePort}, now});
+        ++announcedTotal_;
     } else {
         // Torrent bị xóa rồi thêm lại sẽ nghe ở cổng TCP mới: luôn làm mới cổng, nếu không DHT mãi trả cổng cũ đã đóng.
-        self->ip = myIp;
-        self->port = announcePort;
+        self->contact.ip = myIp;
+        self->contact.port = announcePort;
+        self->at = now;
     }
 }
 

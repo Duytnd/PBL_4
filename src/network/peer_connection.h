@@ -3,9 +3,12 @@
 #include "encryption.h"
 #include "peer_protocol.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -35,6 +38,12 @@ public:
 	explicit PeerConnection(
 		asio::ip::tcp::socket socket,
 		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
+	// Socket kết nối VÀO: io_context riêng của kết nối (không dùng chung với acceptor),
+	// socket phải được tạo trên chính io_context đó.
+	PeerConnection(
+		asio::ip::tcp::socket socket,
+		std::unique_ptr<asio::io_context> owned_ioc,
+		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
 	explicit PeerConnection(
 		std::shared_ptr<UtpStream> stream,
 		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
@@ -51,7 +60,8 @@ public:
 	static PeerConnection connect_to(
 		const std::string& host,
 		std::uint16_t port,
-		std::chrono::milliseconds io_timeout = std::chrono::seconds(30));
+		std::chrono::milliseconds io_timeout = std::chrono::seconds(30),
+		const std::atomic<bool>* cancel = nullptr);  // cancel đặt true: bỏ dở việc kết nối (trong ~100 ms)
 	static PeerConnection connect_utp_to(
 		const std::shared_ptr<UtpEngine>& engine,
 		const asio::ip::udp::endpoint& endpoint,
@@ -156,6 +166,18 @@ private:
 
 	void send_all(const Byte* data, std::size_t size);
 	void receive_exact(Byte* data, std::size_t size);
+	// Ghi đồng bộ một khối lên socket TCP; chỉ gọi khi đang giữ io_mutex_.
+	void write_tcp_locked(const Byte* data, std::size_t size);
+	// Xả hàng đợi gửi (khung do luồng khác gửi trong lúc worker đang nhận); giữ io_mutex_.
+	void drain_send_queue_locked();
+
+	// Mô hình luồng cho TCP: io_context của kết nối chỉ được chạy bởi một luồng tại một thời điểm
+	// (io_mutex_). Worker đang nhận thì chia thời gian đọc thành lát ngắn, giữa các lát nó xả
+	// hàng đợi gửi; luồng khác gửi trong lúc đó chỉ xếp khung vào hàng đợi rồi quay về ngay.
+	std::mutex io_mutex_;
+	std::mutex queue_mutex_;
+	std::deque<Bytes> send_queue_;
+	bool reader_active_ = false;
 	void update_endpoint_info();
 	std::unique_ptr<MseSession> mse_;
 	EncryptionPolicy encryption_policy_{EncryptionPolicy::Tolerant};

@@ -4,10 +4,12 @@
 #include "../src/network/peer_connection.h"
 #include "../src/network/utp_engine.h"
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <future>
 #include <thread>
 #include <vector>
@@ -394,6 +396,128 @@ void test_utp_allowlist_entry_expires() {
 	std::cout << "PASSED\n";
 }
 
+// E1: nhiều luồng cùng gửi trên MỘT kết nối trong lúc luồng chủ sở hữu đang nhận.
+// Khung phải nguyên vẹn, đủ số lượng, và từng luồng đúng thứ tự.
+void test_concurrent_senders_on_one_connection() {
+	std::cout << "[TEST] Concurrent senders on one TCP connection keep frames intact... ";
+
+	asio::io_context server_ioc;
+	asio::ip::tcp::acceptor acceptor(server_ioc,
+									 asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+	const auto port = acceptor.local_endpoint().port();
+
+	constexpr int kSenders = 3;
+	constexpr int kFramesPerSender = 300;
+
+	auto work = std::async(std::launch::async, [&]() {
+		auto x = std::make_shared<PeerConnection>(
+			PeerConnection::connect_to("127.0.0.1", port, std::chrono::seconds(5)));
+		auto y_sock = acceptor.accept();
+		PeerConnection y(std::move(y_sock), std::chrono::seconds(5));
+
+		// Luồng thứ tư: chủ sở hữu của x, ở trong receive_message tới khi nhận keep-alive kết thúc.
+		std::atomic<bool> reader_done{false};
+		std::thread reader([&]() {
+			try {
+				for (;;) {
+					const auto msg = x->receive_message();
+					if (msg.keep_alive) break;
+				}
+			} catch (...) {
+			}
+			reader_done = true;
+		});
+
+		std::vector<std::thread> senders;
+		for (int t = 0; t < kSenders; ++t) {
+			senders.emplace_back([&, t]() {
+				try {
+					for (int seq = 0; seq < kFramesPerSender; ++seq) {
+						Bytes data(1000 + static_cast<std::size_t>(seq % 50) * 100,
+								   static_cast<Byte>(t * 31 + seq));
+						x->send_piece(static_cast<std::uint32_t>(t), static_cast<std::uint32_t>(seq), data);
+					}
+				} catch (...) {
+				}
+			});
+		}
+
+		std::array<int, kSenders> next{};
+		bool ok = true;
+		try {
+			for (int i = 0; i < kSenders * kFramesPerSender; ++i) {
+				const auto msg = y.receive_message();
+				if (msg.keep_alive || msg.id != static_cast<Byte>(PeerMessageId::Piece)) { ok = false; break; }
+				const auto piece = peer_protocol::parse_piece(msg);
+				if (piece.index >= static_cast<std::uint32_t>(kSenders)) { ok = false; break; }
+				const int t = static_cast<int>(piece.index);
+				const int seq = static_cast<int>(piece.begin);
+				const std::size_t expect_size = 1000 + static_cast<std::size_t>(seq % 50) * 100;
+				if (seq != next[t] || piece.data.size() != expect_size) { ok = false; break; }
+				for (auto b : piece.data) {
+					if (b != static_cast<Byte>(t * 31 + seq)) { ok = false; break; }
+				}
+				if (!ok) break;
+				++next[t];
+			}
+		} catch (...) {
+			ok = false;
+		}
+		for (auto& th : senders) th.join();
+		y.send_keep_alive();  // cho luồng nhận của x thoát
+		reader.join();
+		y.close();
+		x->close();
+		for (int t = 0; t < kSenders; ++t) {
+			if (next[t] != kFramesPerSender) ok = false;
+		}
+		return ok;
+	});
+
+	assert(work.wait_for(std::chrono::seconds(20)) == std::future_status::ready);
+	assert(work.get());
+	std::cout << "PASSED\n";
+}
+
+// E1: các kết nối VÀO có io_context riêng nên hai worker nhận đồng thời không chặn nhau.
+void test_inbound_connections_do_not_share_io_context() {
+	std::cout << "[TEST] Two inbound connections read concurrently without blocking each other... ";
+
+	asio::io_context accept_ioc;
+	asio::ip::tcp::acceptor acceptor(accept_ioc,
+									 asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+	const auto port = acceptor.local_endpoint().port();
+
+	auto work = std::async(std::launch::async, [&]() {
+		std::vector<PeerConnection> clients;
+		std::vector<std::unique_ptr<PeerConnection>> inbound;
+		for (int i = 0; i < 2; ++i) {
+			clients.push_back(PeerConnection::connect_to("127.0.0.1", port, std::chrono::seconds(5)));
+			auto ioc = std::make_unique<asio::io_context>();
+			asio::ip::tcp::socket sock(*ioc);
+			acceptor.accept(sock);
+			inbound.push_back(std::make_unique<PeerConnection>(
+				std::move(sock), std::move(ioc), std::chrono::seconds(8)));
+		}
+		// Worker 0 chờ dữ liệu không bao giờ tới (tới khi bị đóng); worker 1 phải vẫn nhận được ngay.
+		std::thread blocked([&]() {
+			try { inbound[0]->receive_message(); } catch (...) {}
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		clients[1].send_keep_alive();
+		const auto start = std::chrono::steady_clock::now();
+		const auto msg = inbound[1]->receive_message();
+		const auto took = std::chrono::steady_clock::now() - start;
+		clients[0].close();
+		blocked.join();
+		return msg.keep_alive && took < std::chrono::seconds(2);
+	});
+
+	assert(work.wait_for(std::chrono::seconds(20)) == std::future_status::ready);
+	assert(work.get());
+	std::cout << "PASSED\n";
+}
+
 int main() {
 	std::cout << "========================================\n";
 	std::cout << " RUNNING PEER CONNECTION INTEGRATION TESTS\n";
@@ -406,6 +530,8 @@ int main() {
 	test_utp_peer_connection_exchange();
 	test_utp_firewall_rejects_unlisted_endpoints();
 	test_utp_allowlist_entry_expires();
+	test_concurrent_senders_on_one_connection();
+	test_inbound_connections_do_not_share_io_context();
 
 	std::cout << "========================================\n";
 	std::cout << " ALL PEER CONNECTION TESTS PASSED!\n";
