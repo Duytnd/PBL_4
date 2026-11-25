@@ -14,6 +14,7 @@
 #include "webui/state_bridge.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -81,6 +82,8 @@ std::string defaultAnnounceUrl() {
 }
 
 constexpr std::size_t kDefaultPieceLength = 262144;
+constexpr std::size_t kMinPieceLength = 16 * 1024;
+constexpr std::size_t kMaxPieceLength = 16 * 1024 * 1024;
 constexpr std::size_t kMaxUploadBytes = 256ull * 1024 * 1024;
 
 std::string rfc5987Encode(const std::string& value) {
@@ -131,7 +134,9 @@ std::size_t parsePieceLength(const httplib::MultipartFormData& form) {
     }
     try {
         const long long value = std::stoll(form.get_field("piece_length"));
-        if (value <= 0) {
+        // Lũy thừa của 2 trong [16 KiB, 16 MiB]; ngoài khoảng (vd. 1 byte sinh hàng trăm triệu hash) thì dùng mặc định.
+        if (value < static_cast<long long>(kMinPieceLength) || value > static_cast<long long>(kMaxPieceLength) ||
+            (value & (value - 1)) != 0) {
             return kDefaultPieceLength;
         }
         return static_cast<std::size_t>(value);
@@ -381,10 +386,18 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    const httplib::FormData upload = req.form.get_file("file");
+    const httplib::FormData& upload = req.form.get_file("file");  // tham chiếu: không sao chép cả body
     if (upload.content.size() > kMaxUploadBytes) {
         res.status = 413;
         res.set_content("File too large", "text/plain");
+        return;
+    }
+
+    // Kiểm tra mọi tham số TRƯỚC khi ghi file lên đĩa: lỗi 400 không được để lại file mồ côi.
+    const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
+    if (!nameOverride.empty() && !PathSanitizer::isSafeRelativePath(nameOverride)) {
+        res.status = 400;
+        res.set_content("Invalid torrent name", "text/plain");
         return;
     }
 
@@ -392,8 +405,40 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
     std::error_code ec;
     std::filesystem::create_directories(downloadDir, ec);
 
-    const std::filesystem::path sourceName = safeFileName(upload.filename);
-    const std::filesystem::path persistentPath = downloadDir / sourceName;
+    // Không ghi đè file có sẵn (có thể đang được seed/tải bởi phiên khác): đặt tên "ten (1).ext", "ten (2).ext"...
+    std::filesystem::path sourceName = safeFileName(upload.filename);
+    std::filesystem::path persistentPath = downloadDir / sourceName;
+    if (std::filesystem::exists(persistentPath, ec)) {
+        const std::filesystem::path stem = sourceName.stem();
+        const std::filesystem::path extension = sourceName.extension();
+        bool found = false;
+        for (int suffix = 1; suffix <= 100 && !found; ++suffix) {
+            std::filesystem::path candidate =
+                stem.string() + " (" + std::to_string(suffix) + ")" + extension.string();
+            if (!std::filesystem::exists(downloadDir / candidate, ec)) {
+                sourceName = candidate;
+                persistentPath = downloadDir / sourceName;
+                found = true;
+            }
+        }
+        if (!found) {
+            res.status = 409;
+            res.set_content("A file with this name already exists", "text/plain");
+            return;
+        }
+    }
+
+    const std::string announce = req.form.has_field("announce") && !req.form.get_field("announce").empty()
+        ? req.form.get_field("announce")
+        : defaultAnnounceUrl();
+    const std::size_t pieceLength = parsePieceLength(req.form);
+    const bool enableTracker = parseBoolField(req.form, "enable_tracker", true);
+    const bool enableDht = parseBoolField(req.form, "enable_dht", true);
+    const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
+    const std::string rawDhtBootstrapHost = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
+    const std::uint16_t rawDhtBootstrapPort = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
+    const auto [dhtBootstrapHost, dhtBootstrapPort] =
+        withTrackerBootstrapFallback(rawDhtBootstrapHost, rawDhtBootstrapPort, announce);
 
     {
         std::ofstream output(persistentPath, std::ios::binary);
@@ -403,24 +448,6 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
             return;
         }
         output.write(upload.content.data(), static_cast<std::streamsize>(upload.content.size()));
-    }
-
-    const std::string announce = req.form.has_field("announce") && !req.form.get_field("announce").empty()
-        ? req.form.get_field("announce")
-        : defaultAnnounceUrl();
-    const std::size_t pieceLength = parsePieceLength(req.form);
-    const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
-    const bool enableTracker = parseBoolField(req.form, "enable_tracker", true);
-    const bool enableDht = parseBoolField(req.form, "enable_dht", true);
-    const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
-    const std::string rawDhtBootstrapHost = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
-    const std::uint16_t rawDhtBootstrapPort = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
-    const auto [dhtBootstrapHost, dhtBootstrapPort] =
-        withTrackerBootstrapFallback(rawDhtBootstrapHost, rawDhtBootstrapPort, announce);
-    if (!nameOverride.empty() && !PathSanitizer::isSafeRelativePath(nameOverride)) {
-        res.status = 400;
-        res.set_content("Invalid torrent name", "text/plain");
-        return;
     }
 
     try {
@@ -457,7 +484,7 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
                 res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
                 return;
             }
-            StateBridge::instance().addSession(session, magnetUri);
+            StateBridge::instance().addSession(session, magnetUri, {config.enable_tracker, config.enable_dht, config.enable_lsd});
         }
 
         const std::string downloadName =
@@ -523,7 +550,7 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
                 res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
                 return;
             }
-            StateBridge::instance().addSession(session, magnetUri);
+            StateBridge::instance().addSession(session, magnetUri, {config.enable_tracker, config.enable_dht, config.enable_lsd});
         }
 
         res.status = 200;
@@ -534,6 +561,30 @@ void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
     }
 }
 
+// Bộ đếm nguyên tử số lần resolve magnet đang chạy; RAII nên mọi đường thoát (return/throw) đều trả lại slot.
+std::atomic<int> g_activeMagnetLookups{0};
+constexpr int kMaxMagnetLookups = 3;
+
+class MagnetLookupSlot {
+public:
+    MagnetLookupSlot() {
+        if (g_activeMagnetLookups.fetch_add(1) < kMaxMagnetLookups) {
+            acquired_ = true;
+        } else {
+            g_activeMagnetLookups.fetch_sub(1);
+        }
+    }
+    ~MagnetLookupSlot() {
+        if (acquired_) g_activeMagnetLookups.fetch_sub(1);
+    }
+    MagnetLookupSlot(const MagnetLookupSlot&) = delete;
+    MagnetLookupSlot& operator=(const MagnetLookupSlot&) = delete;
+    bool acquired() const { return acquired_; }
+
+private:
+    bool acquired_ = false;
+};
+
 void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
     if (!req.form.has_field("magnet_uri")) {
         res.status = 400;
@@ -542,8 +593,24 @@ void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
     }
 
     const std::string magnetUri = req.form.get_field("magnet_uri");
+    // Ký tự điều khiển (nhất là CR/LF) chèn được dòng lạ vào file .meta khi lưu trạng thái.
+    if (std::any_of(magnetUri.begin(), magnetUri.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; })) {
+        res.status = 400;
+        res.set_content("Invalid magnet_uri: control characters are not allowed", "text/plain");
+        return;
+    }
     try {
         const auto magnet = network::parse_magnet_uri(magnetUri);
+
+        // resolve_magnet_uri giữ nguyên một luồng worker của httplib tới khi xong/timeout: giới hạn số lần chạy
+        // đồng thời để vài magnet không có peer không làm treo mọi API khác.
+        const MagnetLookupSlot lookupSlot;
+        if (!lookupSlot.acquired()) {
+            res.status = 429;
+            res.set_content("{\"status\":\"error\",\"message\":\"Too many magnet lookups in progress\"}",
+                            "application/json");
+            return;
+        }
         const std::filesystem::path downloadDir = resolveDownloadDir();
         std::error_code ec;
         std::filesystem::create_directories(downloadDir, ec);
@@ -592,7 +659,7 @@ void handleAddMagnet(const httplib::Request& req, httplib::Response& res) {
                 res.set_content("Failed to start torrent session", "text/plain");
                 return;
             }
-            StateBridge::instance().addSession(session, magnetUri);
+            StateBridge::instance().addSession(session, magnetUri, {config.enable_tracker, config.enable_dht, config.enable_lsd});
         }
 
         res.status = 200;
@@ -778,7 +845,11 @@ void handleLimitTorrent(const httplib::Request& req, httplib::Response& res) {
     auto session = findSessionOrReply(req, res, hash);
     if (!session) return;
     constexpr unsigned long long kMaxKiBps = 1024ULL * 1024ULL;  // 1 GiB/s: đủ lớn, chặn tràn số
-    for (const char* key : {"down", "up"}) {
+    // Nguyên tử: kiểm tra CẢ HAI tham số trước, chỉ áp dụng khi cả hai hợp lệ (không để "down" đổi rồi "up" báo lỗi).
+    std::optional<unsigned long long> parsed[2];
+    const char* keys[2] = {"down", "up"};
+    for (int i = 0; i < 2; ++i) {
+        const char* key = keys[i];
         if (!req.has_param(key)) continue;
         unsigned long long kib = 0;
         try {
@@ -797,9 +868,10 @@ void handleLimitTorrent(const httplib::Request& req, httplib::Response& res) {
             res.set_content(std::string("Value of ") + key + " is too large", "text/plain");
             return;
         }
-        if (std::string(key) == "down") session->set_download_limit(kib * 1024ULL);
-        else session->set_upload_limit(kib * 1024ULL);
+        parsed[i] = kib;
     }
+    if (parsed[0]) session->set_download_limit(*parsed[0] * 1024ULL);
+    if (parsed[1]) session->set_upload_limit(*parsed[1] * 1024ULL);
     StateBridge::instance().persistState(hash);
     res.set_content("{\"status\":\"ok\"}", "application/json");
 }
@@ -871,15 +943,17 @@ void restoreSavedTorrents() {
             StateBridge::instance().applyGlobalLimiters(config);
             config.download_dir = downloadDir;
             config.listen_port = StateBridge::instance().allocatePort();
-            config.enable_tracker = true;
-            config.enable_lsd = true;
-            config.enable_dht = true;
+            config.enable_tracker = saved.enable_tracker;
+            config.enable_lsd = saved.enable_lsd;
+            config.enable_dht = saved.enable_dht;
             config.max_download_rate = saved.download_limit;
             config.max_upload_rate = saved.upload_limit;
             std::tie(config.dht_bootstrap_host, config.dht_bootstrap_port) =
                 withTrackerBootstrapFallback(defaultDhtHost, defaultDhtPort, saved.metadata.announce);
-            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
-                6881, config.dht_bootstrap_host, config.dht_bootstrap_port);
+            if (config.enable_dht) {
+                config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
+                    6881, config.dht_bootstrap_host, config.dht_bootstrap_port);
+            }
 
             auto session = std::make_shared<TorrentSession>(saved.metadata, config);
             if (!session->start()) {
@@ -894,24 +968,26 @@ void restoreSavedTorrents() {
                 session->set_file_selection(wanted);  // lựa chọn hỏng (bỏ hết file) thì giữ mặc định: tải hết
             }
             if (saved.paused) session->pause();
-            StateBridge::instance().addSession(session, saved.magnet_uri);
+            StateBridge::instance().addSession(
+                session, saved.magnet_uri, {saved.enable_tracker, saved.enable_dht, saved.enable_lsd});
         } catch (const std::exception& e) {
             std::cerr << "[STATE] Failed to restore torrent: " << e.what() << std::endl;
         }
     }
 }
 
-std::string getMimeType(const std::string& extension) {
+// Content-Type cho các loại AN TOÀN để hiển thị inline (ảnh raster, audio/video, pdf, text/plain). Loại khác trả về
+// chuỗi rỗng: phải gửi dạng tải về (svg/xml/html/js... chạy được script cùng origin với WebUI nếu mở inline).
+std::string getInlineMimeType(const std::string& extension) {
     std::string ext = extension;
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
     if (ext == ".png") return "image/png";
     if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
     if (ext == ".gif") return "image/gif";
     if (ext == ".webp") return "image/webp";
-    if (ext == ".svg") return "image/svg+xml";
     if (ext == ".bmp") return "image/bmp";
     if (ext == ".ico") return "image/x-icon";
-    if (ext == ".mp4") return "video/mp4";
+    if (ext == ".mp4" || ext == ".m4v") return "video/mp4";
     if (ext == ".mov") return "video/quicktime";
     if (ext == ".webm") return "video/webm";
     if (ext == ".mkv") return "video/x-matroska";
@@ -920,22 +996,11 @@ std::string getMimeType(const std::string& extension) {
     if (ext == ".wav") return "audio/wav";
     if (ext == ".ogg") return "audio/ogg";
     if (ext == ".flac") return "audio/flac";
+    if (ext == ".m4a") return "audio/mp4";
+    if (ext == ".aac") return "audio/aac";
     if (ext == ".pdf") return "application/pdf";
-    if (ext == ".doc") return "application/msword";
-    if (ext == ".docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    if (ext == ".xls") return "application/vnd.ms-excel";
-    if (ext == ".xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-    if (ext == ".ppt") return "application/vnd.ms-powerpoint";
-    if (ext == ".pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     if (ext == ".txt") return "text/plain; charset=utf-8";
-    if (ext == ".csv") return "text/csv; charset=utf-8";
-    if (ext == ".json") return "application/json";
-    if (ext == ".xml") return "application/xml";
-    if (ext == ".zip") return "application/zip";
-    if (ext == ".rar") return "application/x-rar-compressed";
-    if (ext == ".7z") return "application/x-7z-compressed";
-    if (ext == ".tar" || ext == ".gz") return "application/gzip";
-    return "application/octet-stream";
+    return "";
 }
 
 // Đường dẫn tương đối (dạng "a/b/c.png") của một file đã tải, nằm dưới thư mục tải về. Chỉ nhận file thường:
@@ -1057,18 +1122,19 @@ void handleFileContent(const httplib::Request& req, httplib::Response& res) {
             return;
         }
 
+        // Cùng đường kiểm tra với nhánh "path": chặn symlink và ":" (luồng dữ liệu phụ NTFS "file:stream").
         safeName = safeFileName(name);
-        filePath = resolveDownloadDir() / safeName;
-
-        if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+        const auto resolved = resolveDownloadedFile(safeName.u8string());
+        if (!resolved) {
             res.status = 404;
             res.set_content("File not found", "text/plain");
             return;
         }
+        filePath = *resolved;
     }
 
     const std::string ext = filePath.extension().string();
-    const std::string mime = getMimeType(ext);
+    const std::string inlineMime = getInlineMimeType(ext);
 
     std::ifstream file(filePath, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -1079,15 +1145,37 @@ void handleFileContent(const httplib::Request& req, httplib::Response& res) {
 
     const auto fileSize = file.tellg();
     file.seekg(0, std::ios::beg);
+    if (fileSize < 0) {
+        res.status = 500;
+        res.set_content("Failed to read file", "text/plain");
+        return;
+    }
+    // Đọc cả file vào bộ nhớ: file lớn phải mở trực tiếp trên máy (chưa hỗ trợ Range/streaming).
+    constexpr std::streamoff kMaxPreviewBytes = 128LL * 1024 * 1024;
+    if (fileSize > kMaxPreviewBytes) {
+        res.status = 413;
+        res.set_content("{\"status\":\"error\",\"message\":\"File too large to preview; open the file on the "
+                        "computer instead\"}",
+                        "application/json");
+        return;
+    }
 
     std::string buffer;
     buffer.resize(static_cast<std::size_t>(fileSize));
     file.read(&buffer[0], fileSize);
 
     res.status = 200;
-    res.set_header("Content-Disposition", "inline; filename=\"" + asciiFallbackName(safeName.string()) + "\"");
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_content(std::move(buffer), mime);
+    res.set_header("X-Content-Type-Options", "nosniff");
+    res.set_header("Content-Security-Policy",
+                   "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'");
+    if (inlineMime.empty()) {
+        // Loại không an toàn để hiển thị (svg, xml, html, js...): ép tải về, không cho trình duyệt thực thi.
+        res.set_header("Content-Disposition", buildContentDisposition(safeName.u8string()));
+        res.set_content(std::move(buffer), "application/octet-stream");
+    } else {
+        res.set_header("Content-Disposition", "inline; filename=\"" + asciiFallbackName(safeName.string()) + "\"");
+        res.set_content(std::move(buffer), inlineMime);
+    }
 }
 
 // Mở file/thư mục bằng ứng dụng mặc định của hệ điều hành mà KHÔNG đi qua shell, nên tên file chứa ký tự

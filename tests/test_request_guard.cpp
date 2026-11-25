@@ -117,6 +117,38 @@ void testOpenableDirectoryName() {
     CHECK(!isOpenableDirectoryName("trailing."));
 }
 
+void testLoopbackAddress() {
+    CHECK(isLoopbackAddress("127.0.0.1"));
+    CHECK(isLoopbackAddress("127.5.6.7"));
+    CHECK(isLoopbackAddress("::1"));
+    CHECK(isLoopbackAddress("[::1]"));
+    CHECK(isLoopbackAddress("::ffff:127.0.0.1"));
+    CHECK(isLoopbackAddress("::FFFF:127.1.2.3"));
+    CHECK(!isLoopbackAddress("192.168.1.5"));
+    CHECK(!isLoopbackAddress("10.0.0.1"));
+    CHECK(!isLoopbackAddress("0.0.0.0"));
+    CHECK(!isLoopbackAddress("128.0.0.1"));
+    CHECK(!isLoopbackAddress("127.0.0.1.evil.com"));
+    CHECK(!isLoopbackAddress("127.0.0"));
+    CHECK(!isLoopbackAddress("127.0.0.256"));
+    CHECK(!isLoopbackAddress("::ffff:192.168.1.1"));
+    CHECK(!isLoopbackAddress("::2"));
+    CHECK(!isLoopbackAddress("fe80::1"));
+    CHECK(!isLoopbackAddress("localhost"));
+    CHECK(!isLoopbackAddress(""));
+    CHECK(!isLoopbackAddress("garbage"));
+    CHECK(!isLoopbackAddress("::1 "));
+}
+
+void testOpenableFileNameBlocksMacroCapableOffice() {
+    for (const char* bad : {"a.doc", "a.xls", "a.ppt", "a.rtf", "a.docm", "a.xlsm", "a.pptm", "a.dotm"}) {
+        CHECK(!isOpenableFileName(bad));
+    }
+    for (const char* ok : {"a.docx", "a.xlsx", "a.pptx"}) {
+        CHECK(isOpenableFileName(ok));
+    }
+}
+
 int main() {
     RUN(testAllowedHostAcceptsLocalAndPrivateLiterals);
     RUN(testAllowedHostRejectsDnsRebindingNames);
@@ -126,5 +158,7 @@ int main() {
     RUN(testOpenableFileNameBlocksExecutablesAndDisguises);
     RUN(testOpenableFileNameBlocksShellMetacharacters);
     RUN(testOpenableDirectoryName);
+    RUN(testLoopbackAddress);
+    RUN(testOpenableFileNameBlocksMacroCapableOffice);
     return TEST_REPORT();
 }

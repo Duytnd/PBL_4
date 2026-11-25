@@ -87,6 +87,21 @@ bool isAllowedHost(const std::string& value) {
            (o[0] == 100 && o[1] >= 64 && o[1] <= 127);
 }
 
+bool isLoopbackAddress(const std::string& address) {
+    std::string a = toLower(address);
+    if (a.size() >= 2 && a.front() == '[' && a.back() == ']') {
+        a = a.substr(1, a.size() - 2);
+    }
+    if (a == "::1") {
+        return true;
+    }
+    if (a.rfind("::ffff:", 0) == 0) {
+        a.erase(0, 7);  // IPv4-mapped IPv6
+    }
+    std::array<int, 4> o{};
+    return parseIpv4(a, o) && o[0] == 127;
+}
+
 bool isSameOrigin(const std::string& origin, const std::string& hostHeader) {
     if (origin.empty()) {
         return true;
@@ -152,7 +167,9 @@ bool isOpenableFileName(const std::string& fileName) {
         // âm thanh
         "mp3", "wav", "ogg", "flac", "m4a", "aac",
         // tài liệu
-        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf",
+        // không có doc/xls/ppt/rtf (định dạng cũ cho phép macro/đối tượng nhúng): file ghi ra không có Mark-of-the-Web
+        // nên Office không bật Protected View
+        "pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp",
         // văn bản
         "txt", "md", "csv", "json", "log", "xml", "yaml", "yml", "ini",
         // nén (chỉ mở trình xem, không tự giải nén/chạy)
