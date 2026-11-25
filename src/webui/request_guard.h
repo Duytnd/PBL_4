@@ -13,6 +13,10 @@ namespace p2p::webui {
 // như 10.evil.com), và 172.x ngoài 172.16-31 (vd. 172.217.x.x của Google) cũng không qua.
 bool isAllowedHost(const std::string& value);
 
+// Địa chỉ peer của kết nối (req.remote_addr) có phải loopback không: 127.0.0.0/8, "::1", "::ffff:127.x.x.x".
+// Chuỗi rỗng hay không phải IP literal hợp lệ đều bị từ chối.
+bool isLoopbackAddress(const std::string& address);
+
 // Request đổi trạng thái phải cùng nguồn gốc: header Origin (nếu có) phải đúng "http://<Host>".
 // Origin rỗng (công cụ dòng lệnh như curl) được chấp nhận; "null" bị từ chối.
 bool isSameOrigin(const std::string& origin, const std::string& hostHeader);

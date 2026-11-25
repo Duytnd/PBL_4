@@ -21,7 +21,8 @@ StateBridge::~StateBridge() {
     if (queue_thread_.joinable()) queue_thread_.join();
 }
 
-void StateBridge::addSession(std::shared_ptr<TorrentSession> session, const std::string& magnetUri) {
+void StateBridge::addSession(std::shared_ptr<TorrentSession> session, const std::string& magnetUri,
+                             const SessionFlags& flags) {
     if (!session) return;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -32,6 +33,7 @@ void StateBridge::addSession(std::shared_ptr<TorrentSession> session, const std:
         }
         sessions_[hash] = Entry{std::move(session), magnetUri, false, next_order_++};
         Entry& added = sessions_[hash];
+        added.flags = flags;
         if (default_picker_strategy_ != "rarest_first" && added.session->set_piece_strategy(default_picker_strategy_)) {
             added.picker_strategy = default_picker_strategy_;
         }
@@ -243,7 +245,15 @@ void StateBridge::saveEntryLocked(const std::string& hash, const Entry& entry) c
     }
     std::ofstream out(state_dir_ / (hash + ".meta"), std::ios::trunc);
     if (!out) return;
-    out << "magnet=" << entry.magnet_uri << "\n"
+    // Giá trị chuỗi không được chứa CR/LF: nếu không, magnet độc hại chèn được dòng paused=/down=/skip= giả.
+    std::string magnetLine = entry.magnet_uri;
+    magnetLine.erase(std::remove_if(magnetLine.begin(), magnetLine.end(),
+                                    [](char ch) { return ch == '\r' || ch == '\n'; }),
+                     magnetLine.end());
+    out << "magnet=" << magnetLine << "\n"
+        << "tracker=" << (entry.flags.enable_tracker ? 1 : 0) << "\n"
+        << "dht=" << (entry.flags.enable_dht ? 1 : 0) << "\n"
+        << "lsd=" << (entry.flags.enable_lsd ? 1 : 0) << "\n"
         << "paused=" << (entry.session->is_paused() && !entry.queued ? 1 : 0) << "\n"  // dừng do hàng đợi: lần sau tự xếp lại
         << "down=" << entry.session->download_limit() << "\n"
         << "up=" << entry.session->upload_limit() << "\n";
@@ -292,6 +302,9 @@ std::vector<SavedTorrent> StateBridge::loadSavedTorrents() const {
                 try {
                     if (key == "magnet") saved.magnet_uri = value;
                     else if (key == "paused") saved.paused = value == "1";
+                    else if (key == "tracker") saved.enable_tracker = value != "0";
+                    else if (key == "dht") saved.enable_dht = value != "0";
+                    else if (key == "lsd") saved.enable_lsd = value != "0";
                     else if (key == "down") saved.download_limit = std::stoull(value);
                     else if (key == "up") saved.upload_limit = std::stoull(value);
                     else if (key == "skip") {

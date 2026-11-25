@@ -1171,6 +1171,85 @@ void testStateBridgePersistsAndRestoresTorrents() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+void testStateBridgeSanitizesMagnetAndPersistsDiscoveryFlags() {
+    std::cout << "[TEST] StateBridge strips CR/LF from magnet and persists tracker/dht/lsd flags..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_state_flags";
+    const std::filesystem::path state_dir = temp_dir / ".p2p_state";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("flags_me.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.infoRaw = "d6:lengthi32e4:name12:flags_me.bin12:piece lengthi16e6:pieces40:" + meta.pieces[0] + meta.pieces[1] + "e";
+    TorrentSessionConfig config;
+    config.download_dir = temp_dir;
+    config.listen_port = 6992;
+    config.enable_lsd = false;
+    config.enable_dht = false;
+    config.enable_tracker = false;
+
+    auto& bridge = StateBridge::instance();
+    bridge.setStateDir(state_dir);
+    auto session = std::make_shared<TorrentSession>(meta, config);
+    CHECK(session->start());
+    const std::string hash = session->info_hash_hex();
+    // Magnet độc hại: cố chèn dòng paused/down/skip/dht giả vào file .meta.
+    const std::string evil = "magnet:?xt=urn:btih:" + hash + "\npaused=1\r\ndown=999\nskip=0\ndht=1";
+    SessionFlags flags;
+    flags.enable_tracker = false;
+    flags.enable_dht = false;
+    flags.enable_lsd = true;
+    bridge.addSession(session, evil, flags);
+    bridge.persistState(hash);
+
+    // Không khóa lạ nào ngoài danh sách cho phép, và mỗi khóa đúng 1 lần.
+    std::map<std::string, int> keyCounts;
+    {
+        std::ifstream in(state_dir / (hash + ".meta"));
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto eq = line.find('=');
+            if (eq != std::string::npos) ++keyCounts[line.substr(0, eq)];
+        }
+    }
+    for (const auto& [key, count] : keyCounts) {
+        CHECK(key == "magnet" || key == "paused" || key == "down" || key == "up" || key == "skip" ||
+              key == "tracker" || key == "dht" || key == "lsd");
+        CHECK_EQ(count, 1);
+    }
+
+    auto saved = bridge.loadSavedTorrents();
+    CHECK_EQ(saved.size(), std::size_t(1));
+    if (saved.size() == 1) {
+        CHECK(!saved[0].paused);
+        CHECK_EQ(saved[0].download_limit, std::uint64_t(0));
+        CHECK(saved[0].skipped_files.empty());
+        CHECK(saved[0].magnet_uri.find('\n') == std::string::npos);
+        CHECK(saved[0].magnet_uri.find('\r') == std::string::npos);
+        CHECK(!saved[0].enable_tracker);
+        CHECK(!saved[0].enable_dht);
+        CHECK(saved[0].enable_lsd);
+    }
+
+    // File .meta cũ (không có tracker/dht/lsd) vẫn đọc được và mặc định bật cả ba.
+    {
+        std::ofstream legacy(state_dir / (hash + ".meta"), std::ios::trunc);
+        legacy << "magnet=magnet:?xt=urn:btih:" << hash << "\npaused=0\ndown=0\nup=0\n";
+    }
+    saved = bridge.loadSavedTorrents();
+    CHECK_EQ(saved.size(), std::size_t(1));
+    if (saved.size() == 1) {
+        CHECK(saved[0].enable_tracker);
+        CHECK(saved[0].enable_dht);
+        CHECK(saved[0].enable_lsd);
+    }
+
+    CHECK(bridge.removeSession(hash));
+    bridge.setStateDir({});
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 void testStateBridgePickerStrategyPerTorrentAndForAll() {
     std::cout << "[TEST] StateBridge sets piece strategy per torrent and for all, keeps pipeline depth..." << std::endl;
     const std::filesystem::path temp_dir = "./test_picker_strategy";
@@ -2341,6 +2420,7 @@ int main(int argc, char** argv) {
     testSessionLoopbackDownloadWithUnreachableTracker();
     testSessionRateLimitsAndPauseResume();
     testStateBridgePersistsAndRestoresTorrents();
+    testStateBridgeSanitizesMagnetAndPersistsDiscoveryFlags();
     testStateBridgePickerStrategyPerTorrentAndForAll();
     testDownloadQueueLimitsActiveTorrents();
     testGlobalBandwidthLimitIsSharedAndPersisted();

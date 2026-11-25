@@ -38,6 +38,13 @@ struct TorrentViewInfo {
     std::string picker_strategy = "rarest_first";  // chiến lược chọn piece hiện tại
 };
 
+// Các công tắc tìm peer của một torrent lúc được thêm vào; lưu vào .meta để khôi phục đúng lựa chọn của người dùng.
+struct SessionFlags {
+    bool enable_tracker = true;
+    bool enable_dht = true;
+    bool enable_lsd = true;
+};
+
 // Torrent đã lưu trên đĩa, dùng để dựng lại session khi mở lại ứng dụng.
 struct SavedTorrent {
     TorrentFileMetadata metadata;
@@ -45,6 +52,9 @@ struct SavedTorrent {
     bool paused = false;
     std::uint64_t download_limit = 0;
     std::uint64_t upload_limit = 0;
+    bool enable_tracker = true;  // thiếu trong file .meta cũ thì mặc định true
+    bool enable_dht = true;
+    bool enable_lsd = true;
     std::vector<std::size_t> skipped_files;  // chỉ số các file người dùng đã bỏ chọn
 };
 
@@ -55,7 +65,8 @@ public:
         return s_instance;
     }
 
-    void addSession(std::shared_ptr<TorrentSession> session, const std::string& magnetUri);
+    void addSession(std::shared_ptr<TorrentSession> session, const std::string& magnetUri,
+                    const SessionFlags& flags = {});
     bool removeSession(const std::string& infoHashHex);
     std::shared_ptr<TorrentSession> getSession(const std::string& infoHashHex);
 
@@ -128,6 +139,7 @@ private:
         bool queued = false;       // bị hàng đợi tạm dừng (không phải người dùng)
         std::int64_t order = 0;    // nhỏ hơn = ưu tiên hơn
         std::string picker_strategy = "rarest_first";  // chiến lược chọn piece: "rarest_first" hoặc "sequential"
+        SessionFlags flags;
     };
     std::unordered_map<std::string, Entry> sessions_;
     std::shared_ptr<bench::BandwidthLimiter> global_download_ = std::make_shared<bench::BandwidthLimiter>(0);

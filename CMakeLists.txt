@@ -450,6 +450,23 @@ if(WIN32)
     target_link_libraries(p2p_client PRIVATE ws2_32 crypt32 shell32)
 endif()
 
+# Test tích hợp WebUI qua HTTP thật (server loopback + httplib::Client), cùng nguồn với p2p_client trừ main.cpp.
+set(P2P_WEBUI_TEST_SOURCES ${P2P_CLIENT_SOURCES})
+list(REMOVE_ITEM P2P_WEBUI_TEST_SOURCES src/main.cpp)
+add_executable(test_webui_api tests/test_webui_api.cpp ${P2P_WEBUI_TEST_SOURCES})
+target_include_directories(test_webui_api PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/asio
+)
+target_link_libraries(test_webui_api PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+target_link_libraries(test_webui_api PRIVATE p2p_utp)
+target_link_libraries(test_webui_api PRIVATE p2p_lan)
+if(WIN32)
+    target_link_libraries(test_webui_api PRIVATE ws2_32 crypt32 shell32)
+endif()
+add_test(NAME test_webui_api COMMAND test_webui_api)
+
 # Tracker server thật (BEP 3 + BEP 23): bind 0.0.0.0 để các máy khác trong
 # LAN announce tới được.
 add_executable(p2p_tracker
