@@ -18,8 +18,12 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <iostream>
 #include <random>
+#include <set>
+#include <string>
 
 namespace p2p {
 namespace {
@@ -227,6 +231,11 @@ void KademliaNode::stop() {
 
 void KademliaNode::receiveLoop() {
     std::vector<char> buffer(4096);
+    // Log chẩn đoán: chỉ in lần đầu thấy mỗi nguồn gửi, và giới hạn số gói lỗi in ra,
+    // để node DHT công khai không làm tràn console.
+    constexpr std::size_t kMaxLoggedSenders = 256;
+    std::set<std::string> loggedSenders;
+    std::size_t malformedCount = 0;
 
     while (running_) {
         sockaddr_in fromAddr{};
@@ -248,11 +257,21 @@ void KademliaNode::receiveLoop() {
         const std::uint16_t fromPort = ntohs(fromAddr.sin_port);
         const std::string payload(buffer.data(), static_cast<std::size_t>(received));
 
+        const std::string sender = std::string(ipStr) + ":" + std::to_string(fromPort);
+        if (loggedSenders.size() < kMaxLoggedSenders && loggedSenders.insert(sender).second) {
+            std::cout << "[DHT] first packet from " << sender << " (" << received << " bytes)" << std::endl;
+        }
+
         try {
             handleIncoming(payload, ipStr, fromPort);
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
             // 1 node lạ gửi dữ liệu dị dạng không được làm sập cả node DHT
             // (cùng tinh thần "giới hạn phòng thủ" ở mục 5.3).
+            ++malformedCount;
+            if (malformedCount <= 20 || malformedCount % 100 == 0) {
+                std::cerr << "[DHT] dropped malformed packet from " << sender << ": " << e.what()
+                          << " (total dropped: " << malformedCount << ")" << std::endl;
+            }
         }
     }
 }
@@ -370,11 +389,22 @@ void KademliaNode::sendRaw(const std::string& host, std::uint16_t port, const st
     addrinfo* result = nullptr;
     const std::string portStr = std::to_string(port);
     if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &result) != 0 || result == nullptr) {
+        std::cerr << "[DHT] cannot resolve " << host << ":" << port << " (need an IPv4 address or hostname)"
+                  << std::endl;
         return;
     }
 
-    sendto(static_cast<SocketHandle>(socketHandle_), payload.data(), static_cast<int>(payload.size()), 0,
-           result->ai_addr, static_cast<int>(result->ai_addrlen));
+    const auto sent = sendto(static_cast<SocketHandle>(socketHandle_), payload.data(),
+                             static_cast<int>(payload.size()), 0, result->ai_addr,
+                             static_cast<int>(result->ai_addrlen));
+    if (sent < 0) {
+#ifdef _WIN32
+        const int err = WSAGetLastError();
+#else
+        const int err = errno;
+#endif
+        std::cerr << "[DHT] sendto " << host << ":" << port << " failed, error " << err << std::endl;
+    }
     freeaddrinfo(result);
 }
 
@@ -429,10 +459,21 @@ bool KademliaNode::ping(const std::string& host, std::uint16_t port) {
 }
 
 bool KademliaNode::bootstrap(const std::string& host, std::uint16_t port) {
+    std::cout << "[DHT] bootstrap: ping " << host << ":" << port << " (local UDP port " << port_ << ")"
+              << std::endl;
+    const auto started = std::chrono::steady_clock::now();
     if (!ping(host, port)) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - started).count();
+        std::cerr << "[DHT] bootstrap: no reply from " << host << ":" << port << " after " << elapsedMs
+                  << " ms (wrong port, host down, NAT/firewall, or not a DHT node); will not retry"
+                  << std::endl;
         return false;
     }
+    const std::size_t before = routingTable_.size();
     findNode(selfId_);
+    std::cout << "[DHT] bootstrap: " << host << ":" << port << " replied; routing table " << before << " -> "
+              << routingTable_.size() << " nodes" << std::endl;
     return true;
 }
 
