@@ -759,12 +759,44 @@ void TorrentSession::add_peer(const std::string& ip, std::uint16_t port) {
             return;
         }
 
+        if (banned_ips_.count(ip) != 0) {
+            std::cout << "[ADD-PEER] " << ip << ":" << port << " -> banned (sent corrupt data), skipped" << std::endl;
+            return;
+        }
+
         const std::string ep = ip + ":" + std::to_string(port);
-        discovered_tcp_peer_endpoints_.insert(ep);
+        const auto now = std::chrono::steady_clock::now();
+        const auto retry_it = peer_retry_.find(ep);
+        if (retry_it != peer_retry_.end() && now < retry_it->second.retry_after) {
+            const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                retry_it->second.retry_after - now).count();
+            std::cout << "[ADD-PEER] " << ep << " -> connect failed " << retry_it->second.failures
+                      << " time(s), retry in " << wait_ms << " ms, skipped" << std::endl;
+            return;
+        }
+
+        if (discovered_tcp_peer_endpoints_.size() < kMaxDiscoveredPeers) {
+            discovered_tcp_peer_endpoints_.insert(ep);
+        }
         bool is_new = false;
-        if (known_peer_endpoints_.insert(ep).second) {
+        if (known_peer_endpoints_.count(ep) == 0) {
+            if (known_peer_endpoints_.size() >= kMaxKnownPeers ||
+                candidate_peer_endpoints_.size() >= kMaxCandidatePeers) {
+                if (!peer_cap_logged_) {
+                    peer_cap_logged_ = true;
+                    std::cout << "[ADD-PEER] Peer list is full (known=" << known_peer_endpoints_.size()
+                              << ", candidates=" << candidate_peer_endpoints_.size()
+                              << "), dropping new peers until it drains" << std::endl;
+                }
+                return;
+            }
+            known_peer_endpoints_.insert(ep);
             candidate_peer_endpoints_.push_back(ep);
             is_new = true;
+        }
+        if (known_peer_endpoints_.size() < kMaxKnownPeers &&
+            candidate_peer_endpoints_.size() < kMaxCandidatePeers) {
+            peer_cap_logged_ = false;
         }
 
         std::cout << "[ADD-PEER] " << ep
@@ -960,6 +992,11 @@ TorrentSessionStats TorrentSession::stats() const {
         s.progress_percent = 0.0;
     }
     return s;
+}
+
+std::size_t TorrentSession::banned_peer_count() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return banned_ips_.size();
 }
 
 std::vector<SessionPeerInfo> TorrentSession::get_peers() const {
@@ -1324,6 +1361,9 @@ void TorrentSession::orchestration_loop() {
 }
 
 bool TorrentSession::inbound_allowed_locked(const std::string& ip) const {
+    if (banned_ips_.count(ip) != 0) {
+        return false;
+    }
     if (active_peers_.size() >= config_.max_connections) {
         return false;
     }
@@ -1441,6 +1481,12 @@ void TorrentSession::connect_candidate_peers() {
                active_peers_.size() + to_connect.size() < config_.max_connections) {
             std::string candidate = candidate_peer_endpoints_.back();
             candidate_peer_endpoints_.pop_back();
+            const auto candidate_colon = candidate.find(':');
+            if (candidate_colon != std::string::npos &&
+                banned_ips_.count(candidate.substr(0, candidate_colon)) != 0) {
+                known_peer_endpoints_.erase(candidate);
+                continue;
+            }
             if (active_peers_.find(candidate) == active_peers_.end()) {
                 to_connect.push_back(candidate);
             }
@@ -1472,17 +1518,40 @@ void TorrentSession::connect_candidate_peers() {
             {
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 active_peers_[ep_str] = peer;
+                peer_retry_.erase(ep_str);  // nối được: xoá trạng thái lùi
             }
 
             peer->worker_thread = std::thread(&TorrentSession::peer_worker_loop, this, peer);
         } catch (const std::exception& ex) {
             std::cout << "[CONNECT] Failed to connect to " << ep_str << ": " << ex.what() << std::endl;
             request_peer_holepunch(ip, port);
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            note_connect_failure_locked(ep_str);
         } catch (...) {
             std::cout << "[CONNECT] Failed to connect to " << ep_str << " (unknown error)" << std::endl;
             request_peer_holepunch(ip, port);
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            note_connect_failure_locked(ep_str);
         }
     }
+}
+
+void TorrentSession::note_connect_failure_locked(const std::string& endpoint) {
+    // Không để endpoint lỗi kẹt trong "đã biết" mãi mãi (seeder bật muộn, lỗi mạng thoáng qua), nhưng bắt chờ lùi
+    // gấp đôi mỗi lần lỗi để không đập liên tục vào peer chết.
+    known_peer_endpoints_.erase(endpoint);
+    if (peer_retry_.size() > kMaxKnownPeers) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = peer_retry_.begin(); it != peer_retry_.end();) {
+            it = it->second.retry_after <= now ? peer_retry_.erase(it) : std::next(it);
+        }
+    }
+    auto& state = peer_retry_[endpoint];
+    ++state.failures;
+    const std::uint32_t shift = std::min<std::uint32_t>(state.failures - 1, 20);
+    const std::uint64_t delay_ms = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(config_.peer_retry_base_ms) << shift, kMaxPeerRetryDelayMs);
+    state.retry_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
 }
 
 void TorrentSession::connect_utp_candidates() {
@@ -1509,6 +1578,13 @@ void TorrentSession::connect_utp_candidates() {
         if (colon == std::string::npos) continue;
         const std::string ip = endpoint.substr(0, colon);
         const auto port = static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (banned_ips_.count(ip) != 0) {
+                queued_utp_peer_endpoints_.erase(endpoint);
+                continue;
+            }
+        }
         try {
             const auto address = asio::ip::make_address_v4(ip);
             auto connection = pbl4::network::PeerConnection::connect_utp_to(
@@ -1866,9 +1942,17 @@ void TorrentSession::handle_peer_message(
             if (extension_id == pex_id) {
                 try {
                     const auto pex_msg = pbl4::network::extension::parse_pex_message(msg, pex_id);
+                    // Mỗi tin PEX chỉ nhận tối đa kMaxPexPeersPerMessage địa chỉ: peer từ xa không được nhồi hàng nghìn.
+                    std::size_t accepted_from_message = 0;
                     for (const auto& peer_info : pex_msg.added) {
+                        if (accepted_from_message >= kMaxPexPeersPerMessage) {
+                            std::cout << "[PEX] Ignoring " << (pex_msg.added.size() - accepted_from_message)
+                                      << " extra address(es) from " << peer->endpoint_str << std::endl;
+                            break;
+                        }
                         if (!peer_info.ip.empty() && peer_info.port != 0) {
                             add_peer(peer_info.ip, peer_info.port);
+                            ++accepted_from_message;
                         }
                     }
                 } catch (const std::exception& e) {
@@ -2034,6 +2118,10 @@ void TorrentSession::handle_piece_block(
 
         downloaded_bytes_ += piece.data.size();
         peer->downloaded_bytes += piece.data.size();
+        if (prog.block_source_ip.size() != prog.received_block_mask.size()) {
+            prog.block_source_ip.assign(prog.received_block_mask.size(), std::string());
+        }
+        prog.block_source_ip[block_idx] = peer->ip;  // block ghi sau cùng đè dữ liệu cũ nên người gửi sau cùng chịu trách nhiệm
 
         // Endgame: block này có thể đã được xin từ peer khác. Gom lại để gửi cancel, khỏi nhận trùng.
         std::vector<PendingBlock> to_cancel;
@@ -2138,8 +2226,24 @@ void TorrentSession::handle_piece_block(
                     finished_cb = finished_cb_;
                 }
             } else {
-                // Hash sai: xoá block và tải lại mảnh này
+                // Hash sai: xoá block và tải lại mảnh này. Mỗi IP đã gửi block của piece này bị ghi một lần lỗi;
+                // đủ kMaxHashFailuresPerPeer thì cấm IP và ngắt kết nối để không bị bắt tải lại cùng piece mãi.
+                std::unordered_set<std::string> culprits(prog.block_source_ip.begin(), prog.block_source_ip.end());
+                culprits.erase(std::string());
                 in_progress_pieces_.erase(piece.index);
+                for (const auto& culprit_ip : culprits) {
+                    const int failures = ++peer_hash_failures_[culprit_ip];
+                    std::cout << "[PIECE-VERIFY] Piece #" << piece.index << " FAILED SHA-1 (" << culprit_ip
+                              << " strike " << failures << "/" << kMaxHashFailuresPerPeer << ")" << std::endl;
+                    if (failures >= kMaxHashFailuresPerPeer && banned_ips_.insert(culprit_ip).second) {
+                        std::cout << "[BAN] " << culprit_ip << " banned: repeated corrupt pieces" << std::endl;
+                        for (auto& [ep, other] : active_peers_) {
+                            if (other && other->ip == culprit_ip && other->connection) {
+                                other->connection->close();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2296,11 +2400,10 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
         }
     }
 
-    if (choked || !peer->rejected_pieces.empty()) {
-        // Chỉ chọn trong những piece peer này thật sự phục vụ được (bị choke -> chỉ piece "allowed fast").
-        for (std::size_t i = 0; i < unavailable_or_in_progress.size(); ++i) {
-            if (!peer_can_serve(i)) unavailable_or_in_progress[i] = true;
-        }
+    // Luôn chỉ chọn trong những piece peer này thật sự phục vụ được (có piece đó, chưa Reject; bị choke -> chỉ piece
+    // "allowed fast"). Nếu không, picker có thể trả piece hiếm nhất toàn cục mà peer này không có và peer rảnh mãi.
+    for (std::size_t i = 0; i < unavailable_or_in_progress.size(); ++i) {
+        if (!peer_can_serve(i)) unavailable_or_in_progress[i] = true;
     }
 
     strategy::PickerContext picker_ctx;
@@ -2330,6 +2433,7 @@ bool TorrentSession::request_next_blocks_locked(std::shared_ptr<ActivePeer> peer
         prog.total_blocks = block_count;
         prog.received_blocks = 0;
         prog.received_block_mask.assign(block_count, false);
+        prog.block_source_ip.assign(block_count, std::string());
         in_progress_pieces_[next_piece] = prog;
 
         out = BlockRequest{true, static_cast<std::uint32_t>(next_piece), begin, len};
@@ -2551,6 +2655,26 @@ void TorrentSession::update_rates() {
         last_downloaded_snapshot_ = downloaded_bytes_;
         last_uploaded_snapshot_ = uploaded_bytes_;
         last_rate_calc_time_ = now;
+    }
+
+    // Tốc độ từng peer: đầu vào của choker (xếp hạng peer gửi nhiều nhất cho mình / nhận nhiều nhất từ mình).
+    for (auto& [ep, peer] : active_peers_) {
+        if (!peer) continue;
+        if (peer->last_rate_time == std::chrono::steady_clock::time_point{}) {
+            peer->last_rate_time = now;
+            peer->last_rate_downloaded = peer->downloaded_bytes;
+            peer->last_rate_uploaded = peer->uploaded_bytes;
+            continue;
+        }
+        const auto peer_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - peer->last_rate_time).count();
+        if (peer_elapsed_ms < 1000) continue;
+        const double peer_elapsed_sec = static_cast<double>(peer_elapsed_ms) / 1000.0;
+        peer->download_rate = static_cast<double>(peer->downloaded_bytes - peer->last_rate_downloaded) / peer_elapsed_sec;
+        peer->upload_rate = static_cast<double>(peer->uploaded_bytes - peer->last_rate_uploaded) / peer_elapsed_sec;
+        peer->last_rate_downloaded = peer->downloaded_bytes;
+        peer->last_rate_uploaded = peer->uploaded_bytes;
+        peer->last_rate_time = now;
     }
 }
 

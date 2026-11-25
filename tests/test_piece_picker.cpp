@@ -315,7 +315,29 @@ void testSequentialPipelineDepthAndEndgame() {
     cfg.pipeline_depth = 8;
     SequentialPicker picker(cfg);
     CHECK_EQ(picker.pipeline_depth(), std::size_t(8));
-    CHECK(!picker.in_endgame(ctxOf(10, 5, 5)));
+    // Endgame mặc định bật: không còn piece chưa bắt đầu thì vào endgame.
+    CHECK(picker.in_endgame(ctxOf(10, 5, 5)));
+}
+
+void testSequentialEndgameFollowsContext() {
+    SequentialPicker picker;
+    CHECK(!picker.in_endgame(ctxOf(10, 5, 4)));  // còn 1 piece chưa bắt đầu
+    CHECK(picker.in_endgame(ctxOf(10, 5, 5)));   // chỉ còn piece đang dở
+    CHECK(!picker.in_endgame(ctxOf(10, 10, 0)));  // đã xong
+    CHECK(!picker.in_endgame(ctxOf(0, 0, 0)));    // chưa có torrent
+    CHECK_EQ(picker.endgame_max_copies(), std::size_t(2));
+
+    SequentialConfig off;
+    off.endgame_enabled = false;
+    SequentialPicker no_endgame(off);
+    CHECK(!no_endgame.in_endgame(ctxOf(10, 5, 5)));
+    CHECK_EQ(no_endgame.endgame_max_copies(), std::size_t(1));
+
+    SequentialConfig many;
+    many.endgame_max_copies = 3;
+    CHECK_EQ(SequentialPicker(many).endgame_max_copies(), std::size_t(3));
+    many.endgame_max_copies = 0;  // bị kẹp về tối thiểu 1
+    CHECK_EQ(SequentialPicker(many).endgame_max_copies(), std::size_t(1));
 }
 
 int main() {
@@ -342,5 +364,6 @@ int main() {
     RUN(testSequentialSkipsOwnedPieces);
     RUN(testSequentialReturnsMinusOneWhenNoPiecesToPick);
     RUN(testSequentialPipelineDepthAndEndgame);
+    RUN(testSequentialEndgameFollowsContext);
     return TEST_REPORT();
 }

@@ -117,6 +117,9 @@ struct TorrentSessionConfig {
     std::chrono::seconds tracker_interval{60};
     std::chrono::seconds choker_interval{10};
     std::chrono::seconds peer_timeout{30};
+    // Kết nối RA tới một endpoint lỗi thì thử lại sau retry_base x 2^(số lần lỗi - 1), tối đa 5 phút.
+    // Trong lúc chờ, add_peer bỏ qua endpoint đó để không đập liên tục vào peer chết.
+    std::uint32_t peer_retry_base_ms = 15000;
     bool enable_tracker = true;                 // Cho phép announce tới tracker nếu có URL
     bool enable_lsd = true;                     // Tự tìm kiếm peer qua LSD (BEP 14)
     bool enable_dht = true;                     // Tự tìm kiếm peer qua DHT (BEP 5)
@@ -195,6 +198,8 @@ public:
     // Thống kê & Dữ liệu
     [[nodiscard]] TorrentSessionStats stats() const;
     [[nodiscard]] std::vector<SessionPeerInfo> get_peers() const;
+    // Số IP đã bị cấm (gửi dữ liệu sai hash nhiều lần) trong đời session này.
+    [[nodiscard]] std::size_t banned_peer_count() const;
     [[nodiscard]] const TorrentFileMetadata& metadata() const noexcept;
     [[nodiscard]] std::vector<bool> bitfield() const;
     [[nodiscard]] std::string info_hash_hex() const;
@@ -332,6 +337,10 @@ private:
         std::unordered_set<std::string> pex_advertised;
         double download_rate = 0.0;
         double upload_rate = 0.0;
+        // Mốc đo tốc độ riêng của peer (do update_rates cập nhật dưới session_mutex_); time_point{} = chưa đo lần nào.
+        std::chrono::steady_clock::time_point last_rate_time{};
+        std::uint64_t last_rate_downloaded = 0;
+        std::uint64_t last_rate_uploaded = 0;
         std::chrono::steady_clock::time_point last_active;
         std::atomic<bool> worker_active{false};
         std::thread worker_thread;
@@ -341,6 +350,23 @@ private:
     std::unordered_set<std::string> known_peer_endpoints_;
     std::unordered_set<std::string> discovered_tcp_peer_endpoints_;
     std::vector<std::string> candidate_peer_endpoints_;
+    // Trần danh sách peer: peer từ xa (PEX/tracker/DHT) không được làm các tập này phình vô hạn.
+    static constexpr std::size_t kMaxKnownPeers = 2000;
+    static constexpr std::size_t kMaxCandidatePeers = 500;
+    static constexpr std::size_t kMaxDiscoveredPeers = 2000;
+    static constexpr std::size_t kMaxPexPeersPerMessage = 50;  // BEP 11 khuyến nghị <= 50 địa chỉ mỗi tin
+    static constexpr std::uint32_t kMaxPeerRetryDelayMs = 5 * 60 * 1000;
+    static constexpr int kMaxHashFailuresPerPeer = 3;  // đủ số lần gửi dữ liệu sai hash thì cấm IP
+    bool peer_cap_logged_ = false;  // đã log "danh sách peer đầy" cho đợt này (reset khi hết đầy)
+    // Endpoint kết nối RA lỗi: số lần lỗi liên tiếp + thời điểm sớm nhất được thử lại (lùi gấp đôi mỗi lần).
+    struct PeerRetryState {
+        std::uint32_t failures = 0;
+        std::chrono::steady_clock::time_point retry_after;
+    };
+    std::unordered_map<std::string, PeerRetryState> peer_retry_;
+    // Số lần mỗi IP gửi piece sai hash; đủ kMaxHashFailuresPerPeer thì vào banned_ips_ (cấm trong đời session).
+    std::unordered_map<std::string, int> peer_hash_failures_;
+    std::unordered_set<std::string> banned_ips_;
     std::vector<std::string> utp_peer_candidates_;
     std::unordered_set<std::string> queued_utp_peer_endpoints_;
 
@@ -359,6 +385,8 @@ private:
         std::size_t total_blocks = 0;
         std::size_t received_blocks = 0;
         std::vector<bool> received_block_mask;
+        // IP của peer đã gửi dữ liệu hiện nằm trong từng block (block ghi sau cùng thắng); rỗng = chưa nhận.
+        std::vector<std::string> block_source_ip;
     };
     std::unordered_map<std::uint32_t, PieceProgress> in_progress_pieces_;
 
@@ -414,6 +442,8 @@ private:
         const asio::ip::udp::endpoint& source);
     void cleanup_disconnected_peers();
     void update_rates();
+    // Ghi nhận kết nối RA tới `endpoint` lỗi: bỏ khỏi "đã biết" và đặt thời điểm được thử lại (gọi khi giữ session_mutex_).
+    void note_connect_failure_locked(const std::string& endpoint);
 
     void handle_peer_message(
         std::shared_ptr<ActivePeer> peer,
