@@ -85,9 +85,9 @@
   }
 
   function formatBytes(bytes) {
-    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    if (!Number.isFinite(bytes) || bytes < 1) return '0 B';
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
+    const index = Math.max(0, Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1));
     const value = bytes / (1024 ** index);
     return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${sizes[index]}`;
   }
@@ -450,7 +450,7 @@
 
   function getFileCategory(name) {
     const ext = (name.split('.').pop() || '').toLowerCase();
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)) return 'image';
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico'].includes(ext)) return 'image';
     if (['mp4', 'mov', 'webm', 'mkv', 'avi'].includes(ext)) return 'video';
     if (['mp3', 'wav', 'flac', 'm4a', 'ogg'].includes(ext)) return 'audio';
     if (['doc', 'docx'].includes(ext)) return 'word';
@@ -460,6 +460,11 @@
     if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'archive';
     if (['txt', 'md', 'c', 'cpp', 'h', 'py', 'js', 'json', 'html', 'css', 'sh'].includes(ext)) return 'code';
     return 'generic';
+  }
+
+  // Chỉ dùng phần mở rộng làm nhãn khi nó là 1-5 ký tự chữ/số; tên không có dấu chấm hoặc chứa ký tự lạ thì dùng nhãn chung.
+  function safeExtLabel(ext, fallback) {
+    return /^[a-z0-9]{1,5}$/i.test(ext || '') ? String(ext).toUpperCase() : fallback;
   }
 
   function renderFileIconSvg(category, ext) {
@@ -554,7 +559,7 @@
             <polyline points="9 13 7 15 9 17" stroke="#0f766e"/>
             <polyline points="15 13 17 15 15 17" stroke="#0f766e"/>
           </svg>
-          <span class="file-type-pill" style="background: #0f766e;">${(ext || 'TXT').toUpperCase()}</span>
+          <span class="file-type-pill" style="background: #0f766e;">${escapeHtml(safeExtLabel(ext, 'TXT'))}</span>
         </div>`;
     }
     return `
@@ -563,7 +568,7 @@
           <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" fill="#f8fafc"/>
           <polyline points="13 2 13 9 20 9"/>
         </svg>
-        <span class="file-type-pill" style="background: #64748b;">${(ext || 'FILE').toUpperCase()}</span>
+        <span class="file-type-pill" style="background: #64748b;">${escapeHtml(safeExtLabel(ext, 'FILE'))}</span>
       </div>`;
   }
 
@@ -578,9 +583,10 @@
       if (res.ok) {
         setStatus(`Opened "${label}" on this computer.`, 'success');
       } else {
-        const err = await res.text();
-        setStatus(`Could not open it directly: ${err}`, 'error');
-        window.open(`/api/files/content?path=${encodeURIComponent(relativePath)}`, '_blank');
+        const err = (await res.text()).trim();
+        setStatus(res.status === 403
+          ? (err || 'This file type cannot be opened from the web UI. Open the download folder instead.')
+          : `Could not open it directly: ${err || `server responded ${res.status}`}`, 'error');
       }
     } catch (err) {
       setStatus(`Error opening file: ${err.message}`, 'error');
@@ -731,7 +737,7 @@
 
   function fileCardHtml(file, downloading) {
     const category = getFileCategory(file.name);
-    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    const ext = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
     const contentUrl = `/api/files/content?path=${encodeURIComponent(file.path)}`;
     const when = new Date(file.mtime * 1000);
     const folder = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
@@ -793,10 +799,14 @@
         : '<div class="files-empty">Loading files...</div>';
       return;
     }
+    // Làm mới lỗi sau khi đã tải được một lần: vẫn hiện danh sách cũ nhưng kèm cảnh báo phía trên.
+    const warning = filesError
+      ? '<div class="files-warning" role="alert">Could not refresh the file list. Showing the last known list.</div>'
+      : '';
     if (!visible.length) {
-      container.innerHTML = filesData.length
+      container.innerHTML = warning + (filesData.length
         ? '<div class="files-empty">No files in this period.</div>'
-        : '<div class="files-empty">The download folder is empty. Add a .torrent file or a magnet link to get started.</div>';
+        : '<div class="files-empty">The download folder is empty. Add a .torrent file or a magnet link to get started.</div>');
       return;
     }
 
@@ -825,7 +835,7 @@
           <div class="files-explorer-grid">${group.files.map((file) => fileCardHtml(file, isDownloading(file))).join('')}</div>
         </section>`;
     }).join('');
-    container.innerHTML = html + (filesTruncated ? '<p class="files-note">Showing the first 10,000 files only.</p>' : '');
+    container.innerHTML = warning + html + (filesTruncated ? '<p class="files-note">Showing the first 10,000 files only.</p>' : '');
 
     container.querySelectorAll('.file-card').forEach((card) => {
       card.addEventListener('click', () => {
@@ -950,6 +960,7 @@
           }
           torrent.paused = action === 'pause';
           torrent.queued = false;
+          discardInFlightSync();
           setStatus(torrent.paused ? 'Torrent paused.' : 'Torrent resumed.', 'info');
         } catch (_) {
           setStatus(`Failed to ${action} torrent: server unreachable.`, 'error');
@@ -991,6 +1002,7 @@
         }
         const index = torrentList.findIndex((item) => item.infoHash === hash);
         if (index !== -1) torrentList.splice(index, 1);
+        discardInFlightSync();
         renderTorrentList();
         updateDashboardTiles();
         renderFilesList();
@@ -1054,15 +1066,27 @@
     if (banner) banner.hidden = !lost;
   }
 
+  // Mỗi lần tải có số thứ tự riêng; phản hồi cũ hơn phản hồi đã áp dụng thì bỏ, để dữ liệu cũ không ghi đè dữ liệu mới.
+  let syncSeq = 0;
+  let appliedSeq = 0;
+  // Sau khi cập nhật lạc quan (tạm dừng, xóa...), bỏ mọi phản hồi của các lần tải đã gửi trước đó.
+  function discardInFlightSync() {
+    appliedSeq = syncSeq + 1;
+  }
+
   async function syncTorrentsFromServer() {
+    const seq = ++syncSeq;
     try {
       const res = await fetch('/api/torrents');
+      if (seq < appliedSeq) return;
       if (!res.ok) {
         setConnectionLost(true);
         return;
       }
-      setConnectionLost(false);
       const data = await res.json();
+      if (seq < appliedSeq) return;
+      appliedSeq = seq;
+      setConnectionLost(false);
       if (Array.isArray(data)) {
         torrentList.length = 0;
         data.forEach(item => {
@@ -1094,10 +1118,12 @@
         });
         renderTorrentList();
         updateDashboardTiles();
-        renderFilesList();
+        // Trang Files đang ẩn thì khỏi dựng lại (lọc, sắp xếp, so chữ ký tới 10.000 mục mỗi 2 giây); mở trang sẽ tự tải lại.
+        const filesView = document.getElementById('view-files');
+        if (filesView && !filesView.hidden) renderFilesList();
       }
     } catch (_) {
-      setConnectionLost(true);
+      if (seq >= appliedSeq) setConnectionLost(true);
     }
   }
 

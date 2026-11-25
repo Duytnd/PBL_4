@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniBitTorrent</title>
-  <link rel="stylesheet" href="style.css?v=11">
+  <link rel="stylesheet" href="style.css?v=13">
 </head>
 <body>
   <header class="topbar">
@@ -37,6 +37,7 @@
 
     <main>
       <div id="conn-banner" class="torrent-status error" role="alert" hidden>Lost connection to the server. Retrying...</div>
+      <div id="torrent-status" class="torrent-status" aria-live="polite"></div>
       <section class="view" id="view-dashboard" aria-label="Dashboard">
         <div class="tiles">
           <div class="tile"><div class="tile-label">Bytes downloaded</div><div class="tile-value">0 B</div></div>
@@ -78,7 +79,6 @@
             <input id="magnet-add-input" type="url" placeholder="Paste a magnet link (magnet:?xt=urn:btih:...)" aria-label="Magnet link" autocomplete="off">
             <button id="add-magnet-btn" type="button" class="btn">Add magnet</button>
           </div>
-          <div id="torrent-status" class="torrent-status" aria-live="polite">No torrent added yet.</div>
         </div>
 
         <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
@@ -186,7 +186,6 @@
                 <span id="strategy-status" class="strategy-status" aria-live="polite"></span>
               </div>
             </div>
-          </div>
           </div>
         </dialog>
 
@@ -311,6 +310,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=11" defer></script>
+  <script src="app.js?v=13" defer></script>
 </body>
 </html>
