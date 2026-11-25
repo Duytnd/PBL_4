@@ -50,6 +50,12 @@ public:
 };
 
 BencodeValue decodeBencode(const std::string& input, std::size_t* next = nullptr);
+
+// Tìm khoảng byte [begin, end) của GIÁ TRỊ gắn với `key` trong dict ở đầu `input`
+// (dữ liệu gốc, không mã hóa lại). Trả false nếu không có key. Ném
+// std::invalid_argument nếu input không phải dict hợp lệ hoặc key bị trùng.
+bool findDictValueSpan(const std::string& input, const std::string& key,
+                       std::size_t& begin, std::size_t& end);
 std::string encodeBencode(const BencodeValue& value);
 std::string encodeBencode(const std::string& value);
 std::string encodeBencode(int64_t value);

@@ -39,7 +39,7 @@ void testFullRoundTripSingleFile() {
 
     // Dữ liệu không chia hết piece length để kiểm tra piece cuối ngắn hơn.
     std::string content;
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 40000; ++i) {
         content.push_back(static_cast<char>('a' + (i % 26)));
     }
     {
@@ -47,7 +47,7 @@ void testFullRoundTripSingleFile() {
         out << content;
     }
 
-    constexpr std::size_t kPieceLength = 256;
+    constexpr std::size_t kPieceLength = 16384;  // TorrentBuilder nâng piece length nhỏ hơn 16 KiB lên mức này
     const std::string torrentBytes = TorrentBuilder::buildTorrent(
         sourceFile, "http://tracker.example:6969/announce", kPieceLength);
 

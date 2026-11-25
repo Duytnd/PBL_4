@@ -48,6 +48,21 @@ std::vector<std::string> splitSegments(const std::string& path) {
     return segments;
 }
 
+// Ký tự không hợp lệ trong tên file Windows (và ký tự điều khiển < 0x20).
+bool hasForbiddenCharacter(const std::string& segment) {
+    for (const unsigned char ch : segment) {
+        if (ch < 0x20 || ch == '<' || ch == '>' || ch == '"' || ch == '|' || ch == '?' || ch == '*') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Đoạn kết thúc bằng dấu chấm hoặc dấu cách: Windows tự cắt đi, nên "evil." và "evil" trùng nhau.
+bool endsWithDotOrSpace(const std::string& segment) {
+    return !segment.empty() && (segment.back() == '.' || segment.back() == ' ');
+}
+
 }  // namespace
 
 bool PathSanitizer::isReservedWindowsName(const std::string& segment) {
@@ -57,7 +72,12 @@ bool PathSanitizer::isReservedWindowsName(const std::string& segment) {
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
     };
 
-    std::string upper = segment;
+    // Windows coi "CON.txt", "nul.tar.gz" cũng là thiết bị: chỉ phần trước dấu chấm đầu tiên
+    // (bỏ khoảng trắng cuối) được so khớp.
+    std::string upper = segment.substr(0, segment.find('.'));
+    while (!upper.empty() && upper.back() == ' ') {
+        upper.pop_back();
+    }
     std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch) {
         return static_cast<char>(std::toupper(ch));
     });
@@ -106,6 +126,9 @@ bool PathSanitizer::isSafeRelativePath(const std::string& path) {
         if (isReservedWindowsName(segment)) {
             return false;
         }
+        if (hasForbiddenCharacter(segment) || endsWithDotOrSpace(segment)) {
+            return false;
+        }
     }
 
     return true;
@@ -149,6 +172,9 @@ std::string PathSanitizer::normalize(const std::string& path) {
             return "";
         }
         if (isReservedWindowsName(trimmed)) {
+            return "";
+        }
+        if (hasForbiddenCharacter(trimmed) || endsWithDotOrSpace(trimmed)) {
             return "";
         }
         parts.push_back(trimmed);

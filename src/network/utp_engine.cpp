@@ -271,7 +271,8 @@ void UtpEngine::queue_datagram(
     const byte* data,
     std::size_t size) {
     if (!address || !data || size == 0 || address->sa_family != AF_INET ||
-        address_length < sizeof(sockaddr_in) || !socket_.is_open()) {
+        address_length < 0 ||
+        static_cast<std::size_t>(address_length) < sizeof(sockaddr_in) || !socket_.is_open()) {
         return;
     }
     const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
@@ -404,7 +405,8 @@ uint64 UtpEngine::on_accept(utp_callback_arguments* args) {
 uint64 UtpEngine::on_firewall(utp_callback_arguments* args) {
     auto* engine = static_cast<UtpEngine*>(utp_context_get_userdata(args->context));
     if (!engine || !engine->running_.load() || !args->address ||
-        args->address->sa_family != AF_INET || args->address_len < sizeof(sockaddr_in)) {
+        args->address->sa_family != AF_INET || args->address_len < 0 ||
+        static_cast<std::size_t>(args->address_len) < sizeof(sockaddr_in)) {
         return 1;
     }
     // Trước đây có accept_handler là cho phép MỌI endpoint mở kết nối, nên danh sách cho phép chỉ là trang trí

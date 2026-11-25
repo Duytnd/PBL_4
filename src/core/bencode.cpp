@@ -12,7 +12,11 @@ std::string encodeStringValue(const std::string& value) {
     return std::to_string(value.size()) + ':' + value;
 }
 
-BencodeValue parseValue(const std::string& input, std::size_t& pos) {
+// Giới hạn độ sâu lồng nhau để dữ liệu độc không làm tràn stack
+// (metadata torrent thật lồng tối đa khoảng 6 lớp).
+constexpr int kMaxNestingDepth = 64;
+
+BencodeValue parseValue(const std::string& input, std::size_t& pos, int depth = 0) {
     if (pos >= input.size()) {
         throw std::invalid_argument("Bencode: empty input");
     }
@@ -31,15 +35,22 @@ BencodeValue parseValue(const std::string& input, std::size_t& pos) {
         }
 
         const std::string digits = input.substr(start, pos - start);
-        if (digits.empty()) {
-            throw std::invalid_argument("Bencode: invalid integer format");
-        }
 
-        // Cho phép 0 hoặc -0 nhưng không cho số có số 0 ở đầu như 012
-        if (digits == "0" || (digits.size() > 1 && digits[0] == '0')) {
-            if (digits != "0" && digits != "-0") {
-                throw std::invalid_argument("Bencode: invalid integer format");
+        // Chỉ chấp nhận dạng chuẩn: 0 hoặc -?[1-9][0-9]* (không '+', không
+        // khoảng trắng, không "-0", không số 0 ở đầu, không ký tự thừa).
+        const std::size_t firstDigit = (!digits.empty() && digits[0] == '-') ? 1 : 0;
+        bool wellFormed = digits.size() > firstDigit;
+        for (std::size_t i = firstDigit; wellFormed && i < digits.size(); ++i) {
+            if (digits[i] < '0' || digits[i] > '9') {
+                wellFormed = false;
             }
+        }
+        if (wellFormed && digits[firstDigit] == '0' &&
+            (digits.size() > firstDigit + 1 || firstDigit == 1)) {
+            wellFormed = false;
+        }
+        if (!wellFormed) {
+            throw std::invalid_argument("Bencode: invalid integer format");
         }
 
         try {
@@ -75,23 +86,27 @@ BencodeValue parseValue(const std::string& input, std::size_t& pos) {
         }
 
         const std::size_t data_start = length_end + 1;
-        const std::size_t data_end = data_start + length;
-        if (data_end > input.size()) {
+        // data_start <= input.size() (đã có ':' tại length_end), nên phép trừ
+        // không tràn; so sánh kiểu này tránh tràn khi cộng data_start + length.
+        if (length > input.size() - data_start) {
             throw std::invalid_argument("Bencode: truncated string value");
         }
 
         const std::string value = input.substr(data_start, length);
-        pos = data_end;
+        pos = data_start + length;
         return BencodeValue(value);
     }
 
     if (ch == 'l') {
         // Danh sách theo dạng: l<item1><item2>...e
         // Ví dụ: l4:spam4:eggse = ["spam", "eggs"]
+        if (depth >= kMaxNestingDepth) {
+            throw std::invalid_argument("Bencode: nesting too deep");
+        }
         ++pos;
         BencodeList list;
         while (pos < input.size() && input[pos] != 'e') {
-            list.push_back(parseValue(input, pos));
+            list.push_back(parseValue(input, pos, depth + 1));
         }
         if (pos >= input.size()) {
             throw std::invalid_argument("Bencode: unterminated list");
@@ -103,15 +118,18 @@ BencodeValue parseValue(const std::string& input, std::size_t& pos) {
     if (ch == 'd') {
         // Từ điển theo dạng: d<key><value><key><value>...e
         // Ví dụ: d3:fooi10e3:bar5:helloe = { "foo": 10, "bar": "hello" }
+        if (depth >= kMaxNestingDepth) {
+            throw std::invalid_argument("Bencode: nesting too deep");
+        }
         ++pos;
         BencodeDict dict;
         while (pos < input.size() && input[pos] != 'e') {
-            const auto keyValue = parseValue(input, pos);
+            const auto keyValue = parseValue(input, pos, depth + 1);
             const auto* key = keyValue.get_if<std::string>();
             if (key == nullptr) {
                 throw std::invalid_argument("Bencode: dictionary keys must be strings");
             }
-            const auto value = parseValue(input, pos);
+            const auto value = parseValue(input, pos, depth + 1);
             dict[*key] = value;
         }
         if (pos >= input.size()) {
@@ -179,6 +197,36 @@ std::string Bencode::encode(const BencodeValue& value) {
 
 BencodeValue decodeBencode(const std::string& input, std::size_t* next) {
     return Bencode::parse(input, next);
+}
+
+bool findDictValueSpan(const std::string& input, const std::string& key,
+                       std::size_t& begin, std::size_t& end) {
+    if (input.empty() || input[0] != 'd') {
+        throw std::invalid_argument("Bencode: top-level value is not a dictionary");
+    }
+    std::size_t pos = 1;
+    bool found = false;
+    while (pos < input.size() && input[pos] != 'e') {
+        const auto keyValue = parseValue(input, pos, 1);
+        const auto* keyString = keyValue.get_if<std::string>();
+        if (keyString == nullptr) {
+            throw std::invalid_argument("Bencode: dictionary keys must be strings");
+        }
+        const std::size_t valueBegin = pos;
+        parseValue(input, pos, 1);
+        if (*keyString == key) {
+            if (found) {
+                throw std::invalid_argument("Bencode: duplicate key");
+            }
+            found = true;
+            begin = valueBegin;
+            end = pos;
+        }
+    }
+    if (pos >= input.size()) {
+        throw std::invalid_argument("Bencode: unterminated dictionary");
+    }
+    return found;
 }
 
 std::string encodeBencode(const BencodeValue& value) {
