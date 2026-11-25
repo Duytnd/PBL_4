@@ -1,6 +1,8 @@
 # Danh Mục Mẫu File .torrent Dị Dạng (Malformed Samples)
 
-Thư mục này chứa các file `.torrent` dị dạng được cố tình tạo ra nhằm mục đích kiểm thử độ bền (robustness), xử lý ngoại lệ an toàn và chống tấn công leo thang thư mục (Path Traversal / Directory Escape) của Bencode Parser và Torrent Metadata Parser (`TorrentFile::parse` / `TorrentFile::parseFile`).
+> **Lưu ý:** các mẫu dưới đây được `tests/test_malformed_torrent.cpp` **sinh bằng code lúc chạy test** (ghi vào thư mục tạm rồi xoá), không còn là file nhị phân trong repo, vì `.gitignore` chặn `*.torrent`. Bảng này là tài liệu mô tả; thêm mẫu mới thì sửa hàm `syntaxSamples()` / `schemaSamples()` / `securitySamples()` trong file test.
+
+Các mẫu `.torrent` dị dạng được cố tình tạo ra nhằm mục đích kiểm thử độ bền (robustness), xử lý ngoại lệ an toàn và chống tấn công leo thang thư mục (Path Traversal / Directory Escape) của Bencode Parser và Torrent Metadata Parser (`TorrentFile::parse` / `TorrentFile::parseFile`).
 
 Tất cả các file trong thư mục này **BẮT BUỘC** phải bị Parser từ chối (reject) và ném ra ngoại lệ (`std::invalid_argument` hoặc `std::runtime_error`), tuyệt đối không được làm crash ứng dụng và không được tạo file/thư mục tùy tiện ra ngoài thư mục download.
 
