@@ -102,6 +102,9 @@ private:
 // chi dung khi muon stream/xem truoc, khong phai che do mac dinh.
 struct SequentialConfig {
     std::size_t pipeline_depth = 4;
+    // Endgame giống Rarest First: những block cuối không bị kẹt chờ một peer chậm.
+    bool endgame_enabled = true;
+    std::size_t endgame_max_copies = 2;
 };
 
 class SequentialPicker : public PiecePicker {
@@ -115,7 +118,10 @@ public:
                    const std::vector<bool>& my_bitfield,
                    const std::vector<std::vector<bool>>& peers_bitfields) override;
 
+    bool in_endgame(const PickerContext& ctx) const override;
+
     std::size_t pipeline_depth() const override;
+    std::size_t endgame_max_copies() const override;
 
 private:
     SequentialConfig config_;

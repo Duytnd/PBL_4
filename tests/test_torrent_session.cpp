@@ -2315,7 +2315,361 @@ void testNetworkChangeReannouncesAndDropsStaleLanPeers() {
     std::filesystem::remove_all(temp_dir, ec);
 }
 
+// ---------- Nhóm D: logic phiên tải ----------
+
+namespace {
+
+// Ghi file nguồn deterministic vào `dir` rồi dựng metadata (piece 16 KiB) để seeder thật dùng.
+TorrentFileMetadata writeSeedFile(const std::filesystem::path& dir, const std::string& name, std::size_t bytes) {
+    std::string content(bytes, '\0');
+    std::uint32_t state = 12345u;
+    for (auto& c : content) {
+        state = state * 1664525u + 1013904223u;
+        c = static_cast<char>(state >> 24);
+    }
+    const auto source_path = dir / name;
+    {
+        std::ofstream output(source_path, std::ios::binary);
+        output.write(content.data(), static_cast<std::streamsize>(content.size()));
+    }
+    return TorrentFile::parse(TorrentBuilder::buildTorrent(source_path, "", 16384));
+}
+
+}  // namespace
+
+void testPeerRatesReachPeerInfoForChoker() {
+    std::cout << "[TEST] per-peer download/upload rates are measured (choker input)..." << std::endl;
+    const std::filesystem::path seed_dir = "./test_d1_seed";
+    const std::filesystem::path leech_dir = "./test_d1_leech";
+    std::error_code ec;
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+    std::filesystem::create_directories(seed_dir);
+    std::filesystem::create_directories(leech_dir);
+
+    const auto meta = writeSeedFile(seed_dir, "d1.bin", 3u * 1024 * 1024);
+
+    auto seed_config = inboundTestConfig(seed_dir, 7400);
+    seed_config.max_upload_rate = 512 * 1024;  // kéo dài buổi tải vài giây để kịp đo tốc độ
+    TorrentSession seeder(meta, seed_config);
+    CHECK(seeder.start());
+    CHECK(seeder.is_complete());
+
+    TorrentSession leecher(meta, inboundTestConfig(leech_dir, 7401));
+    CHECK(leecher.start());
+    leecher.add_peer("127.0.0.1", 7400);
+
+    bool leecher_sees_download = false;
+    bool seeder_sees_upload = false;
+    const auto start_time = std::chrono::steady_clock::now();
+    while (!(leecher_sees_download && seeder_sees_upload) &&
+           std::chrono::steady_clock::now() - start_time < std::chrono::seconds(12)) {
+        for (const auto& peer : leecher.get_peers()) {
+            if (peer.download_rate > 0.0) leecher_sees_download = true;
+        }
+        for (const auto& peer : seeder.get_peers()) {
+            if (peer.upload_rate > 0.0) seeder_sees_upload = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(leecher_sees_download);
+    CHECK(seeder_sees_upload);
+
+    leecher.stop();
+    seeder.stop();
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+}
+
+namespace {
+
+// Nhận kết nối RA của session ở `listener`, đọc handshake của session rồi đáp lại bằng handshake thô (không bật Fast).
+bool acceptRawPeer(asio::ip::tcp::acceptor& listener, asio::ip::tcp::socket& out, const std::string& infoHashHex) {
+    asio::error_code ec;
+    listener.accept(out, ec);
+    if (ec) return false;
+    setReceiveTimeout(out, 8000);
+    std::uint8_t theirs[68];
+    if (!readExact(out, theirs, sizeof(theirs))) return false;
+    std::string handshake;
+    handshake.push_back(static_cast<char>(19));
+    handshake += "BitTorrent protocol";
+    handshake += std::string(8, '\0');
+    for (std::size_t i = 0; i + 1 < infoHashHex.size(); i += 2) {
+        handshake.push_back(static_cast<char>(std::stoi(infoHashHex.substr(i, 2), nullptr, 16)));
+    }
+    handshake += "-RAWFST-abcdefghijkl";
+    asio::write(out, asio::buffer(handshake), ec);
+    return !ec;
+}
+
+}  // namespace
+
+void testPickerOnlyAsksPeerForPiecesItHas() {
+    std::cout << "[TEST] unchoked peer is asked only for pieces it has, even if a rarer piece is elsewhere..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_d2_picker";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    std::vector<std::string> pieces;
+    for (int i = 0; i < 6; ++i) pieces.push_back(std::string(16384, static_cast<char>('a' + i)));
+    auto meta = makeMockMetadata("d2.bin", pieces, 16384);
+    meta.announce = "";
+
+    TorrentSession session(meta, inboundTestConfig(temp_dir, 7410));
+    session.set_piece_picker(std::make_unique<strategy::SequentialPicker>());  // luôn chọn piece nhỏ nhất ai đó có
+    CHECK(session.start());
+
+    asio::io_context ioc;
+    asio::ip::tcp::acceptor listen_a(ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 7412));
+    asio::ip::tcp::acceptor listen_b(ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 7413));
+
+    // Peer A có đủ 6 piece nhưng giữ choke ta (không bao giờ unchoke).
+    asio::ip::tcp::socket peer_a(ioc);
+    session.add_peer("127.0.0.1", 7412);
+    CHECK(acceptRawPeer(listen_a, peer_a, session.info_hash_hex()));
+    asio::write(peer_a, asio::buffer(rawMessage(5, {}, std::string(1, static_cast<char>(0xFC)))));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // Peer B unchoke ta nhưng thiếu piece 0 (piece duy nhất chỉ A có): vẫn phải được xin piece 1..5.
+    asio::ip::tcp::socket peer_b(ioc);
+    session.add_peer("127.0.0.1", 7413);
+    CHECK(acceptRawPeer(listen_b, peer_b, session.info_hash_hex()));
+    asio::write(peer_b, asio::buffer(rawMessage(5, {}, std::string(1, static_cast<char>(0x7C)))));
+    asio::write(peer_b, asio::buffer(rawMessage(1, {})));
+
+    setReceiveTimeout(peer_b, 3000);
+    bool requested_from_b = false;
+    RawFrame frame;
+    while (readFrame(peer_b, frame)) {
+        if (!frame.keep_alive && frame.id == 6 && frame.payload.size() == 12) {
+            CHECK(beAt(frame.payload, 0) >= 1);  // B không có piece 0
+            requested_from_b = true;
+            break;
+        }
+    }
+    CHECK(requested_from_b);
+
+    asio::error_code ignored;
+    peer_a.close(ignored);
+    peer_b.close(ignored);
+    listen_a.close(ignored);
+    listen_b.close(ignored);
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testFailedConnectIsRetriedAfterBackoff() {
+    std::cout << "[TEST] a peer that refused once is retried after the backoff, not blocked forever..." << std::endl;
+    const std::filesystem::path seed_dir = "./test_d3_seed";
+    const std::filesystem::path leech_dir = "./test_d3_leech";
+    std::error_code ec;
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+    std::filesystem::create_directories(seed_dir);
+    std::filesystem::create_directories(leech_dir);
+
+    const auto meta = writeSeedFile(seed_dir, "d3.bin", 64 * 1024);
+
+    auto leech_config = inboundTestConfig(leech_dir, 7421);
+    leech_config.peer_retry_base_ms = 50;
+    TorrentSession leecher(meta, leech_config);
+    CHECK(leecher.start());
+
+    leecher.add_peer("127.0.0.1", 7420);  // chưa có ai nghe ở cổng này: kết nối lỗi
+    for (int i = 0; i < 100 && leecher.stats().total_peers_known != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK_EQ(leecher.stats().total_peers_known, std::size_t(0));  // endpoint lỗi không được coi là "đã biết"
+
+    TorrentSession seeder(meta, inboundTestConfig(seed_dir, 7420));
+    CHECK(seeder.start());
+    CHECK(seeder.is_complete());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // qua thời gian lùi 50 ms
+    leecher.add_peer("127.0.0.1", 7420);
+
+    const auto start_time = std::chrono::steady_clock::now();
+    while (!leecher.is_complete() &&
+           std::chrono::steady_clock::now() - start_time < std::chrono::seconds(10)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(leecher.is_complete());
+
+    leecher.stop();
+    seeder.stop();
+    std::filesystem::remove_all(seed_dir, ec);
+    std::filesystem::remove_all(leech_dir, ec);
+}
+
+void testPeerSendingCorruptDataIsBanned() {
+    std::cout << "[TEST] a peer that keeps sending pieces with wrong hash is banned..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_d4_ban";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    std::vector<std::string> pieces;
+    for (int i = 0; i < 6; ++i) pieces.push_back(std::string(16384, static_cast<char>('a' + i)));
+    auto meta = makeMockMetadata("d4.bin", pieces, 16384);
+    meta.announce = "";
+
+    TorrentSession session(meta, inboundTestConfig(temp_dir, 7430));
+    CHECK(session.start());
+
+    asio::io_context ioc;
+    std::array<std::uint8_t, 8> reserved{};
+    asio::ip::tcp::socket bad_peer(ioc);
+    bad_peer.connect(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 7430));
+    setReceiveTimeout(bad_peer, 8000);
+    CHECK(rawHandshake(bad_peer, session.info_hash_hex(), false, reserved));
+    asio::write(bad_peer, asio::buffer(rawMessage(5, {}, std::string(1, static_cast<char>(0xFC)))));
+    asio::write(bad_peer, asio::buffer(rawMessage(1, {})));
+
+    // Trả lời mọi request bằng dữ liệu sai nội dung (đúng kích thước nên qua được bước kiểm tra block).
+    setReceiveTimeout(bad_peer, 3000);
+    int served_bad = 0;
+    bool closed_by_session = false;
+    RawFrame frame;
+    for (int guard = 0; guard < 40; ++guard) {
+        if (!readFrame(bad_peer, frame)) {
+            closed_by_session = true;  // ngắt kết nối (hoặc im lặng quá 3 giây: coi như không bị cấm)
+            break;
+        }
+        if (!frame.keep_alive && frame.id == 6 && frame.payload.size() == 12) {
+            const std::string garbage(beAt(frame.payload, 8), 'Z');
+            asio::error_code write_ec;
+            asio::write(bad_peer,
+                        asio::buffer(rawMessage(7, {beAt(frame.payload, 0), beAt(frame.payload, 4)}, garbage)),
+                        write_ec);
+            if (write_ec) {
+                closed_by_session = true;
+                break;
+            }
+            ++served_bad;
+        }
+    }
+    CHECK(closed_by_session);
+    CHECK(served_bad >= 3);  // bị cấm sau đúng 3 lần sai hash (vài request đã bay có thể được trả lời thêm)
+    CHECK_EQ(session.banned_peer_count(), std::size_t(1));
+
+    // Kết nối vào từ IP bị cấm bị từ chối ngay.
+    asio::ip::tcp::socket again(ioc);
+    again.connect(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 7430));
+    setReceiveTimeout(again, 2500);
+    CHECK(!rawHandshake(again, session.info_hash_hex(), false, reserved));
+
+    // add_peer tới IP bị cấm không tạo kết nối đi.
+    asio::ip::tcp::acceptor listener(ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 7431));
+    listener.non_blocking(true);
+    session.add_peer("127.0.0.1", 7431);
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    asio::error_code accept_ec;
+    asio::ip::tcp::socket outgoing(ioc);
+    listener.accept(outgoing, accept_ec);
+    CHECK(accept_ec == asio::error::would_block);
+
+    asio::error_code ignored;
+    again.close(ignored);
+    bad_peer.close(ignored);
+    listener.close(ignored);
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testKnownPeerListIsCapped() {
+    std::cout << "[TEST] known peer list is bounded and add_peer stays fast..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_d5_cap";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("d5.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.announce = "";
+    TorrentSession session(meta, inboundTestConfig(temp_dir, 7440));  // chưa start: chỉ ghi nhận, không kết nối
+
+    const auto start_time = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5000; ++i) {
+        session.add_peer("192.168." + std::to_string(i / 250) + "." + std::to_string(i % 250 + 1), 6881);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start_time;
+    CHECK(session.stats().total_peers_known <= 2000);
+    CHECK(session.stats().total_peers_known > 0);
+    CHECK(elapsed < std::chrono::seconds(10));
+
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
+void testPexMessageAcceptsAtMost50NewPeers() {
+    std::cout << "[TEST] one PEX message adds at most 50 peers..." << std::endl;
+    const std::filesystem::path temp_dir = "./test_d5_pex";
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir, ec);
+    std::filesystem::create_directories(temp_dir);
+
+    auto meta = makeMockMetadata("d5pex.bin", {"AlphaPiece123456", "BetaPiece1234567"}, 16);
+    meta.announce = "";
+    auto config = inboundTestConfig(temp_dir, 7450);
+    config.max_connections = 1;  // kết nối của client PEX chiếm hết chỗ: không thử nối ra các địa chỉ giả
+    TorrentSession session(meta, config);
+    CHECK(session.start());
+
+    const std::string raw_hash = sha1Digest(meta.infoRaw);
+    PeerConnection client = PeerConnection::connect_to("127.0.0.1", 7450, std::chrono::seconds(5));
+    PeerHandshake local_handshake;
+    std::memcpy(local_handshake.info_hash.data(), raw_hash.data(), raw_hash.size());
+    local_handshake.peer_id.fill('X');
+    local_handshake.set_supports_extension(true);
+    client.send_handshake(local_handshake);
+    CHECK(client.receive_handshake().supports_extension());
+    client.send_message(extension::make_extended_handshake());
+
+    // Chờ (có hạn) tới khi chính kết nối của client PEX đã được tính vào "peer đã biết", để mốc đo không bị lệch
+    // khi máy bận (chạy song song nhiều test): nếu không, kết nối đó có thể bị tính vào `added` và vượt 50.
+    {
+        const auto wait_start = std::chrono::steady_clock::now();
+        while (session.stats().total_peers_known == 0 &&
+               std::chrono::steady_clock::now() - wait_start < std::chrono::seconds(8)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    const std::size_t known_before = session.stats().total_peers_known;  // gồm cả chính kết nối của client PEX
+
+    std::vector<extension::PexPeer> many;
+    for (int i = 0; i < 120; ++i) {
+        many.push_back({"192.168.7." + std::to_string(i + 1), 6881});
+    }
+    client.send_message(extension::make_pex_message(extension::kUtPexId, many));
+
+    // Chờ có hạn tới khi tin PEX được xử lý, rồi chờ thêm một chút để mọi địa chỉ (nếu có) kịp vào danh sách.
+    {
+        const auto wait_start = std::chrono::steady_clock::now();
+        while (session.stats().total_peers_known == known_before &&
+               std::chrono::steady_clock::now() - wait_start < std::chrono::seconds(8)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    }
+    const std::size_t added = session.stats().total_peers_known - known_before;
+    CHECK(added > 0);
+    CHECK(added <= 50);
+
+    client.close();
+    session.stop();
+    std::filesystem::remove_all(temp_dir, ec);
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "groupd") {  // chạy riêng nhóm D (logic phiên tải)
+        testPeerRatesReachPeerInfoForChoker();
+        testPickerOnlyAsksPeerForPiecesItHas();
+        testFailedConnectIsRetriedAfterBackoff();
+        testPeerSendingCorruptDataIsBanned();
+        testKnownPeerListIsCapped();
+        testPexMessageAcceptsAtMost50NewPeers();
+        return TEST_REPORT();
+    }
     if (argc > 1 && std::string(argv[1]) == "fast") {  // chạy riêng nhóm Fast Extension khi gỡ lỗi
         testAllowedFastSetMatchesBep6Vectors();
         testFastExtensionSeederSendsHaveAllAllowedFastAndRejects();
@@ -2358,6 +2712,12 @@ int main(int argc, char** argv) {
     testSilentInboundConnectionIsDroppedAfterHandshakeTimeout();
     testInboundCannotTakeSlotsReservedForOutbound();
     testStatsStaysResponsiveWhenAPeerStopsReading();
+    testPeerRatesReachPeerInfoForChoker();
+    testPickerOnlyAsksPeerForPiecesItHas();
+    testFailedConnectIsRetriedAfterBackoff();
+    testPeerSendingCorruptDataIsBanned();
+    testKnownPeerListIsCapped();
+    testPexMessageAcceptsAtMost50NewPeers();
 
     return TEST_REPORT();
 }

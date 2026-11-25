@@ -116,8 +116,22 @@ int SequentialPicker::pick_piece(const PickerContext& /*ctx*/,
     return -1;  // không còn gì để tải
 }
 
+bool SequentialPicker::in_endgame(const PickerContext& ctx) const {
+    if (!config_.endgame_enabled) return false;
+    if (ctx.total_pieces == 0) return false;
+    if (ctx.completed_pieces >= ctx.total_pieces) return false;
+
+    // Giống RarestFirstPicker: không còn piece nào chưa bắt đầu xin, chỉ còn các piece đang dở.
+    return ctx.completed_pieces + ctx.in_progress_pieces >= ctx.total_pieces;
+}
+
 std::size_t SequentialPicker::pipeline_depth() const {
     return std::max<std::size_t>(1, config_.pipeline_depth);
+}
+
+std::size_t SequentialPicker::endgame_max_copies() const {
+    if (!config_.endgame_enabled) return 1;
+    return std::max<std::size_t>(1, config_.endgame_max_copies);
 }
 
 }  // namespace strategy
