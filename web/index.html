@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniBitTorrent</title>
-  <link rel="stylesheet" href="style.css?v=13">
+  <link rel="stylesheet" href="style.css?v=14">
 </head>
 <body>
   <header class="topbar">
@@ -67,6 +67,7 @@
           </label>
           <span class="spacer"></span>
           <button id="create-torrent-btn" type="button" class="btn btn-primary">Create torrent <span aria-hidden="true">+</span></button>
+          <button id="create-folder-btn" type="button" class="btn">Create from folder <span aria-hidden="true">+</span></button>
           <button id="add-torrent-btn" type="button" class="btn">Add torrent <span aria-hidden="true">+</span></button>
           <button id="settings-toggle-btn" type="button" class="btn btn-icon" aria-haspopup="dialog" aria-label="Settings" title="Settings">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -75,6 +76,7 @@
 
         <div id="torrent-builder" class="torrent-builder">
           <input id="torrent-source" type="file" hidden>
+          <input id="folder-source" type="file" webkitdirectory multiple hidden>
           <div class="magnet-add-row">
             <input id="magnet-add-input" type="url" placeholder="Paste a magnet link (magnet:?xt=urn:btih:...)" aria-label="Magnet link" autocomplete="off">
             <button id="add-magnet-btn" type="button" class="btn">Add magnet</button>
@@ -310,6 +312,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=13" defer></script>
+  <script src="app.js?v=14" defer></script>
 </body>
 </html>

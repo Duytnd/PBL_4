@@ -7,6 +7,7 @@
 #include "core/torrent_builder.h"
 #include "core/torrent_file.h"
 #include "network/lan_address.h"
+#include "webui/folder_upload.h"
 #include "webui/request_guard.h"
 #include "network/magnet_resolver.h"
 #include "network/tracker_client.h"
@@ -82,6 +83,8 @@ std::string defaultAnnounceUrl() {
 
 constexpr std::size_t kDefaultPieceLength = 262144;
 constexpr std::size_t kMaxUploadBytes = 256ull * 1024 * 1024;
+// Phần đầu mỗi file trong multipart (tối đa 10.000 file) và các field form.
+constexpr std::size_t kMultipartOverheadSlack = 16ull * 1024 * 1024;
 
 std::string rfc5987Encode(const std::string& value) {
     static constexpr char hex[] = "0123456789ABCDEF";
@@ -374,6 +377,82 @@ std::pair<std::string, std::uint16_t> extractDhtBootstrapFromRequest(const httpl
     return {host, port};
 }
 
+// Thông số dùng chung để dựng torrent, khởi động Seeder và trả file .torrent.
+struct NewTorrentRequest {
+    std::filesystem::path downloadDir;
+    std::filesystem::path source;      // file hoặc thư mục nằm trong downloadDir
+    std::string nameOverride;          // chỉ dùng cho tạo từ một file
+    std::string announce;
+    std::size_t pieceLength = kDefaultPieceLength;
+    bool enableTracker = true;
+    bool enableDht = true;
+    std::string dhtBootstrapHost;
+    std::uint16_t dhtBootstrapPort = 0;
+    std::string downloadName;          // tên file .torrent trả về (đã kèm ".torrent")
+    // Thư mục do chính request này vừa tạo (tạo từ thư mục): xóa nếu dựng/khởi động thất bại.
+    std::filesystem::path cleanupOnFailure;
+};
+
+void removeStagedFolder(const std::filesystem::path& root) {
+    if (root.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+void respondWithNewTorrent(const NewTorrentRequest& request, httplib::Response& res) {
+    try {
+        const std::string torrentBytes = TorrentBuilder::buildTorrent(
+            request.source, request.announce, request.pieceLength, request.nameOverride);
+
+        // Parse metadata để lấy info_hash và tạo Magnet URI
+        auto meta = TorrentFile::parse(torrentBytes);
+        std::string infoHashHex = sha1Hex(meta.infoRaw);
+        std::string magnetUri = "magnet:?xt=urn:btih:" + infoHashHex +
+                                "&dn=" + rfc5987Encode(meta.name) +
+                                "&tr=" + rfc5987Encode(request.announce);
+
+        // Khởi động TorrentSession chạy ngầm ở chế độ Seeder
+        TorrentSessionConfig config;
+        StateBridge::instance().applyGlobalLimiters(config);
+        config.download_dir = request.downloadDir;
+        config.listen_port = StateBridge::instance().allocatePort();
+        config.enable_tracker = request.enableTracker;
+        config.enable_lsd = true;
+        config.enable_dht = request.enableDht;
+        config.dht_bootstrap_host = request.dhtBootstrapHost;
+        config.dht_bootstrap_port = request.dhtBootstrapPort;
+        if (request.enableDht) {
+            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
+                6881, request.dhtBootstrapHost, request.dhtBootstrapPort);
+        }
+
+        // Trùng torrent: không start thêm session (tránh chiếm port vô ích).
+        // Thư mục vừa dựng KHÔNG bị xóa ở nhánh này: nó mang đúng tên mà session cũ đọc dữ liệu
+        // (tên thư mục mới luôn chưa tồn tại), nên xóa đi sẽ làm session cũ mất dữ liệu.
+        if (!StateBridge::instance().getSession(infoHashHex)) {
+            auto session = std::make_shared<TorrentSession>(meta, config);
+            if (!session->start()) {
+                removeStagedFolder(request.cleanupOnFailure);
+                res.status = 503;
+                res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
+                return;
+            }
+            StateBridge::instance().addSession(session, magnetUri);
+        }
+
+        res.set_header("Content-Disposition", buildContentDisposition(request.downloadName));
+        res.set_header("X-Magnet-Uri", magnetUri);
+        res.set_header("Access-Control-Expose-Headers", "Content-Disposition, X-Magnet-Uri");
+        res.set_content(torrentBytes, "application/x-bittorrent");
+    } catch (const std::exception& error) {
+        removeStagedFolder(request.cleanupOnFailure);
+        res.status = 500;
+        res.set_content(std::string("Failed to build torrent: ") + error.what(), "text/plain");
+    }
+}
+
 void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
     if (!req.form.has_file("file")) {
         res.status = 400;
@@ -405,72 +484,93 @@ void handleCreateTorrent(const httplib::Request& req, httplib::Response& res) {
         output.write(upload.content.data(), static_cast<std::streamsize>(upload.content.size()));
     }
 
-    const std::string announce = req.form.has_field("announce") && !req.form.get_field("announce").empty()
+    NewTorrentRequest request;
+    request.downloadDir = downloadDir;
+    request.source = persistentPath;
+    request.announce = req.form.has_field("announce") && !req.form.get_field("announce").empty()
         ? req.form.get_field("announce")
         : defaultAnnounceUrl();
-    const std::size_t pieceLength = parsePieceLength(req.form);
-    const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
-    const bool enableTracker = parseBoolField(req.form, "enable_tracker", true);
-    const bool enableDht = parseBoolField(req.form, "enable_dht", true);
+    request.pieceLength = parsePieceLength(req.form);
+    request.nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
+    request.enableTracker = parseBoolField(req.form, "enable_tracker", true);
+    request.enableDht = parseBoolField(req.form, "enable_dht", true);
     const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
     const std::string rawDhtBootstrapHost = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
     const std::uint16_t rawDhtBootstrapPort = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
-    const auto [dhtBootstrapHost, dhtBootstrapPort] =
-        withTrackerBootstrapFallback(rawDhtBootstrapHost, rawDhtBootstrapPort, announce);
-    if (!nameOverride.empty() && !PathSanitizer::isSafeRelativePath(nameOverride)) {
+    std::tie(request.dhtBootstrapHost, request.dhtBootstrapPort) =
+        withTrackerBootstrapFallback(rawDhtBootstrapHost, rawDhtBootstrapPort, request.announce);
+    if (!request.nameOverride.empty() && !PathSanitizer::isSafeRelativePath(request.nameOverride)) {
         res.status = 400;
         res.set_content("Invalid torrent name", "text/plain");
         return;
     }
 
+    request.downloadName =
+        (request.nameOverride.empty() ? sourceName.string() : request.nameOverride) + ".torrent";
+    respondWithNewTorrent(request, res);
+}
+
+// Tạo torrent nhiều file từ một thư mục: trình duyệt gửi nhiều phần "files",
+// filename của mỗi phần là đường dẫn tương đối dạng "thumuc/con/a.txt".
+void handleCreateFolderTorrent(const httplib::Request& req, httplib::Response& res) {
+    if (!req.form.has_file("files")) {
+        res.status = 400;
+        res.set_content("Missing \"files\" field", "text/plain");
+        return;
+    }
+
+    // Duyệt trực tiếp trong req.form (không copy nội dung) để không nhân đôi RAM.
+    std::vector<webui::UploadedFile> uploads;
+    std::uint64_t totalBytes = 0;
+    const auto range = req.form.files.equal_range("files");
+    for (auto it = range.first; it != range.second; ++it) {
+        if (uploads.size() >= webui::kMaxFolderFiles) {
+            res.status = 413;
+            res.set_content("Too many files in folder", "text/plain");
+            return;
+        }
+        totalBytes += it->second.content.size();
+        if (totalBytes > webui::kMaxFolderBytes) {
+            res.status = 413;
+            res.set_content("Folder too large", "text/plain");
+            return;
+        }
+        uploads.push_back({it->second.filename, std::string_view(it->second.content)});
+    }
+
+    const std::filesystem::path downloadDir = resolveDownloadDir();
+    const std::string nameOverride = req.form.has_field("name") ? req.form.get_field("name") : "";
+
+    webui::StagedFolder staged;
     try {
-        const std::string torrentBytes = TorrentBuilder::buildTorrent(
-            persistentPath, announce, pieceLength, nameOverride);
-
-        // Parse metadata để lấy info_hash và tạo Magnet URI
-        auto meta = TorrentFile::parse(torrentBytes);
-        std::string infoHashHex = sha1Hex(meta.infoRaw);
-        std::string magnetUri = "magnet:?xt=urn:btih:" + infoHashHex +
-                                "&dn=" + rfc5987Encode(meta.name) +
-                                "&tr=" + rfc5987Encode(announce);
-
-        // Khởi động TorrentSession chạy ngầm ở chế độ Seeder
-        TorrentSessionConfig config;
-        StateBridge::instance().applyGlobalLimiters(config);
-        config.download_dir = downloadDir;
-        config.listen_port = StateBridge::instance().allocatePort();
-        config.enable_tracker = enableTracker;
-        config.enable_lsd = true;
-        config.enable_dht = enableDht;
-        config.dht_bootstrap_host = dhtBootstrapHost;
-        config.dht_bootstrap_port = dhtBootstrapPort;
-        if (enableDht) {
-            config.shared_dht = StateBridge::instance().getOrCreateSharedDht(
-                6881, dhtBootstrapHost, dhtBootstrapPort);
-        }
-
-        // Trùng torrent: không start thêm session (tránh chiếm port vô ích).
-        if (!StateBridge::instance().getSession(infoHashHex)) {
-            auto session = std::make_shared<TorrentSession>(meta, config);
-            if (!session->start()) {
-                res.status = 503;
-                res.set_content("Failed to start torrent session: port already in use or bind failed", "text/plain");
-                return;
-            }
-            StateBridge::instance().addSession(session, magnetUri);
-        }
-
-        const std::string downloadName =
-            (nameOverride.empty() ? sourceName.string() : nameOverride) + ".torrent";
-
-        res.set_header("Content-Disposition", buildContentDisposition(downloadName));
-        res.set_header("X-Magnet-Uri", magnetUri);
-        res.set_header("Access-Control-Expose-Headers", "Content-Disposition, X-Magnet-Uri");
-        res.set_content(torrentBytes, "application/x-bittorrent");
+        staged = webui::stageFolderUpload(downloadDir, uploads, nameOverride);
+    } catch (const webui::FolderUploadError& error) {
+        res.status = error.httpStatus;
+        res.set_content(error.what(), "text/plain");
+        return;
     } catch (const std::exception& error) {
         res.status = 500;
-        res.set_content(std::string("Failed to build torrent: ") + error.what(), "text/plain");
+        res.set_content(std::string("Failed to store uploaded folder: ") + error.what(), "text/plain");
+        return;
     }
+
+    NewTorrentRequest request;
+    request.downloadDir = downloadDir;
+    request.source = staged.root;
+    request.announce = req.form.has_field("announce") && !req.form.get_field("announce").empty()
+        ? req.form.get_field("announce")
+        : defaultAnnounceUrl();
+    request.pieceLength = parsePieceLength(req.form);
+    request.enableTracker = parseBoolField(req.form, "enable_tracker", true);
+    request.enableDht = parseBoolField(req.form, "enable_dht", true);
+    const auto [defaultDhtHost, defaultDhtPort] = loadDhtBootstrapConfig();
+    const std::string rawDhtBootstrapHost = req.form.has_field("dht_bootstrap_host") ? req.form.get_field("dht_bootstrap_host") : defaultDhtHost;
+    const std::uint16_t rawDhtBootstrapPort = req.form.has_field("dht_bootstrap_port") ? parseUint16Field(req.form, "dht_bootstrap_port", 0) : defaultDhtPort;
+    std::tie(request.dhtBootstrapHost, request.dhtBootstrapPort) =
+        withTrackerBootstrapFallback(rawDhtBootstrapHost, rawDhtBootstrapPort, request.announce);
+    request.downloadName = staged.name + ".torrent";
+    request.cleanupOnFailure = staged.root;
+    respondWithNewTorrent(request, res);
 }
 
 void handleAddTorrent(const httplib::Request& req, httplib::Response& res) {
@@ -1208,7 +1308,7 @@ void handleFileOpen(const httplib::Request& req, httplib::Response& res) {
 
 void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::path& /*tempDir*/) {
     // Giới hạn body trước khi httplib đọc vào RAM (file + vài field form).
-    server.set_payload_max_length(kMaxUploadBytes + 1024 * 1024);
+    server.set_payload_max_length(kMaxUploadBytes + kMultipartOverheadSlack);
 
     // Tự động khởi động node DHT dùng chung (UDP 6881) ngay khi server chạy
     const auto [bootHost, bootPort] = loadDhtBootstrapConfig();
@@ -1220,6 +1320,10 @@ void ApiRoutes::registerRoutes(httplib::Server& server, const std::filesystem::p
 
     server.Post("/api/torrents/create", [](const httplib::Request& req, httplib::Response& res) {
         handleCreateTorrent(req, res);
+    });
+
+    server.Post("/api/torrents/create-folder", [](const httplib::Request& req, httplib::Response& res) {
+        handleCreateFolderTorrent(req, res);
     });
 
     server.Post("/api/torrents/add", [](const httplib::Request& req, httplib::Response& res) {
