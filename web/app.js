@@ -4,6 +4,8 @@
   const VIEWS = ['dashboard', 'torrents', 'speed', 'files'];
   let currentAnnounceUrl = 'http://127.0.0.1:6969/announce';
   const PIECE_LENGTH = 262144;
+  const MAX_FOLDER_FILES = 10000;
+  const MAX_FOLDER_BYTES = 256 * 1024 * 1024;
   const torrentList = [];
   let activeAction = 'create';
 
@@ -1127,12 +1129,11 @@
     }
   }
 
-  async function requestTorrentFromServer(file) {
+  // Các trường dùng chung khi tạo torrent (một file hoặc cả thư mục).
+  function appendCommonTorrentFields(formData) {
     const announceInput = document.getElementById('tracker-announce-input');
     const announceUrl = (announceInput && announceInput.value.trim()) ? announceInput.value.trim() : currentAnnounceUrl;
 
-    const formData = new FormData();
-    formData.append('file', file, file.name);
     formData.append('announce', announceUrl);
     formData.append('piece_length', String(PIECE_LENGTH));
 
@@ -1142,8 +1143,33 @@
       formData.append('dht_bootstrap_host', parts[0].trim());
       if (parts[1]) formData.append('dht_bootstrap_port', parts[1].trim());
     }
+  }
 
-    const response = await fetch('/api/torrents/create', {
+  // Tên file tải về lấy từ header Content-Disposition (ưu tiên filename*=UTF-8'').
+  function parseDownloadName(disposition, fallback) {
+    const utf8Match = (disposition || '').match(/filename\*=UTF-8''([^;]+)/i);
+    const asciiMatch = (disposition || '').match(/filename="?([^";]+)"?/i);
+    let downloadName = fallback;
+    try {
+      if (utf8Match) downloadName = decodeURIComponent(utf8Match[1]);
+      else if (asciiMatch) downloadName = asciiMatch[1];
+    } catch (_) {}
+    return downloadName;
+  }
+
+  function downloadTorrentBlob(blob, downloadName) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = downloadName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function postCreateTorrent(endpoint, formData, fallbackName) {
+    const response = await fetch(endpoint, {
       method: 'POST',
       body: formData,
     });
@@ -1153,17 +1179,17 @@
       throw new Error(message || `Server responded with ${response.status}`);
     }
 
-    const disposition = response.headers.get('Content-Disposition') || '';
-    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-    const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
-    let downloadName = `${file.name}.torrent`;
-    try {
-      if (utf8Match) downloadName = decodeURIComponent(utf8Match[1]);
-      else if (asciiMatch) downloadName = asciiMatch[1];
-    } catch (_) {}
+    const downloadName = parseDownloadName(response.headers.get('Content-Disposition'), fallbackName);
     const magnetUri = response.headers.get('X-Magnet-Uri') || '';
     const blob = await response.blob();
     return { blob, downloadName, magnetUri };
+  }
+
+  async function requestTorrentFromServer(file) {
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    appendCommonTorrentFields(formData);
+    return postCreateTorrent('/api/torrents/create', formData, `${file.name}.torrent`);
   }
 
   async function handleCreateTorrent(file) {
@@ -1173,17 +1199,78 @@
       setStatus(`Creating torrent for ${file.name}...`);
       const { blob, downloadName, magnetUri } = await requestTorrentFromServer(file);
 
-      // Download .torrent file
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = downloadName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
+      downloadTorrentBlob(blob, downloadName);
 
       setStatus(`Torrent created successfully and added to the swarm: ${downloadName}`, 'success');
+      await syncTorrentsFromServer();
+    } catch (error) {
+      setStatus(`Failed to create torrent: ${error.message}`, 'error');
+    }
+  }
+
+  // Dựng FormData cho /api/torrents/create-folder. Hàm thuần: nhận mảng đối tượng có
+  // name, size, webkitRelativePath. Bỏ mục ẩn (thành phần đường dẫn bắt đầu bằng '.').
+  // Giới hạn khớp với server (10.000 file, 256 MiB).
+  function buildFolderFormData(files, appendCommonFields) {
+    const list = Array.from(files || []);
+    if (list.length === 0) {
+      throw new Error('The selected folder has no files.');
+    }
+    const formData = new FormData();
+    let count = 0;
+    let totalBytes = 0;
+    let skippedHidden = 0;
+    let rootName = '';
+    for (const file of list) {
+      const relativePath = String(file.webkitRelativePath || '');
+      const parts = relativePath.split('/');
+      if (parts.length < 2 || parts.some((part) => part === '')) {
+        throw new Error(`"${file.name}" is not inside a folder. Choose a folder, not single files.`);
+      }
+      if (!rootName) rootName = parts[0];
+      if (parts.some((part) => part.startsWith('.'))) {
+        skippedHidden += 1;
+        continue;
+      }
+      count += 1;
+      if (count > MAX_FOLDER_FILES) {
+        throw new Error(`Too many files: a folder can have at most ${MAX_FOLDER_FILES} files.`);
+      }
+      totalBytes += file.size;
+      if (totalBytes > MAX_FOLDER_BYTES) {
+        throw new Error(`Folder too large: the limit is ${Math.floor(MAX_FOLDER_BYTES / (1024 * 1024))} MB.`);
+      }
+      formData.append('files', file, relativePath);
+    }
+    if (count === 0) {
+      throw new Error('The selected folder only has hidden files, which are skipped.');
+    }
+    if (typeof appendCommonFields === 'function') appendCommonFields(formData);
+    return { formData, count, totalBytes, rootName, skippedHidden };
+  }
+
+  async function handleCreateFolderTorrent(files) {
+    const list = Array.from(files || []);
+    if (list.length === 0) return;
+
+    let built;
+    try {
+      built = buildFolderFormData(list, appendCommonTorrentFields);
+    } catch (error) {
+      setStatus(`Failed to create torrent: ${error.message}`, 'error');
+      return;
+    }
+
+    try {
+      setStatus(`Uploading ${built.count} files (${formatBytes(built.totalBytes)})...`);
+      const { blob, downloadName } = await postCreateTorrent(
+        '/api/torrents/create-folder', built.formData, `${built.rootName}.torrent`);
+
+      downloadTorrentBlob(blob, downloadName);
+
+      const folderName = downloadName.replace(/\.torrent$/i, '');
+      const hiddenNote = built.skippedHidden > 0 ? `, ${built.skippedHidden} hidden skipped` : '';
+      setStatus(`Torrent created for folder ${folderName} (${built.count} files${hiddenNote})`, 'success');
       await syncTorrentsFromServer();
     } catch (error) {
       setStatus(`Failed to create torrent: ${error.message}`, 'error');
@@ -1509,6 +1596,8 @@
     const input = document.getElementById('torrent-source');
     const createTorrentButton = document.getElementById('create-torrent-btn');
     const addTorrentButton = document.getElementById('add-torrent-btn');
+    const createFolderButton = document.getElementById('create-folder-btn');
+    const folderInput = document.getElementById('folder-source');
     const addMagnetButton = document.getElementById('add-magnet-btn');
     const magnetAddInput = document.getElementById('magnet-add-input');
     const dropzone = document.getElementById('torrent-dropzone');
@@ -1524,6 +1613,19 @@
 
     if (addTorrentButton) {
       addTorrentButton.addEventListener('click', () => openFilePicker('add'));
+    }
+
+    if (createFolderButton && folderInput) {
+      createFolderButton.addEventListener('click', () => folderInput.click());
+    }
+
+    if (folderInput) {
+      folderInput.addEventListener('change', async (event) => {
+        const files = Array.from(event.target.files || []);
+        await handleCreateFolderTorrent(files);
+        // Cho phép chọn lại đúng thư mục đó lần sau.
+        folderInput.value = '';
+      });
     }
 
     if (addMagnetButton) {

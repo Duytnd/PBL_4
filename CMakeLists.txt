@@ -13,6 +13,8 @@ endif()
 # HTTPS tracker: cpp-httplib bật TLS (OpenSSL) cho mọi target; PHẢI đồng nhất giữa các TU để tránh ODR.
 find_package(OpenSSL REQUIRED)
 add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
+# Tạo torrent từ thư mục gửi tới 10.000 phần "files" (mặc định httplib chỉ cho 1024 phần); phải đồng nhất giữa các TU.
+add_compile_definitions(CPPHTTPLIB_MULTIPART_FORM_DATA_FILE_MAX_COUNT=10100)
 
 enable_testing()
 
@@ -133,6 +135,15 @@ add_executable(test_request_guard
 )
 target_include_directories(test_request_guard PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_request_guard COMMAND test_request_guard)
+
+# Ghi thư mục tải lên (tạo torrent nhiều file từ WebUI): chỉ logic thuần + PathSanitizer
+add_executable(test_folder_upload
+    tests/test_folder_upload.cpp
+    src/webui/folder_upload.cpp
+    src/core/path_sanitizer.cpp
+)
+target_include_directories(test_folder_upload PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+add_test(NAME test_folder_upload COMMAND test_folder_upload)
 
 add_executable(test_bencode
     tests/test_bencode.cpp
@@ -411,6 +422,7 @@ set(P2P_CLIENT_SOURCES
     src/core/piece_manager.cpp
     src/webui/http_server.cpp
     src/webui/request_guard.cpp
+    src/webui/folder_upload.cpp
     src/webui/api_routes.cpp
     src/webui/state_bridge.cpp
     src/network/torrent_session.cpp
